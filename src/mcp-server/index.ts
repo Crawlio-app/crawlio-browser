@@ -55,6 +55,40 @@ function logPreviousExitIfRecent(): void {
 // Record any non-zero exit (exit hooks must be synchronous — appendFileSync is).
 process.on("exit", (code) => { if (code !== 0) recordExit(code, lastFatalReason); });
 
+// `--help` and `--version` are answered before anything else runs. Previously they fell through
+// to the server, so asking a CLI what version it was started a stdio MCP server and bound a
+// WebSocket port — leaving a process holding 9333 that the user had to notice and kill.
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log(`
+  Crawlio Browser v${PKG_VERSION} — MCP server bridging a live Chrome browser to your agent.
+
+  Usage
+    crawlio-browser [options]           Run the MCP server (stdio; this is what clients invoke)
+    crawlio-browser init [options]      Configure your MCP clients — detects them, writes config
+    crawlio-browser tools [--full]      Print the tool surface each mode exposes
+    crawlio-browser doctor              Check bridge, portal, native host and client configs
+    crawlio-browser audit-egress        Report what has left this machine
+
+  Server options
+    --full                              Expose all tools individually instead of code mode
+    --portal [--port <n>]               Serve over HTTP instead of stdio (survives restarts)
+
+  Shared options
+    --json                              Machine-readable output (tools, doctor)
+    --help, -h                          Show this message
+    --version, -v                       Print the version
+
+  'tools' and 'doctor' are read-only: no browser, no extension, no network.
+  Docs: https://docs.crawlio.app/browser-agent/overview
+`);
+  process.exit(0);
+}
+
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  console.log(PKG_VERSION);
+  process.exit(0);
+}
+
 const initMode = process.argv.includes("init") || process.argv.includes("--setup") || process.argv.includes("setup");
 if (initMode) {
   const { runInit } = await import("./init.js");

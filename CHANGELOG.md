@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.9.2] - 2026-08-05
+
+### Fixed
+
+- **`--help` and `--version` started the MCP server.** Neither was handled, so both fell through
+  to the transport setup: asking the CLI its version launched a stdio server and bound a
+  WebSocket port, leaving a process the user had to notice and kill. Both are now answered
+  before anything else runs, and `--help` documents every subcommand. `npm run check:surface`
+  fails if `--version` ever stops exiting on its own again
+
+## [1.9.1] - 2026-08-05
+
+### Fixed
+
+- **`mcpName` was missing from the published package**, which made the server impossible to list
+  in the MCP registry. The registry proves you own an npm package by reading `mcpName` back off
+  the published tarball and comparing it to the server name in `server.json`; without it,
+  submission fails validation no matter how the domain is verified. npm tarballs are immutable,
+  so correcting it required a release. `npm run check:surface` now fails when the two disagree
+- **`server.json` would have been rejected on submission.** Its description ran 118 characters
+  against a hard limit of 100, and its `$schema` pointed at the deprecated 2025-09-29 revision
+  rather than 2025-12-11. `mcp-publisher validate` now reports the file valid, and both limits
+  are enforced by the surface check
+
 ## [1.9.0] - 2026-08-05
 
 The product now answers to one name, and the numbers it advertises are measured rather than

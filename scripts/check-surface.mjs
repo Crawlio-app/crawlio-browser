@@ -98,6 +98,33 @@ function runToolsJson() {
 }
 
 /**
+ * `--version` must answer and exit, not start a server.
+ *
+ * It used to fall through to the transport setup, so asking the CLI its version started a stdio
+ * MCP server and bound a WebSocket port, leaving a process the user had to notice and kill. A
+ * short timeout is the assertion: a server that starts instead of answering will hang here.
+ */
+function checkVersionFlagExits(expected) {
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [SERVER, "--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    const timer = setTimeout(() => {
+      p.kill();
+      resolve(`\`--version\` did not exit within 10s — it is starting the server instead of answering`);
+    }, 10000);
+    p.stdout.on("data", (c) => { out += c.toString(); });
+    p.on("error", (e) => { clearTimeout(timer); resolve(`\`--version\` failed to run: ${e.message}`); });
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      const printed = out.trim();
+      if (code !== 0) return resolve(`\`--version\` exited ${code}, expected 0`);
+      if (printed !== expected) return resolve(`\`--version\` printed "${printed}", expected "${expected}"`);
+      resolve(null);
+    });
+  });
+}
+
+/**
  * The detector runs inside the page and cannot be executed here, so its vocabulary is read
  * from source. Deduplicated because several checks push the same framework by different means.
  */
@@ -179,6 +206,31 @@ async function main() {
     if (before.includes("<!--n:") && !before.includes("<!--/n-->")) continue;
     if (!known.has(m[1])) continue;
     failures.push(`"${m[0].trim()}" states a surface number outside a marker — wrap it in <!--n:…--> so it stays checked`);
+  }
+
+  // The npm page and the MCP registry listing both quote the tool count in prose that no
+  // marker can reach, so check them directly. The registry also caps descriptions at 100
+  // characters and rejects the whole submission over it — which is a poor time to find out.
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  const server = JSON.parse(readFileSync(join(ROOT, "server.json"), "utf-8"));
+
+  if (server.description.length > 100) {
+    failures.push(`server.json description is ${server.description.length} chars; the MCP registry rejects anything over 100`);
+  }
+  // The registry proves you own the npm package by reading `mcpName` back off the PUBLISHED
+  // package and comparing it to the server name. A tarball published without it can never be
+  // listed, and npm tarballs are immutable — the only fix is another release.
+  if (pkg.mcpName !== server.name) {
+    failures.push(`package.json mcpName is ${pkg.mcpName ?? "absent"}, but server.json name is ${server.name} — the registry checks the published package for this and rejects a mismatch`);
+  }
+
+  const versionFlag = await checkVersionFlagExits(pkg.version);
+  if (versionFlag) failures.push(versionFlag);
+  for (const [label, description] of [["package.json", pkg.description], ["server.json", server.description]]) {
+    const claimed = /(\d{2,3})\s+CDP/.exec(description);
+    if (claimed && Number(claimed[1]) !== truth.full) {
+      failures.push(`${label} description claims ${claimed[1]} CDP tools, measured ${truth.full}`);
+    }
   }
 
   if (FIX && text !== original) {

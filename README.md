@@ -53,6 +53,8 @@ npx crawlio-browser tools          # What code mode exposes (the default)
 npx crawlio-browser tools --full   # Every tool, individually
 npx crawlio-browser tools --json   # Machine-readable, for diffing across versions
 npx crawlio-browser doctor         # Bridge, portal, native host, client configs
+npx crawlio-browser --help         # All commands and options
+npx crawlio-browser --version      # Version only
 ```
 
 Both are read-only and run without a browser, an extension, or a network connection — you can
