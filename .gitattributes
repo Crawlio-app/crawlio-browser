@@ -1,0 +1,15 @@
+# Normalize line endings so a Windows checkout does not rewrite shell scripts or
+# change the bytes of files the tests compare.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.woff  binary
+*.woff2 binary
+
+# Generated / vendored — collapse in diffs and exclude from language stats.
+package-lock.json  linguist-generated=true -diff
+src/mcp-server/tool-embeddings.json linguist-generated=true -diff
+packages/selectors/src/*.ts linguist-vendored=false

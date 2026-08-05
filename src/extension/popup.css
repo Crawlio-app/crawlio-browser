@@ -1,0 +1,267 @@
+:root {
+  --bg-100: #fff;
+  --bg-200: #f8f8fa;
+  --text-100: rgba(0,0,0,0.87);
+  --text-200: rgba(0,0,0,0.55);
+  --text-300: rgba(0,0,0,0.35);
+  --border-100: rgba(0,0,0,0.06);
+  --accent: #008FFD;
+  --accent-hover: #0070D4;
+  --red: #dc2626;
+  --red-hover: #b91c1c;
+  --green: #22c55e;
+  --font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--text-100);
+  background: var(--bg-100);
+  width: 260px;
+}
+
+.popup { padding: 0; }
+
+.popup-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border-100);
+}
+
+.popup-logo {
+  width: 22px;
+  height: 22px;
+}
+
+.popup-title {
+  font-size: 15px;
+  font-weight: 600;
+  flex: 1;
+  color: var(--text-100);
+}
+
+.help-link {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-300);
+  text-decoration: none;
+  border: 1px solid var(--border-100);
+  flex-shrink: 0;
+}
+
+.help-link:hover {
+  color: var(--text-200);
+  background: var(--bg-200);
+}
+
+.popup-body {
+  padding: 14px 16px 16px;
+}
+
+/* --- Status indicator --- */
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-300);
+  flex-shrink: 0;
+}
+
+.status-dot.connected {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(34,197,94,0.15);
+}
+
+.status-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-200);
+}
+
+.status-label.connected {
+  color: var(--text-100);
+}
+
+/* --- Setup card --- */
+.setup-card {
+  background: var(--bg-200);
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.setup-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-100);
+  margin-bottom: 4px;
+}
+
+.setup-desc {
+  font-size: 12px;
+  color: var(--text-200);
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.setup-perms {
+  list-style: none;
+  margin-bottom: 12px;
+}
+
+.setup-perms li {
+  font-size: 12px;
+  color: var(--text-200);
+  padding: 2px 0;
+}
+
+.setup-perms li::before {
+  content: "\00B7\00A0\00A0";
+  font-weight: 700;
+}
+
+.btn-enable {
+  display: block;
+  width: 100%;
+  padding: 9px;
+  border: none;
+  border-radius: 8px;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  transition: background 0.15s;
+}
+
+.btn-enable:hover {
+  background: var(--accent-hover);
+}
+
+/* --- Waiting card (auto-connect state) --- */
+.waiting-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+.waiting-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-300);
+  flex-shrink: 0;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.waiting-text {
+  font-size: 13px;
+  color: var(--text-200);
+}
+
+.reconnect-link {
+  display: inline-block;
+  background: none;
+  border: none;
+  color: var(--text-300);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0;
+  margin-top: 2px;
+}
+
+.reconnect-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.reconnect-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+  text-decoration: none;
+}
+
+/* --- Buttons --- */
+.btn {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 8px;
+  font-family: var(--font);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-connect {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-connect:hover {
+  background: var(--accent-hover);
+}
+
+.btn-connect:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.btn-disconnect {
+  background: var(--red);
+  color: #fff;
+}
+
+.btn-disconnect:hover {
+  background: var(--red-hover);
+}
+
+/* --- Setup link (opens welcome.html onboarding) --- */
+.setup-link {
+  display: block;
+  margin-top: 10px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0;
+  text-align: center;
+  width: 100%;
+}
+
+.setup-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}

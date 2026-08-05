@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Connect Crawlio</title>
+  <link rel="stylesheet" href="welcome.css">
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <img src="icon48.png" class="logo" alt="">
+      <h1>Connect Crawlio to your browser</h1>
+      <p class="subtitle">Give your AI full browser access in seconds</p>
+
+      <!-- Progress Stepper -->
+      <div class="stepper">
+        <div class="step done" id="step-install">
+          <div class="step-dot">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+          </div>
+          <span>Install extension</span>
+        </div>
+        <div class="step current" id="step-grant">
+          <div class="step-dot"></div>
+          <span>Grant browser access</span>
+        </div>
+        <div class="step" id="step-mcp">
+          <div class="step-dot"></div>
+          <span>Start MCP server</span>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+      <button id="connect-btn" class="btn btn-primary">Grant Access</button>
+    </div>
+  </div>
+
+  <!-- Trust Modal Overlay -->
+  <div id="modal-overlay" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-icon">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      </div>
+      <h2>Authorize browser access</h2>
+      <p>Crawlio needs access to your open tabs so your AI can analyze pages, capture screenshots, and automate tasks on your behalf.</p>
+      <div class="modal-detail">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <span>Your data stays local. Crawlio never sends browsing data to external servers.</span>
+      </div>
+      <button id="authorize-btn" class="btn btn-primary">Authorize</button>
+      <button id="cancel-btn" class="btn btn-ghost">Cancel</button>
+    </div>
+  </div>
+
+  <script src="welcome.js"></script>
+</body>
+</html>

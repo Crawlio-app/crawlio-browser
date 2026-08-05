@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest a new tool, capability, or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the task you cannot accomplish today, not just the feature you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should the tool or runtime do? If it is a new tool, sketch its inputs and output shape.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer does this belong to?
+      description: |
+        The extension is deliberately kept thin — a runtime of browser primitives. Workflows
+        and domain expertise usually belong in a skill that composes existing tools.
+      options:
+        - MCP server (a new or improved tool)
+        - Chrome extension runtime (a better primitive)
+        - Skill / workflow composed from existing tools
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried?
+      description: Existing tools or workarounds you have already attempted.

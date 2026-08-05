@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+*.js.map
+
+# Local environment
+.env
+.env.*
+.DS_Store
+
+# Packaged artifacts
+*.zip
+*.tgz
+
+# Generated native-host wrapper (contains machine-local absolute paths)
+bin/native-host/crawlio-native-host
+
+# Local evidence / run output
+.crawlio/

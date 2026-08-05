@@ -1,0 +1,14 @@
+{
+  "default": "deny",
+  "allow": [
+    "capture_page",
+    "get_*",
+    "detect_*",
+    "browser_snapshot",
+    "search",
+    "connect_tab",
+    "create_tab",
+    "close_tab",
+    "execute"
+  ]
+}

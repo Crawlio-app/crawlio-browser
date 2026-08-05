@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    // "noUncheckedIndexedAccess": true, // TODO: enable after major refactor
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "declaration": true,
+    "declarationMap": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "paths": {
+      "@crawlio/semantic-grounding": ["./packages/semantic-grounding/src/index.ts"],
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "packages/semantic-grounding/src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "packages/*/dist", "src/extension/**/*.ts"]
+}

@@ -1,0 +1,29 @@
+{
+  "default": "deny",
+  "allow": [
+    "browser_*",
+    "capture_page",
+    "get_*",
+    "detect_*",
+    "take_screenshot",
+    "search",
+    "connect_tab",
+    "disconnect_tab",
+    "list_tabs",
+    "switch_tab",
+    "create_tab",
+    "close_tab",
+    "execute",
+    "ping",
+    "check_permissions",
+    "request_permissions",
+    "get_connection_status",
+    "get_recording_status",
+    "compile_recording",
+    "start_recording",
+    "stop_recording",
+    "wait_for_network_idle",
+    "extract_*",
+    "detect_tables"
+  ]
+}

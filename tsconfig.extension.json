@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["chrome"],
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": [
+    "src/extension/**/*.ts",
+    "src/shared/**/*.ts",
+    "src/env.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/shared/constants.ts"
+  ]
+}

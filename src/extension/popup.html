@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup">
+    <div class="popup-header">
+      <img src="icon32.png" class="popup-logo" alt="">
+      <span class="popup-title">Crawlio</span>
+      <a id="help-link" class="help-link" href="https://docs.crawlio.app/browser-agent/overview" target="_blank" title="Help">?</a>
+    </div>
+    <div class="popup-body">
+      <div class="status-row">
+        <span class="status-dot"></span>
+        <span id="status-label" class="status-label"></span>
+      </div>
+
+      <!-- Setup card: visible only when pending permissions exist -->
+      <div id="setup-card" class="setup-card" style="display:none">
+        <div class="setup-title">Finish setup</div>
+        <div class="setup-desc">Your AI needs these to control the browser:</div>
+        <ul id="setup-perms" class="setup-perms"></ul>
+        <button id="enable-btn" class="btn btn-enable">Enable Crawlio</button>
+      </div>
+
+      <div id="waiting-card" class="waiting-card" style="display:none">
+        <span class="waiting-dot"></span>
+        <span class="waiting-text">Waiting for MCP server...</span>
+      </div>
+      <button id="reconnect-btn" class="reconnect-link" style="display:none">Reconnect</button>
+      <button id="disconnect-btn" class="btn btn-disconnect" style="display:none">Disconnect</button>
+      <button id="setup-btn" class="setup-link" style="display:none">Complete setup</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

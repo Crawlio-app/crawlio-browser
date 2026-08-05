@@ -1,0 +1,27 @@
+{
+  "name": "@crawlio/semantic-grounding",
+  "version": "1.0.0",
+  "description": "Local-first semantic grounding contract, providers, and router for Crawlio.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./contract/provider.schema.json": "./contract/provider.schema.json",
+    "./contract/context.schema.json": "./contract/context.schema.json",
+    "./contract/result.schema.json": "./contract/result.schema.json"
+  },
+  "files": [
+    "contract/",
+    "dist/"
+  ],
+  "optionalDependencies": {
+    "onnxruntime-node": "1.27.0"
+  }
+}

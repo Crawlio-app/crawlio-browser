@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "app.crawlio/crawlio-browser",
+  "description": "Bridge a live Chrome browser to your agent: 145 CDP tools for automation, network/DOM capture, extraction & recording.",
+  "version": "1.8.0",
+  "repository": {
+    "url": "https://github.com/Crawlio-app/crawlio-browser",
+    "source": "github"
+  },
+  "websiteUrl": "https://www.crawlio.app/browser-agent",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "crawlio-browser",
+      "version": "1.8.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

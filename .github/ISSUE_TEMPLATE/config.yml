@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://docs.crawlio.app/browser-agent/overview
+    about: Setup, tool reference, and guides.
+  - name: Report a security vulnerability
+    url: https://github.com/Crawlio-app/crawlio-browser/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately, not as a public issue.

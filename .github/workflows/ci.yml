@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a run on main; a superseded PR run is not worth the minutes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      # The workspace packages are consumed via file: deps whose main/types point at dist/,
+      # and dist/ is not committed — so they must be built before anything typechecks.
+      - run: npm run build:selectors
+      - run: npm run build:semantic-grounding
+      - run: npm run typecheck
+      # vitest 4 requires Node ^20 || ^22 || >=24. The package itself still supports Node 18
+      # (engines >=18), so 18 keeps typechecking and building — it just cannot run the suite.
+      - run: npm run test
+        if: matrix.node-version != 18
+      - run: npm run build:server
+      # The extension is an IIFE bundle built by a separate tsup pipeline — typecheck alone
+      # does not exercise it, so build both variants here.
+      - run: npm run build:extension
+      - run: npm run build:dev
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      # Separate steps so the failing linter is obvious from the job summary.
+      - run: npm run lint
+      - run: npm run lint:ox
+
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Needed for the merge-base diff in the release-version check below.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      # Version drift across package.json / both manifests / server.json is otherwise only
+      # caught at publish time.
+      - run: npm run build:extension
+      - run: npm run check:versions
+
+      # If a pull request touches anything that ships in the npm tarball, the version must
+      # move forward. npm tarballs are immutable, so a change that ships under an already
+      # published version can never be corrected — only superseded.
+      - name: Require a version bump when shipped files change
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          changed=$(git diff --name-only "$base" "$HEAD_SHA" -- \
+            src bin skills packages server.json package.json \
+            tsconfig.json tsconfig.extension.json)
+          if [ -z "$changed" ]; then
+            echo "No shipped files changed; version bump not required."
+            exit 0
+          fi
+          base_version=$(git show "$base:package.json" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).version))')
+          head_version=$(node -p "require('./package.json').version")
+          if ! printf '%s' "$head_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::package.json version '$head_version' is not semver" >&2
+            exit 1
+          fi
+          highest=$(printf '%s\n%s\n' "$base_version" "$head_version" | sort -V | tail -1)
+          if [ "$base_version" = "$head_version" ] || [ "$highest" != "$head_version" ]; then
+            echo "::error::These files ship in the crawlio-browser package. Bump the version past $base_version (currently $head_version)." >&2
+            printf '%s\n' "$changed" >&2
+            exit 1
+          fi
+          echo "Version $base_version -> $head_version."
+
+  # Single stable check name for branch protection. Requiring this instead of the individual
+  # jobs means the matrix can grow or shrink without touching repository settings.
+  ci:
+    runs-on: ubuntu-latest
+    needs: [build, lint, versions]
+    if: always()
+    steps:
+      - name: Verify required jobs succeeded
+        run: |
+          echo "build=${{ needs.build.result }} lint=${{ needs.lint.result }} versions=${{ needs.versions.result }}"
+          [ "${{ needs.build.result }}" = "success" ] \
+            && [ "${{ needs.lint.result }}" = "success" ] \
+            && [ "${{ needs.versions.result }}" = "success" ]

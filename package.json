@@ -1,0 +1,103 @@
+{
+  "name": "crawlio-browser",
+  "version": "1.8.0",
+  "description": "MCP server with 145 CDP-backed tools for browser automation — screenshots, DOM, network capture, framework detection, cookies, storage, session recording, structured data extraction, tracking analysis, SEO auditing, technographic fingerprinting, performance metrics via Chrome",
+  "type": "module",
+  "main": "dist/mcp-server/index.js",
+  "bin": {
+    "crawlio-browser": "bin/crawlio-browser.js"
+  },
+  "files": [
+    "bin/crawlio-browser.js",
+    "bin/native-host/README.md",
+    "bin/native-host/ext-key.json",
+    "bin/native-host/gen-key.mjs",
+    "bin/native-host/host.mjs",
+    "bin/native-host/install.mjs",
+    "bin/native-host/provision.mjs",
+    "dist/mcp-server/",
+    "packages/semantic-grounding/contract/",
+    "packages/semantic-grounding/dist/",
+    "packages/semantic-grounding/package.json",
+    "packages/selectors/dist/",
+    "packages/selectors/package.json",
+    "packages/selectors/LICENSE",
+    "skills/",
+    "server.json",
+    "TELEMETRY.md",
+    "README.md",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "build": "npm run build:selectors && npm run build:semantic-grounding && npm run build:server && npm run build:extension",
+    "build:selectors": "npm run build --prefix packages/selectors",
+    "build:semantic-grounding": "tsup packages/semantic-grounding/src/index.ts --format esm,cjs --dts --outDir packages/semantic-grounding/dist --clean",
+    "build:server": "node -e \"require('fs').rmSync('dist/mcp-server',{recursive:true,force:true})\" && tsup src/mcp-server/index.ts --format esm --minify --dts --outDir dist/mcp-server && cp src/mcp-server/tool-embeddings.json dist/mcp-server/tool-embeddings.json",
+    "check:versions": "node scripts/check-version-sync.mjs",
+    "oss:export": "node scripts/export-oss.mjs",
+    "oss:check": "node scripts/check-oss-clean.mjs",
+    "prepublishOnly": "npm run check:versions && npm run typecheck && npm run test && npm run build:selectors && npm run build:semantic-grounding && npm run build:server",
+    "build:extension": "rm -rf dist/extension && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension --define.__DEV__=false --minify && cd dist/extension && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.prod.json dist/extension/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon16.png src/extension/icon32.png src/extension/icon48.png src/extension/icon128.png dist/extension/",
+    "build:dev": "rm -rf dist/extension-dev && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension-dev --define.__DEV__=true && cd dist/extension-dev && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.dev.json dist/extension-dev/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon*.png dist/extension-dev/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.extension.json",
+    "typecheck:extension": "tsc --noEmit -p tsconfig.extension.json",
+    "lint": "eslint src bin scripts tests packages/selectors/src packages/semantic-grounding/src eslint.config.mjs",
+    "lint:ox": "oxlint --deny-warnings src bin scripts tests packages/selectors/src",
+    "dev": "tsup src/mcp-server/index.ts --format esm --watch",
+    "generate:embeddings": "npx tsx scripts/generate-embeddings.ts",
+    "setup": "node dist/mcp-server/index.js init"
+  },
+  "keywords": [
+    "mcp",
+    "crawlio",
+    "browser-automation",
+    "chrome",
+    "model-context-protocol",
+    "ai",
+    "screenshots",
+    "dom",
+    "web-scraping",
+    "cdp",
+    "session-recording",
+    "network-capture"
+  ],
+  "homepage": "https://www.crawlio.app/browser-agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Crawlio-app/crawlio-browser"
+  },
+  "bugs": {
+    "url": "https://github.com/Crawlio-app/crawlio-browser/issues"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@crawlio/selectors": "file:packages/selectors",
+    "@crawlio/semantic-grounding": "file:packages/semantic-grounding",
+    "@modelcontextprotocol/sdk": "^1.25.0",
+    "express-rate-limit": "^8.2.1",
+    "idb": "^8.0.3",
+    "ws": "^8.18.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/chrome": "^0.0.287",
+    "@types/ws": "^8.18.0",
+    "@vitest/coverage-v8": "^4.0.18",
+    "eslint": "^10.8.0",
+    "globals": "^17.9.0",
+    "oxlint": "^1.77.0",
+    "sharp": "^0.35.3",
+    "tsup": "^8.4.0",
+    "typescript": "^5.6.2",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^4.0.18"
+  }
+}

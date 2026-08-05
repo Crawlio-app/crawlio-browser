@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.crawlio.app/semantic-grounding/result.schema.json",
+  "title": "GroundingResult",
+  "type": "object",
+  "required": ["provider", "kind", "modelVersion", "confidence", "output", "evidenceRefs", "routedBecause"],
+  "additionalProperties": false,
+  "properties": {
+    "provider": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["ane", "onnx", "heuristic", "llm"]
+    },
+    "modelVersion": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adapterId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "output": {},
+    "evidenceRefs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "routedBecause": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

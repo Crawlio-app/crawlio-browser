@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "Crawlio (Dev)",
+  "version": "1.8.0",
+  "description": "Capture Browser Data via MCP",
+  "permissions": [
+    "alarms",
+    "debugger",
+    "storage"
+  ],
+  "optional_permissions": [
+    "tabs",
+    "tabGroups",
+    "history",
+    "downloads",
+    "contextMenus"
+  ],
+  "optional_host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
+      "128": "icon128.png",
+      "256": "icon256.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png",
+    "256": "icon256.png"
+  },
+  "commands": {
+    "connect-tab": {
+      "suggested_key": { "default": "Alt+Shift+C" },
+      "description": "Connect to active tab"
+    },
+    "capture-page": {
+      "suggested_key": { "default": "Alt+Shift+X" },
+      "description": "Capture current page"
+    },
+    "take-screenshot": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Take screenshot"
+    },
+    "toggle-recording": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Stop recording"
+    }
+  }
+}

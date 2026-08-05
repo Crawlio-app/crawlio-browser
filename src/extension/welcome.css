@@ -1,0 +1,312 @@
+:root {
+  --bg-100: #fff;
+  --bg-200: #f8f8fa;
+  --bg-300: #f0f0f4;
+  --text-100: rgba(0,0,0,0.87);
+  --text-200: rgba(0,0,0,0.55);
+  --text-300: rgba(0,0,0,0.32);
+  --text-400: rgba(0,0,0,0.2);
+  --border-100: rgba(0,0,0,0.06);
+  --border-200: rgba(0,0,0,0.1);
+  --accent: #008FFD;
+  --accent-hover: #0070D4;
+  --accent-light: rgba(0,143,253,0.1);
+  --accent-glow: rgba(0,143,253,0.12);
+  --green: #22c55e;
+  --green-light: rgba(34,197,94,0.08);
+  --font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font);
+  background: #FAFBFC;
+  color: var(--text-200);
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 40px 24px;
+}
+
+.container {
+  width: 100%;
+  max-width: 420px;
+}
+
+/* --- Card --- */
+.card {
+  background: var(--bg-100);
+  border: 1px solid var(--border-100);
+  border-radius: 16px;
+  padding: 44px 36px 36px;
+  text-align: center;
+  width: 100%;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 6px 24px rgba(0,0,0,0.03);
+}
+
+.logo {
+  width: 44px;
+  height: 44px;
+  margin-bottom: 20px;
+}
+
+.card h1 {
+  font-size: 24px;
+  font-weight: 500;
+  color: var(--text-100);
+  letter-spacing: -0.02em;
+  margin-bottom: 6px;
+}
+
+.subtitle {
+  font-size: 14px;
+  color: var(--text-200);
+  margin-bottom: 28px;
+  line-height: 1.5;
+}
+
+/* --- Stepper --- */
+.stepper {
+  text-align: left;
+  margin-bottom: 20px;
+  padding: 0 4px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 0;
+  position: relative;
+}
+
+/* Vertical connector between dots */
+.step:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 30px;
+  width: 2px;
+  height: calc(100% - 20px);
+  background: var(--border-200);
+  transition: background 0.3s ease;
+}
+
+/* Connector above active = green (completed segment) */
+.step.done:not(:last-child)::after {
+  background: rgba(34,197,94,0.3);
+}
+
+/* --- Step dot --- */
+.step-dot {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-200);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.3s ease;
+  background: var(--bg-100);
+}
+
+/* Done: green filled check */
+.step.done .step-dot {
+  background: var(--green);
+  border-color: var(--green);
+  color: white;
+}
+
+/* Current: filled purple with subtle continuous pulse */
+.step.current .step-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+  animation: pulseGlow 2.5s ease-in-out infinite;
+}
+
+/* White inner dot on current */
+.step.current .step-dot::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: white;
+}
+
+/* --- Step text hierarchy --- */
+.step span {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-300);
+  transition: color 0.3s ease, font-weight 0.3s ease;
+}
+
+.step.done span {
+  color: var(--text-200);
+  font-weight: 450;
+}
+
+.step.current span {
+  color: var(--text-100);
+  font-weight: 600;
+}
+
+/* --- Divider --- */
+.divider {
+  height: 1px;
+  background: var(--border-100);
+  margin: 4px 0 24px;
+}
+
+/* --- Buttons --- */
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 12px 24px;
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 16px;
+  font-weight: 600;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: white;
+  width: 100%;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-300);
+  width: 100%;
+  padding: 10px 24px;
+}
+
+.btn-ghost:hover {
+  color: var(--text-100);
+  background: var(--bg-200);
+}
+
+/* --- Modal --- */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.4);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  justify-content: center;
+  align-items: center;
+  padding: 24px;
+}
+
+.modal-overlay.visible {
+  display: flex;
+  animation: fadeIn 0.15s ease;
+}
+
+.modal {
+  background: var(--bg-100);
+  border-radius: 16px;
+  padding: 36px 28px 24px;
+  width: 100%;
+  max-width: 380px;
+  text-align: center;
+  box-shadow: 0 24px 48px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.08);
+  animation: slideUp 0.2s ease;
+}
+
+.modal-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  background: var(--accent-light);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 20px;
+}
+
+.modal h2 {
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--text-100);
+  margin-bottom: 8px;
+}
+
+.modal > p {
+  font-size: 14px;
+  color: var(--text-200);
+  line-height: 1.7;
+  margin-bottom: 16px;
+}
+
+.modal-detail {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--bg-200);
+  border-radius: 10px;
+  margin-bottom: 24px;
+  text-align: left;
+}
+
+.modal-detail svg {
+  flex-shrink: 0;
+  color: var(--green);
+  margin-top: 1px;
+}
+
+.modal-detail span {
+  font-size: 13px;
+  color: var(--text-200);
+  line-height: 1.5;
+}
+
+.modal .btn + .btn {
+  margin-top: 8px;
+}
+
+/* --- Animations --- */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(0,143,253,0.06); }
+  50% { box-shadow: 0 0 0 6px rgba(0,143,253,0.10); }
+}
+
+@keyframes checkIn {
+  from { transform: scale(0.6); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.step.done .step-dot {
+  animation: checkIn 0.35s ease;
+}
