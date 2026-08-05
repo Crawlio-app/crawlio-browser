@@ -115,7 +115,7 @@ export function listLiveBridges(
       // Missing/non-numeric/FUTURE sorts last so a malformed or forged file never wins.
       // Reject future timestamps: a genuine server stamps Date.now() (<= now);
       // a same-user rogue forges a far-future value to always win the election. (Same-user
-      // remains out of scope per bridge-handshake.ts:12-15, but this kills the trivial forge.)
+      // remains out of scope — see the scope note in bridge-handshake.ts — but this kills the trivial forge.)
       lastActivityAt:
         typeof data.lastActivityAt === "number" && data.lastActivityAt <= Date.now() + 5000
           ? data.lastActivityAt
@@ -158,7 +158,7 @@ export async function validateBridgeViaHealth(bridge, fetchFn = fetch) {
  * forgery never reaches it, so we can never INVERT to such a rogue (the original break).
  * The residual is a same-user process that runs a REAL validating server AND forges a
  * high `lastActivityAt` to win the tiebreak; same-user is explicitly out of scope for this
- * handshake (bridge-handshake.ts:12-15 — equal-privilege, covered by Chrome's visible
+ * handshake (see bridge-handshake.ts — equal-privilege, covered by Chrome's visible
  * debugger infobar/consent), so electing by a forgeable activity stamp among already-
  * validated peers does not lower the real bar. Returns `{ port, token } | null`.
  */

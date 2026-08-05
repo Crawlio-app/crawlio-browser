@@ -597,7 +597,7 @@ interface KeyboardState {
 
 const tabKeyboardState = new Map<number, KeyboardState>();
 
-// AC-3: Site opt-out cache — key is `${tabId}:${url}`, value is boolean
+// Site opt-out cache — key is `${tabId}:${url}`, value is boolean
 const optOutCache = new Map<string, boolean>();
 const OPT_OUT_ERROR = 'Site opted out of Crawlio capture via <meta name="crawlio-agent" content="disable">. Respect the site\'s preference.';
 
@@ -693,10 +693,10 @@ function buildEvalParams(
 let networkCapturing = false;
 let networkCaptureSeq = 0;
 
-// AC-21: CSS coverage tracking
+// CSS coverage tracking
 let cssCoverageActive = false;
 
-// AC-22: JS code coverage tracking
+// JS code coverage tracking
 let jsCoverageActive = false;
 const networkEntries: Map<string, NetworkMapEntry> = new Map();
 
@@ -1319,7 +1319,7 @@ async function captureAgentSessionSnapshot(session: AgentBrowserSession, command
 let mainDocResponseHeaders: Record<string, string> = {};
 let networkWriteTimer: ReturnType<typeof setTimeout> | null = null;
 
-// AC-16: WebSocket monitoring
+// WebSocket monitoring
 interface WebSocketMessage {
   direction: "sent" | "received";
   opcode: number;
@@ -1588,7 +1588,7 @@ function teardownInteractionCapture(tabId: number): void {
 
 const dialogCounts = new Map<number, number>();
 
-// AC-6: Dialog queue
+// Dialog queue
 interface PendingDialog {
   type: "alert" | "confirm" | "prompt" | "beforeunload";
   message: string;
@@ -1640,7 +1640,7 @@ interface SecurityState {
 
 let currentSecurityState: SecurityState | null = null;
 
-// --- Service Worker Tracking (AC-19) ---
+// --- Service Worker Tracking ---
 interface SWVersion {
   versionId: string;
   scriptURL: string;
@@ -1665,7 +1665,7 @@ interface InterceptRule {
 
 const interceptRules = new Map<number, InterceptRule[]>(); // tabId -> rules
 
-// --- CDP Target Domain Session Tracking (AC-24) ---
+// --- CDP Target Domain Session Tracking ---
 interface TargetSession {
   targetId: string;
   sessionId: string;
@@ -1690,7 +1690,7 @@ function writeStatus(patch: Record<string, any>) {
   storageWrite("crawlio:status", { ...statusCache });
 }
 
-// --- Permission Broker (PF-2: runtime permission model) ---
+// --- Permission Broker ---
 const OPTIONAL_PERMISSIONS: chrome.permissions.Permissions = {
   // nativeMessaging activates the rogue-server defense: it lets the extension be handed
   // the real bridge token over Chrome's authenticated native channel (connectNative →
@@ -1835,7 +1835,7 @@ chrome.permissions.onRemoved.addListener((perms) => {
     requestBridgeDiscovery();
   }
 });
-// --- Data Sanitizer (PF-5) ---
+// --- Data Sanitizer ---
 const SENSITIVE_KEY_PATTERNS = /password|token|secret|api[_-]?key|auth(?:orization|_token|_key|_secret)|credential|bearer/i;
 
 const SENSITIVE_VALUE_PATTERNS = [
@@ -3166,7 +3166,7 @@ async function dispatchKey(tabId: number, key: string, modifiers = 0): Promise<v
   }
 }
 
-// --- CDP Element Waiting (AC-1) ---
+// --- CDP Element Waiting ---
 
 type WaitState = "attached" | "visible" | "hidden" | "detached";
 
@@ -3282,7 +3282,7 @@ async function waitForSelector(
 // --- CDP Element Visibility Pipeline (AH-4) ---
 
 // Resolve CSS selector to CDP remote object ID
-// AC-2: Uses activeFrameId's contextId when set for implicit frame targeting
+// Uses activeFrameId's contextId when set for implicit frame targeting
 // Parse text selector syntax: "text=Continue" or "button >> text=Continue"
 function resolveTextSelector(selector: string): string {
   // ">> text=X" suffix: "button >> text=Continue" → find button containing text
@@ -3351,7 +3351,7 @@ async function resolveElement(tabId: number, selector: string): Promise<string> 
   return result.result.objectId;
 }
 
-// AC-26: Parse hex color to CDP RGBA format
+// Parse hex color to CDP RGBA format
 function parseOverlayColor(color?: string): { r: number; g: number; b: number; a: number } {
   if (!color) return { r: 111, g: 168, b: 220, a: 0.66 };
   const hex = color.replace("#", "");
@@ -4568,7 +4568,7 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: entries };
       }
 
-      // AC-16: WebSocket monitoring — list connections
+      // WebSocket monitoring — list connections
       case "get_websocket_connections": {
         await requireDebuggerTab();
         const statusFilter = command.status as string | undefined;
@@ -4587,7 +4587,7 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { connections }};
       }
 
-      // AC-16: WebSocket monitoring — get messages
+      // WebSocket monitoring — get messages
       case "get_websocket_messages": {
         await requireDebuggerTab();
         const limit = (command.limit as number) ?? 50;
@@ -5026,7 +5026,7 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { cleared: true, fallback: true } };
       }
 
-      // AC-23: IndexedDB operations
+      // IndexedDB operations
       case "get_databases": {
         const tab = await getConnectedTab();
         await ensureDebugger(tab.id!);
@@ -5192,12 +5192,12 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // AC-6: Dialog control
+      // Dialog control
       case "get_dialog": {
         return { type: "response", id, success: true, data: { dialog: pendingDialog } };
       }
 
-      // AC-6: Dialog handling
+      // Dialog handling
       case "handle_dialog": {
         const targetTabId = await requireDebuggerTab();
         if (!pendingDialog) {
@@ -5849,7 +5849,7 @@ async function handleCommand(command: any): Promise<any> {
         };
       }
 
-      // --- Frame execution context tools (AC-2) ---
+      // --- Frame execution context tools ---
 
       case "get_frame_tree": {
         const tab = await getConnectedTab();
@@ -5901,7 +5901,7 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { action: "switch_to_main_frame", activeFrameId: null } };
       }
 
-      // --- Tab management (AC-3) ---
+      // --- Tab management ---
 
       case "create_tab": {
         await ensureTabPermission(type);
@@ -6030,7 +6030,7 @@ async function handleCommand(command: any): Promise<any> {
         }};
       }
 
-      // AC-8: Viewport & device emulation
+      // Viewport & device emulation
       case "set_viewport": {
         const tab = await getConnectedTab();
         await ensureDebugger(tab.id!);
@@ -6098,7 +6098,7 @@ async function handleCommand(command: any): Promise<any> {
         }};
       }
 
-      // AC-12: Geolocation emulation
+      // Geolocation emulation
       // Emulation.clearGeolocationOverride
       case "set_geolocation": {
         const tab = await getConnectedTab();
@@ -6158,7 +6158,7 @@ async function handleCommand(command: any): Promise<any> {
         }};
       }
 
-      // AC-9: PDF generation
+      // PDF generation
       // Error strings: "No web contents to print", "Printing is not available", "Printing failed"
       case "print_to_pdf": {
         const tab = await getConnectedTab();
@@ -6210,7 +6210,7 @@ async function handleCommand(command: any): Promise<any> {
         }};
       }
 
-      // AC-13: Accessibility tree
+      // Accessibility tree
       case "get_accessibility_tree": {
         const tab = await getConnectedTab();
         await ensureDebugger(tab.id!);
@@ -6254,7 +6254,7 @@ async function handleCommand(command: any): Promise<any> {
         }};
       }
 
-      // AC-14: Performance metrics
+      // Performance metrics
       case "get_performance_metrics": {
         const tab = await getConnectedTab();
         await ensureDebugger(tab.id!);
@@ -6453,7 +6453,7 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // AC-19: Service worker control
+      // Service worker control
       case "list_service_workers": {
         const tabId = await requireDebuggerTab();
         const registrations = Array.from(swRegistrations.values()).filter(r => !r.isDeleted);
@@ -6520,7 +6520,7 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { bypassing: bypass } };
       }
 
-      // --- AC-20: DOM Manipulation (DOM.setOuterHTML, DOM.setAttributeValue,
+      // --- DOM Manipulation (DOM.setOuterHTML, DOM.setAttributeValue,
       // DOM.removeAttribute, DOM.removeNode) ---
 
       case "set_outer_html": {
@@ -6555,7 +6555,7 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { action: "remove_node", selector: command.selector } };
       }
 
-      // --- AC-21: CSS Coverage & Pseudo-State ---
+      // --- CSS Coverage & Pseudo-State ---
 
       case "start_css_coverage": {
         const tabId = await requireDebuggerTab();
@@ -6612,7 +6612,7 @@ async function handleCommand(command: any): Promise<any> {
         } };
       }
 
-      // --- AC-22: JS Code Coverage ---
+      // --- JS Code Coverage ---
 
       case "start_js_coverage": {
         const tabId = await requireDebuggerTab();
@@ -6846,7 +6846,7 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // --- AC-24: Target & Session Management ---
+      // --- Target & Session Management ---
 
       case "get_targets": {
         const tabId = await requireDebuggerTab();
@@ -6901,7 +6901,7 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // AC-25: Memory & Heap Analysis
+      // Memory & Heap Analysis
       case "get_dom_counters": {
         const tabId = await requireDebuggerTab();
         try {
@@ -6930,7 +6930,7 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // AC-25: Force GC
+      // Force GC
       case "force_gc": {
         const tabId = await requireDebuggerTab();
 
@@ -6958,7 +6958,7 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // AC-25: Heap Snapshot
+      // Heap Snapshot
       case "take_heap_snapshot": {
         const tabId = await requireDebuggerTab();
 
@@ -7026,7 +7026,7 @@ async function handleCommand(command: any): Promise<any> {
         }
       }
 
-      // AC-26: Overlay & Visual Debug
+      // Overlay & Visual Debug
       case "highlight_element": {
         const tabId = await requireDebuggerTab();
 
@@ -8176,7 +8176,7 @@ async function resolveCssSelectorToObjectId(tabId: number, selector: string): Pr
   return resolved.object.objectId;
 }
 
-// --- AX tree helpers (AC-13) ---
+// --- AX tree helpers ---
 
 function simplifyAXNode(node: any): any {
   const simplified: any = {
@@ -8636,7 +8636,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
         for (const [fid, cid] of ctxMap) {
           if (cid === ctxId) {
             ctxMap.delete(fid);
-            // AC-2 fix: clear activeFrameId if destroyed context was the active frame's
+            // fix: clear activeFrameId if destroyed context was the active frame's
             if (activeFrameId === fid) activeFrameId = null;
             break;
           }
@@ -8648,7 +8648,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
     case "Runtime.executionContextsCleared": {
       const tabId = source.tabId!;
       frameContexts.get(tabId)?.clear();
-      // AC-2 fix: all contexts destroyed — activeFrameId is now invalid
+      // fix: all contexts destroyed — activeFrameId is now invalid
       if (tabId === debuggerAttachedTabId) activeFrameId = null;
       break;
     }
@@ -8684,7 +8684,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
 
-    // AC-6: Dialog control
+    // Dialog control
     case "Page.javascriptDialogOpening": {
       const tabId = source.tabId!;
       const count = (dialogCounts.get(tabId) || 0) + 1;
@@ -8741,7 +8741,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
 
-    // AC-11: File chooser interception
+    // File chooser interception
     case "Page.fileChooserOpened": {
       pendingFileChooser = {
         mode: params.mode, // "selectSingle" | "selectMultiple"
@@ -8830,7 +8830,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
 
-    // --- AC-16: WebSocket monitoring ---
+    // --- WebSocket monitoring ---
     case "Network.webSocketCreated": {
       if (!networkCapturing) return;
       const { requestId, url, initiator } = params;
@@ -9027,7 +9027,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
 
-    // AC-19: ServiceWorker registration tracking
+    // ServiceWorker registration tracking
     case "ServiceWorker.workerRegistrationUpdated": {
       const regs = params.registrations as any[];
       if (regs) {
@@ -9044,7 +9044,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
 
-    // AC-19: ServiceWorker version tracking
+    // ServiceWorker version tracking
     case "ServiceWorker.workerVersionUpdated": {
       const versions = params.versions as any[];
       if (versions) {
@@ -9144,7 +9144,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 const SKIP_URL_PREFIXES = ["chrome://", "chrome-extension://", "about:", "file://", "devtools://"];
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  // AC-3: Invalidate opt-out cache on navigation
+  // Invalidate opt-out cache on navigation
   if (changeInfo.url || changeInfo.status === "loading") {
     for (const key of optOutCache.keys()) {
       if (key.startsWith(`${tabId}:`)) optOutCache.delete(key);
@@ -9631,7 +9631,7 @@ chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
 
 // Clean up connected tab if user closes it
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  // AC-3: Clean opt-out cache for closed tab
+  // Clean opt-out cache for closed tab
   for (const key of optOutCache.keys()) {
     if (key.startsWith(`${tabId}:`)) optOutCache.delete(key);
   }

@@ -25,7 +25,7 @@ function createMockBridge(responses: Array<{ data?: unknown; error?: string }>) 
 }
 
 // ============================================================
-// Group 1: Permission Broker — Wire Protocol (PF-8 bugs)
+// Group 1: Permission Broker — wire protocol
 // ============================================================
 
 describe("Permission Broker — Wire Protocol", () => {

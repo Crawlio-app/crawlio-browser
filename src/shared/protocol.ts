@@ -76,94 +76,94 @@ export type ServerCommand =
   | { type: "agent_session_claim_tab"; id: string; sessionId: string; tabId: number; [key: string]: unknown }
   | { type: "agent_session_name"; id: string; sessionId: string; name: string; [key: string]: unknown }
   | { type: "agent_session_finalize"; id: string; sessionId: string; [key: string]: unknown }
-  // Cookie & storage commands (AC-4, AC-5)
+  // Cookie & storage commands
   | { type: "get_cookies"; id: string }
   | { type: "set_cookie"; id: string; [key: string]: unknown }
   | { type: "delete_cookies"; id: string; [key: string]: unknown }
   | { type: "get_storage"; id: string; [key: string]: unknown }
   | { type: "set_storage"; id: string; [key: string]: unknown }
   | { type: "clear_storage"; id: string; [key: string]: unknown }
-  // Dialog commands (AC-6)
+  // Dialog commands
   | { type: "get_dialog"; id: string }
   | { type: "handle_dialog"; id: string; [key: string]: unknown }
-  // Response body (AC-7)
+  // Response body
   | { type: "get_response_body"; id: string; [key: string]: unknown }
-  // Viewport & emulation (AC-8)
+  // Viewport & emulation
   | { type: "set_viewport"; id: string; [key: string]: unknown }
   | { type: "set_user_agent"; id: string; [key: string]: unknown }
   | { type: "emulate_device"; id: string; [key: string]: unknown }
-  // PDF (AC-9)
+  // PDF
   | { type: "print_to_pdf"; id: string; [key: string]: unknown }
-  // Advanced input (AC-10)
+  // Advanced input
   | { type: "browser_scroll"; id: string; [key: string]: unknown }
   | { type: "browser_double_click"; id: string; [key: string]: unknown }
   | { type: "browser_drag"; id: string; [key: string]: unknown }
-  // File upload (AC-11)
+  // File upload
   | { type: "browser_file_upload"; id: string; [key: string]: unknown }
-  // Geolocation (AC-12)
+  // Geolocation
   | { type: "set_geolocation"; id: string; [key: string]: unknown }
-  // Accessibility (AC-13)
+  // Accessibility
   | { type: "get_accessibility_tree"; id: string; [key: string]: unknown }
-  // Performance (AC-14)
+  // Performance
   | { type: "get_performance_metrics"; id: string }
-  // Stealth (AC-15)
+  // Stealth
   | { type: "set_stealth_mode"; id: string; [key: string]: unknown }
-  // WebSocket monitoring (AC-16)
+  // WebSocket monitoring
   | { type: "get_websocket_connections"; id: string; [key: string]: unknown }
   | { type: "get_websocket_messages"; id: string; [key: string]: unknown }
-  // Network conditions (AC-17)
+  // Network conditions
   | { type: "emulate_network"; id: string; [key: string]: unknown }
   | { type: "set_cache_disabled"; id: string; [key: string]: unknown }
   | { type: "set_extra_headers"; id: string; [key: string]: unknown }
-  // Security (AC-18)
+  // Security
   | { type: "get_security_state"; id: string }
   | { type: "ignore_certificate_errors"; id: string; [key: string]: unknown }
-  // Service workers (AC-19)
+  // Service workers
   | { type: "list_service_workers"; id: string }
   | { type: "stop_service_worker"; id: string; [key: string]: unknown }
   | { type: "bypass_service_worker"; id: string; [key: string]: unknown }
-  // DOM mutation (AC-20)
+  // DOM mutation
   | { type: "set_outer_html"; id: string; [key: string]: unknown }
   | { type: "set_attribute"; id: string; [key: string]: unknown }
   | { type: "remove_attribute"; id: string; [key: string]: unknown }
   | { type: "remove_node"; id: string; [key: string]: unknown }
-  // CSS/JS coverage (AC-21)
+  // CSS/JS coverage
   | { type: "start_css_coverage"; id: string }
   | { type: "stop_css_coverage"; id: string }
   | { type: "start_js_coverage"; id: string; [key: string]: unknown }
   | { type: "stop_js_coverage"; id: string }
-  // Computed style, pseudo state & font detection (AC-22)
+  // Computed style, pseudo state & font detection
   | { type: "get_computed_style"; id: string; [key: string]: unknown }
   | { type: "force_pseudo_state"; id: string; [key: string]: unknown }
   | { type: "detect_fonts"; id: string; [key: string]: unknown }
-  // IndexedDB (AC-23)
+  // IndexedDB
   | { type: "get_databases"; id: string }
   | { type: "query_object_store"; id: string; [key: string]: unknown }
   | { type: "clear_database"; id: string; [key: string]: unknown }
-  // Targets (AC-24)
+  // Targets
   | { type: "get_targets"; id: string }
   | { type: "attach_to_target"; id: string; [key: string]: unknown }
   | { type: "create_browser_context"; id: string; [key: string]: unknown }
-  // Memory & heap (AC-25)
+  // Memory & heap
   | { type: "get_dom_counters"; id: string }
   | { type: "force_gc"; id: string }
   | { type: "take_heap_snapshot"; id: string }
-  // Overlay & visual debug (AC-26)
+  // Overlay & visual debug
   | { type: "highlight_element"; id: string; [key: string]: unknown }
   | { type: "show_layout_shifts"; id: string; [key: string]: unknown }
   | { type: "show_paint_rects"; id: string; [key: string]: unknown }
-  // Selector wait (AC-1)
+  // Selector wait
   | { type: "wait_for_selector"; id: string; [key: string]: unknown }
   | { type: "browser_wait_for"; id: string; [key: string]: unknown }
-  // Frame commands (AC-2)
+  // Frame commands
   | { type: "get_frame_tree"; id: string }
   | { type: "switch_to_frame"; id: string; frameId: string }
   | { type: "switch_to_main_frame"; id: string }
-  // Tab management (AC-3)
+  // Tab management
   | { type: "create_tab"; id: string; [key: string]: unknown }
   | { type: "close_tab"; id: string; tabId: number }
   | { type: "switch_tab"; id: string; tabId: number }
-  // Network intercept (AC-7)
+  // Network intercept
   | { type: "browser_intercept"; id: string; [key: string]: unknown }
   // Network replay
   | { type: "replay_request"; id: string; [key: string]: unknown }

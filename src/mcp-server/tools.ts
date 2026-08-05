@@ -2022,7 +2022,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(result);
       },
     },
-    // --- Element waiting tool (AC-1) ---
+    // --- Element waiting tool ---
     {
       name: "browser_wait_for",
       description: "Wait for an element matching a CSS selector to reach a specific state. States: 'attached' (exists in DOM), 'visible' (visible and has dimensions), 'hidden' (not visible or not in DOM), 'detached' (removed from DOM). Returns when condition is met or timeout expires.",
@@ -2107,7 +2107,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(result);
       },
     },
-    // --- Frame execution context tools (AC-2) ---
+    // --- Frame execution context tools ---
     {
       name: "get_frame_tree",
       description: "Get the frame hierarchy of the current page. Returns all frames (main + iframes) with their IDs, URLs, names, and parent relationships. Use frameId with switch_to_frame to execute JS in a specific frame.",
@@ -2143,7 +2143,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // --- Tab management tools (AC-3) ---
+    // --- Tab management tools ---
     {
       name: "create_tab",
       description: "Create a new browser tab with the given URL. Pass connect:true to auto-attach CDP and start capturing — the tab is immediately ready for interaction (screenshot, evaluate, navigate, etc).",
@@ -2350,7 +2350,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         }
       },
     },
-    // AC-6: Dialog control
+    // Dialog control
     {
       name: "get_dialog",
       description: "Get the current pending JavaScript dialog (alert/confirm/prompt/beforeunload). Returns null if no dialog is open. Use handle_dialog to accept or dismiss it.",
@@ -2444,7 +2444,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // AC-8: Viewport & device emulation
+    // Viewport & device emulation
     {
       name: "set_viewport",
       description: "Set the browser viewport dimensions. Affects page layout and media queries. Does not affect the actual browser window size.",
@@ -2520,7 +2520,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // AC-9: PDF generation
+    // PDF generation
     {
       name: "print_to_pdf",
       description: "Generate a PDF of the current page. Returns base64-encoded PDF data. Supports landscape/portrait orientation, custom scale, margins, page ranges, paper size, and preset formats (letter, legal, tabloid, a3, a4, a5).",
@@ -2678,7 +2678,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(shapeInteraction(result));
       },
     },
-    // AC-13: Accessibility tree
+    // Accessibility tree
     {
       name: "get_accessibility_tree",
       description: "Get the accessibility tree (AXTree) of the current page. Returns a simplified tree with role, name, value, description, and children for each node. Useful for understanding page structure from a screen-reader perspective. Optionally limit depth to reduce output size.",
@@ -2733,7 +2733,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(result);
       },
     },
-    // AC-14: Performance metrics
+    // Performance metrics
     {
       name: "get_performance_metrics",
       description: "Get performance metrics for the current page. Includes Chrome's built-in metrics (DOM nodes, JS heap, layout counts, script duration) and Web Vitals (LCP, CLS, FID). Useful for performance auditing and optimization.",
@@ -2745,7 +2745,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // AC-16: WebSocket monitoring
+    // WebSocket monitoring
     {
       name: "get_websocket_connections",
       description: "List all WebSocket connections observed since network capture started. Shows connection URL, status (connecting/open/closed/error), and message count. Requires active network capture.",
@@ -2812,7 +2812,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // --- Network conditions & headers (AC-17) ---
+    // --- Network conditions & headers ---
 
     {
       name: "emulate_network",
@@ -2917,7 +2917,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // AC-19: Service worker control
+    // Service worker control
 
     {
       name: "list_service_workers",
@@ -2973,7 +2973,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // --- AC-20: DOM Manipulation ---
+    // --- DOM Manipulation ---
 
     {
       name: "set_outer_html",
@@ -3075,7 +3075,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // --- AC-21: CSS Coverage & Pseudo-State ---
+    // --- CSS Coverage & Pseudo-State ---
 
     {
       name: "start_css_coverage",
@@ -3102,7 +3102,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // --- AC-22: JS Code Coverage ---
+    // --- JS Code Coverage ---
 
     {
       name: "start_js_coverage",
@@ -3207,7 +3207,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // AC-23: IndexedDB operations
+    // IndexedDB operations
     {
       name: "get_databases",
       description: "List all IndexedDB databases for the current page's origin. Shows database names and their object stores with schemas.",
@@ -3286,7 +3286,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // --- AC-24: Target & Session Management ---
+    // --- Target & Session Management ---
 
     {
       name: "get_targets",
@@ -3350,7 +3350,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
 
-    // AC-25: Memory & Heap Analysis
+    // Memory & Heap Analysis
     {
       name: "get_dom_counters",
       description: "Get DOM object counters: number of documents, DOM nodes, and JS event listeners. Useful for detecting memory leaks (growing counters over time).",
@@ -3393,7 +3393,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // --- AC-26: Overlay & Visual Debug tools ---
+    // --- Overlay & Visual Debug tools ---
     {
       name: "highlight_element",
       description: "Highlight an element with a colored overlay. The highlight persists until cleared or another element is highlighted. Useful for visual documentation in screenshots. Pass no selector to clear.",
