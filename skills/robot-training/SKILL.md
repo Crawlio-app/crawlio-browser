@@ -1,7 +1,7 @@
 ---
 name: robot-training
 description: Use this skill when the user wants to train an agent or robot from a real browser demonstration, record a full human-guided web flow, infer button-to-API contracts, build replay recipes, synthesize OpenAPI from captured traffic, or prepare timed automation runs.
-allowed-tools: mcp__crawlio-agent__robot_training_start, mcp__crawlio-agent__robot_training_status, mcp__crawlio-agent__robot_training_stop, mcp__crawlio-agent__robot_training_artifacts, mcp__crawlio-agent__agent_session_create, mcp__crawlio-agent__agent_session_action, mcp__crawlio-agent__agent_session_batch, mcp__crawlio-agent__agent_session_snapshot, mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab
+allowed-tools: mcp__crawlio-browser__robot_training_start, mcp__crawlio-browser__robot_training_status, mcp__crawlio-browser__robot_training_stop, mcp__crawlio-browser__robot_training_artifacts, mcp__crawlio-browser__agent_session_create, mcp__crawlio-browser__agent_session_action, mcp__crawlio-browser__agent_session_batch, mcp__crawlio-browser__agent_session_snapshot, mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab
 ---
 
 # Robot Training

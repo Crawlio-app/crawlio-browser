@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.9.3] - 2026-08-05
+
+A second sweep found defects the first pass missed — one of them a skill whose tools were never
+actually granted.
+
+### Fixed
+
+- **The robot-training skill granted nothing.** Eight of its eleven `allowed-tools` entries used
+  the retired `mcp__crawlio-agent__` prefix, but `init` writes the `crawlio-browser` config key —
+  so those grants named tools that do not exist. The skill loaded, looked correct, and had no
+  permission to run robot training or agent sessions. `npm run check:surface` now fails on any
+  skill referencing the retired prefix
+- **The install wizard's last line was wrong on both branches.** It reported `(114 tools)` for
+  full mode and `(3 tools, 147 commands)` for code mode; the truth is 145, and 6 tools over a
+  178-command catalog. Now derived from the same builders as everything else
+- **`smart.woocommerce` was missing from the `execute` tool description**, which enumerated 16 of
+  the 17 framework namespaces — so a model reading its own instructions had no way to know the
+  namespace existed
+- **The README documented `smart.screenshot()` twice** — in the core-methods table and in a
+  worked example — though it does not exist and the `execute` description says so explicitly.
+  The seventh core method is `smart.rebuild()`; the example now uses `bridge.send`
+- **Links to the archived `crawlio-browser-agent` repository** in the shipped skill reference and
+  the plugin manifest now point at the live repository
+
 ## [1.9.2] - 2026-08-05
 
 ### Fixed

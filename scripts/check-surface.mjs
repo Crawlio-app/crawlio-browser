@@ -16,7 +16,7 @@
 //   node scripts/check-surface.mjs          # verify (CI)
 //   node scripts/check-surface.mjs --fix    # rewrite markers to the measured values
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -24,6 +24,7 @@ import { spawn } from "node:child_process";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const README = join(ROOT, "README.md");
 const SERVER = join(ROOT, "dist/mcp-server/index.js");
+const SKILLS = join(ROOT, "skills");
 const DETECTOR = join(ROOT, "src/extension/injected/framework-detector.ts");
 const FIX = process.argv.includes("--fix");
 
@@ -226,6 +227,20 @@ async function main() {
 
   const versionFlag = await checkVersionFlagExits(pkg.version);
   if (versionFlag) failures.push(versionFlag);
+
+  // A skill's `allowed-tools` names tools by the client's config key. init writes
+  // `crawlio-browser`, so a grant under the retired `mcp__crawlio-agent__` prefix names a tool
+  // that does not exist — the skill loads, looks correct, and silently has no permission. That
+  // shipped for several releases in robot-training.
+  for (const rel of readdirSync(SKILLS, { recursive: true })) {
+    if (typeof rel !== "string" || !rel.endsWith(".md")) continue;
+    const body = readFileSync(join(SKILLS, rel), "utf-8");
+    const dead = body.match(/mcp__crawlio-agent__[a-z_]+/g);
+    if (dead) {
+      const unique = [...new Set(dead)];
+      failures.push(`skills/${rel} grants ${unique.length} tool(s) under the retired mcp__crawlio-agent__ prefix (e.g. ${unique[0]}) — init writes the crawlio-browser key, so these grant nothing`);
+    }
+  }
   for (const [label, description] of [["package.json", pkg.description], ["server.json", server.description]]) {
     const claimed = /(\d{2,3})\s+CDP/.exec(description);
     if (claimed && Number(claimed[1]) !== truth.full) {

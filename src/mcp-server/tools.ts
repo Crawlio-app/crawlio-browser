@@ -5572,7 +5572,7 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "  smart.remix.{getContext,getRouteData}",
         "  smart.gatsby.{getData,getPageData}",
         "  smart.shopify.{getShop,getCart}",
-        "  smart.wordpress.{isWP,getRestUrl,getPlugins}",
+        "  smart.wordpress.{isWP,getRestUrl,getPlugins} | smart.woocommerce.{getParams,getCSRF}",
         "  smart.laravel.{getCSRF} | smart.django.{getCSRF} | smart.drupal.{getSettings}",
         "  smart.jquery.{getVersion}",
         "",

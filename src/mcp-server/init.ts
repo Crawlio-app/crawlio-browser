@@ -1206,7 +1206,14 @@ async function printSummary(options: InitOptions): Promise<void> {
     }
   } else {
     const modeLabel = options.full ? "Full mode" : "Code mode";
-    const countLabel = options.full ? "(114 tools)" : "(3 tools, 147 commands)";
+    // Counted, not quoted. This line is the last thing an installer reads, and it spent several
+    // releases claiming 114 tools in full mode and 3 in code mode when the real numbers were
+    // 145 and 6. Imported lazily so the tool builders load only when this summary is printed.
+    const { describeSurface } = await import("./surface.js");
+    const surface = await describeSurface();
+    const countLabel = options.full
+      ? `(${surface.full.length} tools)`
+      : `(${surface.code.length} tools, ${surface.catalog.total} commands)`;
     statusLines.push(`${green("+")} Mode        ${modeLabel} ${countLabel}`);
   }
 

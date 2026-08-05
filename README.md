@@ -305,7 +305,7 @@ In Code Mode, the `smart` object provides framework-aware helpers with auto-wait
 | `smart.navigate(url, opts?)` | Navigate with 1000ms settle |
 | `smart.waitFor(selector, timeout?)` | Poll until element is actionable |
 | `smart.snapshot()` | Accessibility tree snapshot |
-| `smart.screenshot()` | Full-page screenshot (base64 PNG) |
+| `smart.rebuild()` | Re-detect frameworks and reattach namespaces for the current page |
 
 ### Higher-Order Methods
 
@@ -628,7 +628,7 @@ return { page: page.meta, finding };
 await bridge.send({ type: 'emulate_device', device: 'iPhone 14' }, 10000);
 await smart.navigate('https://example.com');
 await smart.waitForIdle();
-const screenshot = await smart.screenshot();
+const screenshot = await bridge.send({ type: 'take_screenshot' }, 10000);
 return screenshot;
 ```
 

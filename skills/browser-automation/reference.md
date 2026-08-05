@@ -269,4 +269,4 @@ The `smart` object provides auto-waiting wrappers and framework-specific data:
 ## Links
 
 - Extension install: https://www.crawlio.app/browser-agent
-- GitHub: https://github.com/Crawlio-app/crawlio-browser-agent
+- GitHub: https://github.com/Crawlio-app/crawlio-browser
