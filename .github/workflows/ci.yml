@@ -78,8 +78,11 @@ jobs:
       # If a pull request touches anything that ships in the npm tarball, the version must
       # move forward. npm tarballs are immutable, so a change that ships under an already
       # published version can never be corrected — only superseded.
+      # Dependabot is exempt: it changes package.json and the lockfile by design, and cannot
+      # know which release its bump belongs to. Maintainers batch dependency updates into a
+      # release and set the version then.
       - name: Require a version bump when shipped files change
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
