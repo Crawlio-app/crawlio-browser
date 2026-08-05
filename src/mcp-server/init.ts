@@ -538,6 +538,11 @@ export function createAppWrapper(serverEntryPath: string): string | null {
   if (platform() !== "darwin") return null;
 
   const crawlioDir = join(HOME, ".crawlio");
+  // The bundle path is frozen at the old product name on purpose. buildStdioEntry() returns
+  // this path as the `command` written into every MCP client's config file, so it exists
+  // verbatim in installed configs. Renaming the directory — or cleaning up the old one —
+  // points those configs at something that is no longer there and silently breaks the server
+  // for everyone who installed before the rename. Only the display name below moves.
   const appDir = join(crawlioDir, "Crawlio Agent.app");
   const contentsDir = join(appDir, "Contents");
   const macosDir = join(contentsDir, "MacOS");
@@ -557,7 +562,7 @@ export function createAppWrapper(serverEntryPath: string): string | null {
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key>
-  <string>Crawlio Agent</string>
+  <string>Crawlio Browser</string>
   <key>CFBundleIdentifier</key>
   <string>com.crawlio.agent</string>
   <key>CFBundleExecutable</key>

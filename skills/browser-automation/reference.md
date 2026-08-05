@@ -1,8 +1,11 @@
-# Crawlio Agent Command Reference
+# Crawlio Browser Command Reference
 
-Full catalog of all commands available via `search` and `execute`.
+A curated reference for the commands available via `search` and `execute`, grouped by what
+they do. It is written by hand and covers the commonly used surface rather than all of it —
+for the complete and current list run `crawlio-browser tools --full`, or call `search` from
+inside `execute`. Both read the live builders, so neither can disagree with the server.
 
-## Browser Commands (96)
+## Browser Commands
 
 Commands sent via `bridge.send({ type: "<command>", ...params })`.
 
@@ -184,7 +187,7 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | `get_crawled_urls` | Get list of crawled URLs | `status?`, `type?`, `limit?`, `offset?` |
 | `enrich_url` | Submit enrichment data to Crawlio | `url`, `framework?`, `networkRequests?`, `consoleLogs?`, `domSnapshotJSON?` |
 
-## Desktop Commands (33)
+## Desktop Commands
 
 Commands sent via `crawlio.api(method, path, body?)`. Requires Crawlio desktop app running.
 

@@ -191,7 +191,15 @@ function newRunId(): string {
 
 function defaultOutputDir(targetUrl: string, runId: string): string {
   const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "Z");
-  return join(process.cwd() || join(homedir(), "Desktop", "crawlio-agent"), "runs", `${slugify(targetUrl)}-${timestamp}`, runId);
+  // process.cwd() never returns an empty string — it throws if the working directory was
+  // removed underneath the process. So a `||` fallback here could never run; only a catch can.
+  let base: string;
+  try {
+    base = process.cwd();
+  } catch {
+    base = homedir();
+  }
+  return join(base, "runs", `${slugify(targetUrl)}-${timestamp}`, runId);
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {

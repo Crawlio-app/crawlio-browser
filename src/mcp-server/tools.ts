@@ -4700,8 +4700,30 @@ export function makePolicyEnforcingBridge(bridge: Pick<WebSocketBridge, "send">,
   return sender as unknown as PolicyEnforcedSender;
 }
 
+/**
+ * The `smart` keys that always exist, independent of what the page turns out to be.
+ * Everything else on the object is either a higher-order method or a framework namespace,
+ * so this set is what `rebuild` preserves and what surface reporting subtracts.
+ */
+export const SMART_CORE_KEYS: ReadonlySet<string> = new Set([
+  "evaluate", "click", "type", "navigate", "waitFor", "snapshot", "rebuild",
+]);
+
+/**
+ * Every framework name that gates a namespace below. Feeding all of them to
+ * `buildSmartObject` yields the maximal surface — which is how `describeSurface()` reports
+ * "up to N namespaces" by construction rather than by counting source. A namespace added
+ * with a new trigger must be listed here or it will not appear in that report;
+ * `tests/unit/surface.test.ts` fails when the two drift.
+ */
+export const SMART_NAMESPACE_TRIGGERS: readonly string[] = [
+  "Alpine.js", "Angular", "Django", "Drupal", "Gatsby", "Laravel", "Next.js", "Nuxt",
+  "React", "Remix", "Shopify", "Svelte", "SvelteKit", "Vue.js", "VuePress", "WooCommerce",
+  "WordPress", "jQuery",
+];
+
 /** Build the `smart` object with actionability wrappers and framework-specific data accessors */
-async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Record<string, unknown>> {
+export async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Record<string, unknown>> {
   const evaluate = (expression: string, timeout?: number) =>
     bridge.send({ type: "browser_evaluate", expression: wrapEvaluateExpression(expression) }, timeout ?? 5000);
 
@@ -4753,7 +4775,7 @@ async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Record<st
     rebuild: async () => {
       smartObjectCache = null;
       const fresh = await buildSmartObject(bridge);
-      const coreKeys = new Set(["evaluate", "click", "type", "navigate", "waitFor", "snapshot", "rebuild"]);
+      const coreKeys = SMART_CORE_KEYS;
       const namespaces = Object.keys(fresh).filter(k => !coreKeys.has(k));
       // Replace all keys on current smart object
       for (const key of Object.keys(smart)) {
@@ -5273,7 +5295,7 @@ async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Record<st
   return smart;
 }
 
-// --- Code Mode: search + execute + connect_tab (3 tools instead of 73) ---
+// --- Code Mode: search + execute + connect_tab, plus the three async job tools ---
 
 /** Searchable catalog entry (name + description + schema, no handler) */
 interface CatalogEntry {
@@ -5345,7 +5367,7 @@ const crawlioHTTPCatalog: CatalogEntry[] = [
 ];
 
 /** Build a search index from the full tool list + crawlio HTTP catalog */
-function buildCatalog(tools: Tool[]): CatalogEntry[] {
+export function buildCatalog(tools: Tool[]): CatalogEntry[] {
   const browserCatalog = tools.map(t => {
     const entry: CatalogEntry = {
       name: t.name,
@@ -5433,7 +5455,9 @@ function searchCatalog(
 
 /**
  * Create code-mode tools: search, execute, connect_tab.
- * Replaces 73 individual tools with 3 — Claude writes JS code against bridge/crawlio.
+ * Replaces the full tool surface with three primary tools — the model writes JS against
+ * `bridge` and `crawlio` instead of choosing among individual schemas. Counts live in
+ * `surface.ts`; stating them here is how they went stale.
  */
 export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioClient, options: CodeModeToolOptions = {}): Tool[] {
   // Build catalog from full tool definitions (for search)

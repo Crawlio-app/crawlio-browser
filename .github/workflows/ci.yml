@@ -75,6 +75,15 @@ jobs:
       - run: npm run build:extension
       - run: npm run check:versions
 
+      # Every advertised count is checked against what the server actually exposes. Needs the
+      # built server because the check asks it over JSON-RPC rather than trusting the source —
+      # and the server needs the workspace packages, whose file: deps point at an uncommitted
+      # dist/. Without them it builds but crashes on import.
+      - run: npm run build:selectors
+      - run: npm run build:semantic-grounding
+      - run: npm run build:server
+      - run: npm run check:surface
+
       # If a pull request touches anything that ships in the npm tarball, the version must
       # move forward. npm tarballs are immutable, so a change that ships under an already
       # published version can never be corrected — only superseded.

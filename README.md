@@ -1,4 +1,4 @@
-# Crawlio Agent
+# Crawlio Browser
 
 [![npm version](https://img.shields.io/npm/v/crawlio-browser)](https://www.npmjs.com/package/crawlio-browser)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -6,13 +6,23 @@
 
 ## [Documentation](https://docs.crawlio.app/browser-agent/overview) | [API Reference](https://docs.crawlio.app/browser-agent/tools) | [Chrome Extension](https://www.crawlio.app/browser-agent)
 
-MCP server that gives AI full control of a live Chrome browser via CDP. 145 tools with framework-aware intelligence, typed evidence infrastructure, tracking pixel analysis, technographic fingerprinting, SEO auditing, and confidence-tracked findings — captures what static crawlers can't see.
+MCP server that gives AI full control of a live Chrome browser via CDP. <!--n:full-->145<!--/n--> tools with framework-aware intelligence, typed evidence infrastructure, tracking pixel analysis, technographic fingerprinting, SEO auditing, and confidence-tracked findings — captures what static crawlers can't see.
 
-## When to use Crawlio Agent
+## When to use Crawlio Browser
 
-Use Crawlio Agent when your AI needs to interact with a **real browser** — SPAs, authenticated pages, dynamic content, JS-rendered frameworks. Unlike headless browser tools, Crawlio Agent connects to **your actual Chrome** via a lightweight extension, giving the AI access to your logged-in sessions, cookies, and full browser state.
+Use Crawlio Browser when your AI needs to interact with a **real browser** — SPAs, authenticated pages, dynamic content, JS-rendered frameworks. Unlike headless browser tools, Crawlio Browser connects to **your actual Chrome** via a lightweight extension, giving the AI access to your logged-in sessions, cookies, and full browser state.
 
-**Crawlio Agent vs headless browser tools:** Headless tools launch a separate browser process. Crawlio Agent connects to your existing Chrome — no separate browser, no login flows, full access to your tabs and sessions.
+**Crawlio Browser vs headless browser tools:** Headless tools launch a separate browser process. Crawlio Browser connects to your existing Chrome — no separate browser, no login flows, full access to your tabs and sessions.
+
+> [!WARNING]
+> This is the trade-off, stated plainly: connecting your own Chrome is the feature, and it means
+> an AI agent can act as you on every site you are logged into. It attaches Chrome's debugger to
+> the tab you connect, so it can read cookies, storage, and page content for that session.
+>
+> Review what you connect it to. Prefer a dedicated Chrome profile for agent work. Nothing is
+> captured until you connect a tab, and you can see the exact tool surface before configuring
+> anything by running `npx crawlio-browser tools`. Sites can opt out with
+> `<meta name="crawlio-agent" content="disable">`, which the extension honors.
 
 ## Quick Start
 
@@ -28,13 +38,26 @@ That's it. Auto-detects and configures 14 MCP clients: Claude Code, Cursor, VS C
 
 ```bash
 npx crawlio-browser init              # Default: code mode, stdio transport
-npx crawlio-browser init --full       # Full mode (145 individual tools)
+npx crawlio-browser init --full       # Full mode (every tool exposed individually)
 npx crawlio-browser init --portal     # Portal mode (persistent HTTP server)
 npx crawlio-browser init --cloudflare # Add Cloudflare MCP (89 tools, no wrangler)
 npx crawlio-browser init --dry-run    # Show what would happen
 npx crawlio-browser init --yes        # Skip prompts (CI / scripted installs)
 npx crawlio-browser init -a claude    # Target specific MCP client
 ```
+
+### Inspecting what it exposes
+
+```bash
+npx crawlio-browser tools          # What code mode exposes (the default)
+npx crawlio-browser tools --full   # Every tool, individually
+npx crawlio-browser tools --json   # Machine-readable, for diffing across versions
+npx crawlio-browser doctor         # Bridge, portal, native host, client configs
+```
+
+Both are read-only and run without a browser, an extension, or a network connection — you can
+see the whole surface before you configure any client. The numbers come from the same builders
+the server registers, so they cannot disagree with what your client receives.
 
 ### Transport Modes
 
@@ -117,19 +140,21 @@ Capture human-guided browser demonstrations as replayable robot-training bundles
 
 Every mutative action (`click`, `type`, `navigate`, `select_option`) runs actionability checks before acting — polling visibility, dimensions, enabled state, and overlay detection. After the action, a progressive backoff settle delay (`[0, 20, 100, 100, 500]ms`) waits for DOM mutations to quiesce. The AI doesn't need manual `sleep()` calls between actions.
 
-## Architecture: JIT Context Runtime
+## Architecture
 
-The JIT Context MCP Runtime is a layered execution architecture where each layer absorbs a category of complexity that would otherwise fall on the model. The model sees three tools and a clean SDK. Everything beneath that surface is the runtime absorbing reality.
+A layered execution architecture where each layer absorbs a category of complexity that would otherwise fall on the model. The model sees three tools and a clean SDK. Everything beneath that surface is the runtime absorbing reality.
+
+The layer worth understanding is the one that assembles itself. Detection runs against the live page on first use, and the `smart` object is built to match what that page turned out to be — `smart.react.*` exists only where React does. Nothing about the target is known at startup, so the surface is composed per tab rather than declared up front.
 
 ```
                      ┌───────────────────────────────────┐
                      │        AI Model (LLM)             │
                      │  Writes code, reads errors, loops  │
                      └───────────────┬───────────────────┘
-                                     │  3 tools: search, execute, connect_tab
+                                     │  search, execute, connect_tab (+ 3 job tools)
                                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    JIT Context MCP Runtime                       │
+│                     Crawlio Browser runtime                      │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐  │
 │  │  METHOD MODE                                               │  │
@@ -163,8 +188,10 @@ The JIT Context MCP Runtime is a layered execution architecture where each layer
 │  │  ↳ Absorbs: connection drops, tab refreshes,              │  │
 │  │    port conflicts, extension lifecycle                     │  │
 │  ├────────────────────────────────────────────────────────────┤  │
-│  │  178 RAW COMMANDS  (bridge.send)                           │  │
-│  │  CDP-level browser control via Chrome extension            │  │
+│  │  COMMAND CHANNEL                                           │  │
+│  │  bridge.send → CDP browser control via the extension       │  │
+│  │  crawlio.*   → Crawlio HTTP endpoints                      │  │
+│  │  178 searchable across both (145 browser + 33 HTTP)        │  │
 │  └────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                                      │
@@ -182,14 +209,14 @@ The JIT Context MCP Runtime is a layered execution architecture where each layer
 |-------|-----------|---------|
 | **Tethered IPC Bridge** | Script crashes on tab refresh, pending commands lost on reconnect, port conflicts on startup | Resilient WebSocket with message queue (100-msg capacity), heartbeat stale detection (15s intervals), auto-reconnect with drain |
 | **Actionability Engine** | `click('#btn')` fires before the button renders, during CSS transitions, or while an overlay covers it | Progressive polling (exists → has dimensions → visible → not disabled → not obscured) with `[0, 20, 100, 100, 500]ms` backoff |
-| **Polymorphic Context** | Model sees minified `<div>` elements; reading React state requires knowing exact hook paths, renderer maps, and fiber root API | Runtime probes live JS environment, detects 17 frameworks, injects namespace methods (`smart.react.getVersion()`, `smart.nextjs.getData()`) |
-| **Method Mode** | Model composes primitives ad-hoc — inconsistent scroll loops, missed edge cases, varying return shapes | 8 tested methods encode correct patterns; behavioral protocol constrains workflow |
+| **Polymorphic Context** | Model sees minified `<div>` elements; reading React state requires knowing exact hook paths, renderer maps, and fiber root API | Runtime probes live JS environment, recognizes <!--n:frameworks-->64<!--/n--> frameworks and attaches up to <!--n:ns-->17<!--/n--> matching namespaces (`smart.react.getVersion()`, `smart.nextjs.getData()`) |
+| **Method Mode** | Model composes primitives ad-hoc — inconsistent scroll loops, missed edge cases, varying return shapes | <!--n:higher-->18<!--/n--> tested methods encode correct patterns; behavioral protocol constrains workflow |
 
 ### Execution Lifecycle
 
 1. **Discovery** — Model calls `search("page capture performance")` and gets documentation for relevant commands
 2. **Framework Detection** — Runtime probes the live DOM, detects active frameworks, constructs polymorphic `smart` object with appropriate namespaces
-3. **Scope Assembly** — Model's code is compiled into an async function with injected parameters: `bridge` (133 commands), `crawlio` (HTTP client), `sleep`, `TIMEOUTS`, `smart` (7 core + 8 higher-order + up to 17 framework namespaces), `compileRecording`
+3. **Scope Assembly** — Model's code is compiled into an async function with injected parameters: `bridge` (the browser command channel), `crawlio` (HTTP client), `sleep`, `TIMEOUTS`, `smart` (<!--n:core-->7<!--/n--> core + <!--n:higher-->18<!--/n--> higher-order methods + up to <!--n:ns-->17<!--/n--> framework namespaces), `compileRecording`
 4. **Execution** — Method Mode methods compose the lower layers: `extractPage()` fires 7 parallel `bridge.send()` calls; `click()` runs the actionability engine; `react.getVersion()` evaluates framework-specific expressions
 5. **Error Recovery (Agentic REPL)** — On failure, the browser stays in the exact state that produced the error. The model reads the structured error, adjusts, and calls `execute` again. Framework cache persists — no re-detection unless URL changed
 
@@ -201,15 +228,28 @@ The JIT Context MCP Runtime is a layered execution architecture where each layer
 
 ### How It Compares
 
-| Dimension | Standard MCP | Cloudflare Code Mode | JIT Context Runtime |
-|-----------|-------------|---------------------|---------------------|
-| **Tools in context** | 50-100+ schemas | 2 (`search`, `execute`) | 3 (`search`, `execute`, `connect_tab`) |
-| **Execution environment** | N/A (tool calls) | V8 isolate (stateless) | Local async sandbox (stateful, tethered to live browser) |
+Code Mode is Cloudflare's idea and a good one: present tools as a typed API and let the model
+write code against it, because models have seen far more code than tool calls. Crawlio Browser
+applies that pattern to a target it was not built for — a live browser holding your session.
+This is an MCP server, not an alternative to MCP.
+
+| Dimension | Standard MCP | Cloudflare Code Mode | Crawlio Browser |
+|-----------|-------------|---------------------|-----------------|
+| **Tools in context** | 50-100+ schemas | 2 (`search`, `execute`) | <!--n:code-->6<!--/n--> (3 primary + 3 async job tools) |
+| **Execution environment** | N/A (tool calls) | V8 isolate (stateless) | Local async sandbox, tethered to a live browser |
 | **DOM access** | Via individual tool calls | None | Live, persistent, framework-aware |
-| **Framework awareness** | None | None | 17 namespaces, injected JIT |
+| **Framework awareness** | None | None | up to <!--n:ns-->17<!--/n--> namespaces, attached per page |
 | **Action resilience** | Model must handle timing | N/A (no DOM) | Built-in actionability polling + settle delays |
-| **Error recovery** | Re-call individual tool | Re-create isolate | Re-execute against same live state (Agentic REPL) |
-| **Multi-step patterns** | Model improvises | Model writes loops | 17 tested higher-order methods + behavioral protocol |
+| **Error recovery** | Re-call individual tool | Re-create isolate | Re-run against the state that produced the error |
+| **Multi-step patterns** | Model improvises | Model writes loops | <!--n:higher-->18<!--/n--> tested higher-order methods + behavioral protocol |
+
+The row that matters is error recovery. An isolate is disposable by design — that is what makes
+it safe to run untrusted code, and it means a failure discards the state that caused it. Here
+execution is tethered to a real tab, so when code fails the browser is still sitting in exactly
+the situation that broke it: same scroll position, same modal, same half-filled form. The model
+reads the error and runs again against that. Neither approach is better in general; they are
+answers to different problems, and the sandboxing guarantees Cloudflare gets from V8 isolates
+are genuinely stronger than what a local async sandbox provides.
 
 [Read the full architecture guide &rarr;](https://docs.crawlio.app/browser-agent/overview)
 
@@ -217,9 +257,15 @@ The JIT Context MCP Runtime is a layered execution architecture where each layer
 
 ### Code Mode (3 primary tools) — default
 
-Collapses 145 tools into 3 high-level tools with ~95% schema token reduction (plus
-`get_job_result`, `list_jobs`, and `cancel_job` for async execution, so `tools/list`
-reports 6):
+Collapses <!--n:full-->145<!--/n--> tools into three high-level tools, plus `get_job_result`,
+`list_jobs`, and `cancel_job` for async execution — so `tools/list` reports
+<!--n:code-->6<!--/n-->.
+
+That makes the `tools/list` payload **<!--n:reduction-->83<!--/n-->% smaller**, measured by
+serializing the result each mode actually returns rather than estimated from a tool count. Code
+mode is not free: `execute` and `search` carry long descriptions, which is why the figure is 83%
+and not the ~95% a naive tools-only ratio suggests. Check it yourself — `npx crawlio-browser
+tools --json` prints both surfaces without connecting to anything.
 
 | Tool | Description |
 |------|-------------|
@@ -235,7 +281,7 @@ const screenshot = await bridge.send({ type: 'take_screenshot' }, 10000);
 return screenshot;
 ```
 
-### Full Mode (145 tools)
+### Full Mode (<!--n:full-->145<!--/n--> tools)
 
 Every tool exposed directly to the LLM. Enable with `--full`:
 
@@ -430,16 +476,36 @@ When a framework is detected, the smart object exposes framework-specific helper
 
 ## Method Mode
 
-Method Mode is a domain layer built on top of Code Mode. It adds higher-order methods, a typed evidence system, and a behavioral protocol to the `execute` sandbox — without changing the tool surface. The model still sees three tools. The same `smart` object. The same 178-command catalog underneath. What changes is what happens *inside* `execute`.
+Code Mode asks the model to write code. Method Mode gives that code a tested vocabulary:
+<!--n:higher-->18<!--/n--> higher-order methods that encode the multi-step patterns a model
+would otherwise improvise.
+
+```javascript
+await smart.extractTable(selector)   // not a hand-rolled scrape loop
+await smart.scrollCapture()          // not a guessed scroll cadence
+```
+
+It is a domain layer over Code Mode, not a replacement: the tool surface does not change, the
+model still sees the same three primary tools, and the same <!--n:catalog-->178<!--/n-->-command
+catalog sits underneath. What changes is what happens *inside* `execute`.
+
+The surface is assembled per page. Detection recognizes <!--n:frameworks-->64<!--/n-->
+frameworks and attaches up to <!--n:ns-->17<!--/n--> matching namespaces, so `smart.react.*`
+exists only where React does — the model never has to ask what the page is built with, or guess
+at hook paths and fiber internals to find out.
+
+And because execution is tethered to a live tab rather than a disposable isolate, a failure
+leaves the browser in the exact state that produced it. The model reads the structured error and
+runs again against that state, rather than rebuilding the situation from scratch.
 
 ### The Maturity Ladder
 
 | Layer | Optimizes For | Behavioral Variance | Evidence Quality |
 |-------|---------------|---------------------|-----------------|
-| **Raw MCP** (145 tools) | Completeness | High — flat tool list, no composition guidance | None — unstructured text |
-| **Code Mode** (3 tools) | Token efficiency | Medium — right primitives, ad-hoc composition | None — model-defined shapes |
-| **Method Mode v1** (+ 17 methods + protocol) | Consistency | Low — proper methods, protocol constraints | Convention — `{ finding, evidence, url }` |
-| **Method Mode v2** (+ typed evidence + gaps + confidence) | Correctness | Minimal — typed schemas, tool-enforced findings | Structural — typed records, gap tracking, confidence propagation |
+| **Raw MCP** (<!--n:full-->145<!--/n--> tools) | Completeness | High — flat tool list, no composition guidance | None — unstructured text |
+| **Code Mode** (<!--n:code-->6<!--/n--> tools) | Token efficiency | Medium — right primitives, ad-hoc composition | None — model-defined shapes |
+| **Method Mode** (+ <!--n:higher-->18<!--/n--> methods + protocol) | Consistency | Low — proper methods, protocol constraints | Convention — `{ finding, evidence, url }` |
+| **+ typed evidence** (gaps + confidence) | Correctness | Minimal — typed schemas, tool-enforced findings | Structural — typed records, gap tracking, confidence propagation |
 
 ### Architecture
 
@@ -455,19 +521,20 @@ Method Mode is a domain layer built on top of Code Mode. It adds higher-order me
 │  │  finding() · findings() · clearFindings()            │  │
 │  │  Typed records · Coverage gaps · Confidence prop.    │  │
 │  ├──────────────────────────────────────────────────────┤  │
-│  │  Higher-Order Methods  [8]                           │  │
+│  │  Higher-Order Methods  [18]                          │  │
 │  │  scrollCapture · waitForIdle · extractPage ·         │  │
 │  │  comparePages · detectTables · extractTable ·        │  │
-│  │  waitForNetworkIdle · extractData                    │  │
+│  │  waitForNetworkIdle · extractData · detectSections · │  │
+│  │  detectTechnologies · parseTrackingPixels · ...      │  │
 │  ├──────────────────────────────────────────────────────┤  │
 │  │  Smart Core  [7 methods]                             │  │
 │  │  evaluate · click · type · navigate · waitFor ·      │  │
-│  │  snapshot · screenshot                               │  │
+│  │  snapshot · rebuild                                  │  │
 │  ├──────────────────────────────────────────────────────┤  │
-│  │  Framework Namespaces  [up to 17, injected JIT]      │  │
+│  │  Framework Namespaces  [up to 17, attached per page] │  │
 │  │  react · vue · angular · nextjs · shopify · ...      │  │
 │  ├──────────────────────────────────────────────────────┤  │
-│  │  bridge.send()  — 178 raw commands                   │  │
+│  │  bridge.send()  — the browser command channel        │  │
 │  └──────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -635,8 +702,12 @@ Multi-framework detection returns a **primary** framework (meta-framework takes 
 
 ## Tools Reference
 
+The table below is a hand-written guide to the commonly used tools, not the complete set. For
+the full, current surface — all <!--n:full-->145<!--/n--> of them, read from the server itself —
+run `npx crawlio-browser tools --full`.
+
 <details>
-<summary><b>All 145 tools</b> — Connection, Capture, Navigation, Network, Storage, Emulation, Tracking, SEO, and more</summary>
+<summary><b>Tool reference</b> — Connection, Capture, Navigation, Network, Storage, Emulation, Tracking, SEO, and more</summary>
 
 ### Connection & Status
 
@@ -832,7 +903,7 @@ Multi-framework detection returns a **primary** framework (meta-framework takes 
 ## Requirements
 
 - **Node.js** >= 18
-- **Chrome** (or Chromium) with the [Crawlio Agent extension](https://www.crawlio.app/browser-agent) installed
+- **Chrome** (or Chromium) with the [Crawlio for Chrome extension](https://www.crawlio.app/browser-agent) installed
 - **Crawlio.app** (optional) — for site crawling and enrichment
 
 ## Build from Source

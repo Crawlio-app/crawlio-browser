@@ -1,5 +1,51 @@
 # Changelog
 
+## [1.9.0] - 2026-08-05
+
+The product now answers to one name, and the numbers it advertises are measured rather than
+typed.
+
+### Added
+
+- **`crawlio-browser tools`** — prints the exact tool surface each mode exposes, without a
+  browser, an extension, or a network connection. `--full` for all 145, `--json` for a
+  machine-readable form you can diff across versions. Installing this server hands an agent the
+  debugger permission on a browser holding live sessions, so being able to read what it exposes
+  *before* configuring a client is a reasonable thing to ask for
+- **`npm run check:surface`** — fails CI when a documented count disagrees with the server.
+  Numbers in the README carry markers checked against `tools --json`; `--fix` rewrites them
+
+### Fixed
+
+- **Full mode reported the wrong tool count on startup.** The banner read
+  `exposing all 114 tools` while exposing 145. It is now counted, not quoted
+- **Corrected every advertised count.** The README claimed "3 tools" where a client sees 6,
+  "8 higher-order methods" in three places and "17" in a fourth (there are 18), "detects 17
+  frameworks" on one line and the correct 64 on another, and `bridge` "133 commands", which
+  matched nothing measurable. A section titled "All 145 tools" listed 92
+- **The `~95% schema token reduction` claim was an estimate, and wrong.** Measured on the
+  serialized `tools/list` payload each mode returns, the reduction is **83%** — code mode is not
+  free, because `execute` and `search` carry long descriptions. The README now states the
+  measured figure and the method
+- **Unreachable fallback in robot training.** `process.cwd() || …` could never take the fallback
+  branch — `process.cwd()` throws rather than returning empty — and the dead branch hardcoded a
+  developer's Desktop path. Now a real `try`/`catch` falling back to the home directory
+
+### Changed
+
+- **One name: Crawlio Browser.** The README's title said "Crawlio Agent" above an npm badge and
+  install command that both said `crawlio-browser`. The npm package, CLI, MCP server name and
+  repository already agreed; the prose now does too. The Chrome extension keeps its Web Store
+  name, **Crawlio for Chrome**, and is described as the browser-side component
+- The macOS process title is now `Crawlio Browser`. The `~/.crawlio/Crawlio Agent.app` bundle
+  path is deliberately unchanged: `buildStdioEntry()` writes it into client config files, so
+  renaming or removing it would break every install that already points there
+- **Method Mode is the product's one coined term.** The runtime it sits on is described rather
+  than branded; "JIT Context Runtime" is no longer used as a name
+- Shipped skill documentation no longer states hand-maintained command counts, pointing at
+  `crawlio-browser tools --full` and `search` instead — both read the live builders
+- CI pins moved to `actions/checkout@v7`, `actions/setup-node@v7` and `codeql-action@v4`
+
 ## [1.8.0] - 2026-08-04
 
 Crawlio Browser is now **open source under Apache-2.0** at

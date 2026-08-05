@@ -20,7 +20,9 @@ import { appendFileSync, mkdirSync, existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join, dirname } from "path";
 
-process.title = "Crawlio Agent";
+// Shown in Activity Monitor and `ps`. scripts/reap-stale-mcp.sh matches on this, and still
+// accepts the former "Crawlio Agent" so a server started before an upgrade stays reapable.
+process.title = "Crawlio Browser";
 
 // --- Crash/exit observability ---------------------------------------------------------------
 // Disconnects used to be a black box: the process exited and the reason scrolled past in the
@@ -86,6 +88,15 @@ if (process.argv.includes("doctor")) {
   process.exit(await runDoctor(process.argv.slice(2)));
 }
 
+// `tools` — the exact surface each mode exposes, derived from the builders themselves.
+// Must stay above the mode/transport setup below: installing this server hands an agent the
+// debugger permission on a live browser, so reading what it exposes has to be possible
+// without connecting anything.
+if (process.argv.includes("tools")) {
+  const { runTools } = await import("./tools-report.js");
+  process.exit(await runTools(process.argv.slice(2)));
+}
+
 const codeMode = !process.argv.includes("--full");
 if (process.argv.includes("--code-mode")) {
   console.error("[MCP] Note: --code-mode is now the default and can be removed");
@@ -140,7 +151,8 @@ const tools = codeMode
   : createTools(bridge, crawlio);
 
 if (!codeMode) {
-  console.error("[MCP] Full mode — exposing all 114 tools");
+  // Counted, not quoted. This line said 114 for as long as the surface had been 145.
+  console.error(`[MCP] Full mode — exposing all ${tools.length} tools`);
 } else {
   console.error(`[MCP] Code mode (default) — ${tools.length} tools (search, execute, connect_tab + async jobs: get_job_result, list_jobs, cancel_job)`);
 }

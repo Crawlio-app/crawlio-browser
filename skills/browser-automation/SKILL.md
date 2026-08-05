@@ -1,10 +1,10 @@
 ---
 name: browser-automation
-description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates crawlio-agent's 114 browser tools via the search + execute + connect_tab interface.
+description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates Crawlio Browser's 145 browser tools via the search + execute + connect_tab interface.
 allowed-tools: mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab
 ---
 
-# Browser Automation with Crawlio Agent
+# Browser Automation with Crawlio Browser
 
 ## When to Use
 
@@ -335,7 +335,7 @@ When you don't know the exact command, search first:
 search({ query: "cookies" })
 ```
 
-This returns matching command names, descriptions, and parameter schemas from the full catalog of 147 commands (114 browser + 33 desktop).
+This returns matching command names, descriptions, and parameter schemas from the full catalog of 178 commands (145 browser + 33 desktop).
 
 ## Desktop Integration (Crawlio App)
 
@@ -560,4 +560,4 @@ For multi-page research protocols (competitive analysis, site audits), see the *
 
 ## Reference
 
-See [reference.md](./reference.md) for the full list of all 114 browser commands and 33 desktop commands with parameters.
+See [reference.md](./reference.md) for a curated reference with parameters. For the complete, current surface run `crawlio-browser tools --full`, or `search` it from inside `execute` — both read the live builders, so neither can go stale.
