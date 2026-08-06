@@ -1,6 +1,6 @@
 {
   "name": "crawlio-browser",
-  "version": "1.9.4",
+  "version": "1.9.5",
   "mcpName": "app.crawlio/crawlio-browser",
   "description": "MCP server with 145 CDP-backed tools for browser automation — screenshots, DOM, network capture, framework detection, cookies, storage, session recording, structured data extraction, tracking analysis, SEO auditing, technographic fingerprinting, performance metrics via Chrome",
   "type": "module",
@@ -40,8 +40,8 @@
     "oss:export": "node scripts/export-oss.mjs",
     "oss:check": "node scripts/check-oss-clean.mjs",
     "prepublishOnly": "npm run check:versions && npm run typecheck && npm run test && npm run build:selectors && npm run build:semantic-grounding && npm run build:server && npm run check:surface",
-    "build:extension": "rm -rf dist/extension && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension --define.__DEV__=false --minify && cd dist/extension && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.prod.json dist/extension/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon16.png src/extension/icon32.png src/extension/icon48.png src/extension/icon128.png dist/extension/",
-    "build:dev": "rm -rf dist/extension-dev && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension-dev --define.__DEV__=true && cd dist/extension-dev && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.dev.json dist/extension-dev/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon*.png dist/extension-dev/",
+    "build:extension": "rm -rf dist/extension && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension --define.__DEV__=false --define.__BUILD_ID__=\\\"$(date -u +%Y%m%dT%H%M%SZ)\\\" --minify && cd dist/extension && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.prod.json dist/extension/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon16.png src/extension/icon32.png src/extension/icon48.png src/extension/icon128.png dist/extension/",
+    "build:dev": "rm -rf dist/extension-dev && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension-dev --define.__DEV__=true --define.__BUILD_ID__=\\\"$(date -u +%Y%m%dT%H%M%SZ)\\\" && cd dist/extension-dev && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.dev.json dist/extension-dev/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon*.png dist/extension-dev/",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

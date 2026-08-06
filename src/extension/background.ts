@@ -2525,12 +2525,30 @@ async function requireDebuggerTab(): Promise<number> {
 
 // Ensure the tab is focused and active before input dispatch — UNLESS it was connected in
 // background mode (connect_tab({background:true})), where we must never steal the user's active
-// tab/window (harness invariant). CDP input still reaches a background tab: browser_scroll and
-// agent-sessions already drive non-focused tabs successfully.
+// tab/window.
+//
+// Background mode needs more than declining to focus. A tab whose visibilityState is "hidden"
+// does not process synthetic mouse or key events at all: the click is dispatched, nothing
+// errors, and the page never sees it. (Scrolling and Runtime.evaluate do work, which is why
+// this went unnoticed — it looked like input reached background tabs.) Focus emulation tells
+// the renderer to behave as focused and rendered, which is what makes dispatched input land.
+// Both calls are best-effort: they are no-ops on a target that does not support them.
+async function enableBackgroundInput(tabId: number): Promise<void> {
+  try {
+    await sendCDPCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }, 0, 3000);
+  } catch { /* older Chrome or unsupported target — fall through */ }
+  try {
+    await sendCDPCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" }, 0, 3000);
+  } catch { /* best-effort un-freeze */ }
+}
+
 async function ensureTabFocused(tabId: number): Promise<void> {
   try {
     const stored = (await chrome.storage.session.get("crawlio:connectedTab"))["crawlio:connectedTab"] as { tabId?: number; background?: boolean } | undefined;
-    if (stored?.tabId === tabId && stored.background === true) return; // background connect — no focus-steal
+    if (stored?.tabId === tabId && stored.background === true) {
+      await enableBackgroundInput(tabId);
+      return; // background connect — no focus-steal
+    }
     const tab = await chrome.tabs.get(tabId);
     if (tab.windowId !== undefined) {
       await chrome.windows.update(tab.windowId, { focused: true });
@@ -3439,11 +3457,18 @@ async function isElementInViewport(tabId: number, objectId: string): Promise<boo
 async function scrollElementIntoView(tabId: number, objectId: string): Promise<void> {
   try {
     await sendCDPCommand({ tabId }, "DOM.scrollIntoViewIfNeeded", { objectId });
-  } catch {
-    // Fallback: JS scrollIntoView
+  } catch { /* fall through to the in-page scroll below */ }
+
+  // DOM.scrollIntoViewIfNeeded does nothing on a tab Chrome is not rendering — a background tab
+  // that has never been foregrounded — and it does not report that it did nothing. So verify
+  // rather than trust: if the element is still outside the viewport, scroll from inside the
+  // page, which updates layout even while the tab is hidden. Without this a click on a
+  // background tab is dispatched at a point where elementFromPoint returns null, and lands on
+  // nothing while reporting success.
+  if (!(await isElementInViewport(tabId, objectId))) {
     await sendCDPCommand({ tabId }, "Runtime.callFunctionOn", {
       objectId,
-      functionDeclaration: `function() { this.scrollIntoView({ behavior: 'instant', block: 'end', inline: 'nearest' }); }`,
+      functionDeclaration: `function() { this.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }); }`,
     });
   }
 }
@@ -4371,6 +4396,13 @@ async function handleCommand(command: any): Promise<any> {
         }
 
         return { type: "response", id, success: true, data: {
+          // Which build is actually loaded. An unpacked extension does not hot-reload, so after
+          // editing the source there is no way to tell from the outside whether Chrome is
+          // running the new code or the old — which has cost real debugging cycles, chasing a
+          // fix that was never loaded. The manifest version alone is not enough, since it does
+          // not change between rebuilds within a release.
+          extensionVersion: chrome.runtime.getManifest().version,
+          buildId: __BUILD_ID__,
           connected: isConnected,
           tools,
         }};

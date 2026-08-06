@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.9.5] - 2026-08-06
+
+Background operation actually works now. Clicking, keyboard input and dragging on a tab the user
+is not looking at previously did nothing at all.
+
+### Fixed
+
+- **Synthetic input never reached a hidden tab.** `connect_tab({background: true})` correctly
+  declines to steal focus, but a tab whose `visibilityState` is `hidden` does not process
+  dispatched mouse or key events: the command was sent, nothing errored, and the page never saw
+  it. Scrolling and `Runtime.evaluate` *do* work on a hidden tab, which is why this went
+  unnoticed — a comment in the extension asserted "CDP input still reaches a background tab",
+  generalising from the two mechanisms that happen to work to the ones that do not.
+
+  Background connections now enable `Emulation.setFocusEmulationEnabled` and
+  `Page.setWebLifecycleState({state:"active"})`, which is what makes a non-rendered page accept
+  dispatched input. Both are best-effort no-ops on targets that do not support them. Click,
+  double-click, `press_key` and `drag` now all work on a hidden tab, and focus is still never
+  taken — verified against a real browser while the active tab stayed put throughout.
+
+  The discriminator is `visibilityState`, not focus: input to an *unfocused but rendered* tab
+  always worked, which is why this reproduced only on a tab created in the background that had
+  never been foregrounded.
+- **Scrolling a target into view silently failed on background tabs.**
+  `DOM.scrollIntoViewIfNeeded` is a no-op on a tab Chrome is not rendering and does not report
+  it, so the existing in-page fallback — which only ran in a `catch` — never fired. The scroll
+  is now verified, and falls back to scrolling from inside the page when the element is still
+  outside the viewport.
+
+### Added
+
+- **`get_capabilities` reports `extensionVersion` and `buildId`.** An unpacked extension does not
+  hot-reload and the manifest version does not change between rebuilds within a release, so
+  there was no way to tell whether Chrome had loaded newly built code. That ambiguity cost real
+  debugging time chasing a fix that was never loaded.
+- `tests/e2e-sessions.mjs` — background operation, multi-session isolation, tab navigation and
+  the full input battery against a real browser, asserting throughout that the user's active tab
+  never changes. 24 checks; it is what found the input defect above.
+
 ## [1.9.4] - 2026-08-06
 
 ### Fixed
