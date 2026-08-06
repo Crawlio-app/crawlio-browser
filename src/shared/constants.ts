@@ -2,7 +2,7 @@ import { homedir } from "os";
 import { join } from "path";
 
 // Single source of truth — bump here, tests enforce sync with package.json
-export const PKG_VERSION = "1.9.3";
+export const PKG_VERSION = "1.9.4";
 
 // CRAWLIO_WS_PORT relocates the whole 10-slot range (tests/dev isolation).
 // The extension only discovers the default range (background.ts WS_PORT_END),

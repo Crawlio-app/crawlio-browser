@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.9.4] - 2026-08-06
+
+### Fixed
+
+- **A click on an element below the fold reported success and did nothing.**
+  `prepareElementForInteraction` scrolled only when `isElementVisible` said no, and that check
+  asks whether an element is *rendered* — `display`, `visibility`, `opacity`, and a non-zero
+  rect. A button 1298px down an 800px viewport passes all four, so no scroll happened,
+  `getElementCenter` returned its box-model coordinate, and `Input.dispatchMouseEvent`
+  interpreted that as a *viewport* coordinate and dispatched outside the viewport. Nothing
+  errored, so the command returned `{action:"click", selector, x, y, snapshot}` — a success
+  shape, with coordinates, for a click that never landed.
+
+  A new `isElementInViewport` check tests the element's **centre**, which is the exact point a
+  click is dispatched at, and the pipeline now scrolls when a target is either not rendered or
+  not reachable. This fixes every handler routed through `withFreshElement` — click,
+  double-click, hover, type and the rest — in both modes and through raw `bridge.send`.
+  Previously `smart.click` worked only because `pollActionability` happened to scroll first, so
+  the same command succeeded or silently missed depending on which path reached it.
+- **Six tools were missing from the code-mode invocation hints.** `detect_tables` and
+  `extract_table` are server-composed and need their `smart.*` helpers; the four
+  `robot_training_*` tools have neither a bridge command nor a `smart.*` binding and are
+  full-mode only. Code-mode callers who found them through `search` got no hint and hit
+  "Unknown command".
+
+### Added
+
+- `tests/e2e-stress.mjs` and a deterministic fixture page: one matrix driven through both code
+  mode and `--full` against a real browser, asserting effects rather than acknowledgements —
+  a click is verified by the DOM changing. It is what found the click defect. Not part of
+  `npm test`; it needs Chrome with the extension loaded.
+
 ## [1.9.3] - 2026-08-05
 
 A second sweep found defects the first pass missed — one of them a skill whose tools were never

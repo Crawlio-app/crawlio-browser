@@ -3401,6 +3401,40 @@ async function isElementVisible(tabId: number, objectId: string): Promise<boolea
   return result.result.value;
 }
 
+/**
+ * Is the point a click would be dispatched at actually inside the viewport?
+ *
+ * Separate from isElementVisible on purpose. That asks whether the element is RENDERED; this
+ * asks whether it is REACHABLE. Both matter, because getElementCenter returns a box-model
+ * coordinate and Input.dispatchMouseEvent interprets it as a VIEWPORT coordinate. An element
+ * scrolled below the fold is rendered, has a valid box model, and a center y larger than the
+ * viewport height — dispatching a click there lands on nothing, and the command still reports
+ * success because no step errored. Checking the center specifically (not mere overlap) is the
+ * point: a half-visible element's center is where the click actually goes.
+ */
+async function isElementInViewport(tabId: number, objectId: string): Promise<boolean> {
+  try {
+    const result = await sendCDPCommand<{ result: { value: boolean } }>(
+      { tabId }, "Runtime.callFunctionOn",
+      {
+        objectId,
+        functionDeclaration: `function() {
+          const r = this.getBoundingClientRect();
+          const vw = window.innerWidth || document.documentElement.clientWidth;
+          const vh = window.innerHeight || document.documentElement.clientHeight;
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          return cx >= 0 && cy >= 0 && cx <= vw && cy <= vh;
+        }`,
+        returnByValue: true,
+      }
+    );
+    return result.result.value === true;
+  } catch { /* treat an unanswerable check as out-of-view so we scroll rather than miss */
+    return false;
+  }
+}
+
 // Scroll element into view — CDP native with JS fallback
 async function scrollElementIntoView(tabId: number, objectId: string): Promise<void> {
   try {
@@ -3429,7 +3463,11 @@ async function getElementCenter(tabId: number, objectId: string): Promise<{ x: n
 async function prepareElementForInteraction(tabId: number, selector: string): Promise<{ objectId: string; x: number; y: number }> {
   const objectId = await resolveElement(tabId, selector);
 
-  if (!await isElementVisible(tabId, objectId)) {
+  // Scroll when the element is not rendered OR not reachable at its click point. The second
+  // condition is what makes a below-the-fold target work: it is rendered, so the old check
+  // passed, no scroll happened, and the click was dispatched at a coordinate outside the
+  // viewport — silently hitting nothing while reporting success.
+  if (!(await isElementVisible(tabId, objectId)) || !(await isElementInViewport(tabId, objectId))) {
     await scrollElementIntoView(tabId, objectId);
     if (!await isElementVisible(tabId, objectId)) {
       throw new Error(`Element not visible after scroll: ${selector}`);

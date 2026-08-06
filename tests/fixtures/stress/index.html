@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Crawlio Stress Fixture</title>
+<meta name="description" content="Deterministic page for the end-to-end stress harness.">
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; max-width: 900px; }
+  section { border: 1px solid #ddd; padding: 16px; margin: 16px 0; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+  .card { border: 1px solid #ccc; padding: 12px; margin: 8px 0; height: 64px; }
+  #overlay { position: absolute; background: rgba(0,0,0,.6); color: #fff; padding: 8px; z-index: 10; }
+  #drop-target { border: 2px dashed #999; padding: 24px; text-align: center; }
+  .tall { height: 1400px; background: linear-gradient(#fff, #eee); }
+  #hover-readout, #key-readout { font-family: monospace; }
+</style>
+</head>
+<body>
+
+<!--
+  Everything on this page exists because a case in tests/e2e-stress.mjs depends on it. Each
+  interactive control writes its result into a readout element, so the harness can assert that an
+  action had an EFFECT rather than that a tool returned ok — a tool acknowledging work it did not
+  do is the failure mode this fixture is built to catch.
+-->
+
+<header data-testid="page-header">
+  <h1 id="title">Crawlio Stress Fixture</h1>
+  <nav data-testid="main-nav" aria-label="Primary">
+    <a href="#tables">Tables</a> · <a href="#forms">Forms</a> · <a href="#drag">Drag</a>
+  </nav>
+</header>
+
+<main data-testid="main-content">
+
+  <!-- detect_tables fast path: a real table with a header row. -->
+  <section id="tables" aria-label="Tabular data">
+    <h2>Quarterly Results</h2>
+    <table id="results-table">
+      <thead><tr><th>Region</th><th>Quarter</th><th>Revenue</th><th>Report</th></tr></thead>
+      <tbody>
+        <tr><td>North</td><td>Q1</td><td>120000</td><td><a href="/report/north-q1">North Q1</a></td></tr>
+        <tr><td>South</td><td>Q1</td><td>98000</td><td><a href="/report/south-q1">South Q1</a></td></tr>
+        <tr><td>North</td><td>Q2</td><td>131500</td><td><a href="/report/north-q2">North Q2</a></td></tr>
+        <tr><td>South</td><td>Q2</td><td>104250</td><td><a href="/report/south-q2">South Q2</a></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- detect_tables geometric path: repeated blocks with consistent structure, no <table>. -->
+  <section id="cards" aria-label="Repeated blocks">
+    <h2>Product Cards</h2>
+    <div class="product-list">
+      <div class="card" data-sku="A-1"><span class="name">Widget A</span><span class="price">$10.00</span></div>
+      <div class="card" data-sku="B-2"><span class="name">Widget B</span><span class="price">$12.50</span></div>
+      <div class="card" data-sku="C-3"><span class="name">Widget C</span><span class="price">$9.99</span></div>
+      <div class="card" data-sku="D-4"><span class="name">Widget D</span><span class="price">$15.75</span></div>
+    </div>
+  </section>
+
+  <section id="forms" aria-label="Form controls">
+    <h2>Form</h2>
+    <form id="stress-form" onsubmit="return false">
+      <label>Name <input id="name-input" name="name" type="text"></label><br>
+      <label>Notes <textarea id="notes-input" name="notes" rows="2"></textarea></label><br>
+      <label><input id="agree-check" type="checkbox"> Agree</label><br>
+      <label><input type="radio" name="plan" id="plan-basic" value="basic"> Basic</label>
+      <label><input type="radio" name="plan" id="plan-pro" value="pro"> Pro</label><br>
+      <label>Region
+        <select id="region-select">
+          <option value="">Choose…</option>
+          <option value="north">North</option>
+          <option value="south">South</option>
+        </select>
+      </label><br>
+      <label>Upload <input id="file-input" type="file"></label>
+    </form>
+  </section>
+
+  <section id="actions" aria-label="Click targets">
+    <h2>Actions</h2>
+    <!-- Each writes a readout, so a click is verifiable rather than merely accepted. -->
+    <button id="click-btn" type="button">Click me</button>
+    <span id="click-readout">clicks=0</span><br>
+
+    <button id="dblclick-btn" type="button">Double-click me</button>
+    <span id="dblclick-readout">dblclicks=0</span><br>
+
+    <button id="hover-btn" type="button">Hover me</button>
+    <span id="hover-readout">hover=no</span><br>
+
+    <input id="key-input" type="text" placeholder="press keys here">
+    <span id="key-readout">lastKey=none</span>
+  </section>
+
+  <!-- Actionability: the poller has to be observed waiting, not assumed to work. -->
+  <section id="timing" aria-label="Delayed and obscured targets">
+    <h2>Actionability</h2>
+    <div id="delayed-slot"><em>delayed button appears after 1200ms…</em></div>
+    <div style="position: relative; margin-top: 12px;">
+      <div id="overlay">overlay clears after 1500ms</div>
+      <button id="covered-btn" type="button">Covered button</button>
+      <span id="covered-readout">covered=0</span>
+    </div>
+  </section>
+
+  <section id="drag" aria-label="Drag and drop">
+    <h2>Drag</h2>
+    <div id="drag-source" draggable="true">Drag this</div>
+    <div id="drop-target">Drop here — <span id="drop-readout">empty</span></div>
+  </section>
+
+  <section id="scroll" aria-label="Scrollable region">
+    <h2>Scroll</h2>
+    <div class="tall">Scroll region. Bottom marker below.</div>
+    <div id="scroll-marker">BOTTOM_MARKER</div>
+  </section>
+
+</main>
+
+<footer data-testid="page-footer">
+  <p>Fixture footer.</p>
+  <!-- Tracking pixel for parse_tracking_pixels. 1x1 transparent GIF, no network egress. -->
+  <img id="tracking-pixel" width="1" height="1" alt=""
+       src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+</footer>
+
+<script>
+  // Analytics globals the tracking parsers probe for. Stubs, so nothing leaves the machine —
+  // pushed events are held in memory for inspect_datalayer to read back.
+  window.dataLayer = window.dataLayer || [];
+  window.dataLayer.push({ event: "page_view", page_type: "fixture" });
+  window.dataLayer.push({ event: "view_item", ecommerce: { items: [{ item_id: "A-1", price: 10 }] } });
+
+  window.fbq = function () { (window.fbq.queue = window.fbq.queue || []).push(Array.from(arguments)); };
+  window.fbq("init", "000000000000000");
+  window.fbq("track", "PageView");
+  window.fbq("track", "ViewContent", { content_ids: ["A-1"], value: 10, currency: "USD" });
+
+  window.gtag = function () { (window.dataLayer = window.dataLayer || []).push(arguments); };
+  window.gtag("js", new Date(0));
+  window.gtag("config", "G-FIXTURE0000");
+
+  // --- Readouts. Every handler mutates visible state the harness can assert on. ---
+  var clicks = 0, dblclicks = 0, covered = 0;
+  document.getElementById("click-btn").addEventListener("click", function () {
+    clicks++; document.getElementById("click-readout").textContent = "clicks=" + clicks;
+  });
+  document.getElementById("dblclick-btn").addEventListener("dblclick", function () {
+    dblclicks++; document.getElementById("dblclick-readout").textContent = "dblclicks=" + dblclicks;
+  });
+  document.getElementById("hover-btn").addEventListener("mouseover", function () {
+    document.getElementById("hover-readout").textContent = "hover=yes";
+  });
+  document.getElementById("key-input").addEventListener("keydown", function (e) {
+    document.getElementById("key-readout").textContent = "lastKey=" + e.key;
+  });
+  document.getElementById("covered-btn").addEventListener("click", function () {
+    covered++; document.getElementById("covered-readout").textContent = "covered=" + covered;
+  });
+
+  // Appears late: a click issued immediately must wait for it.
+  setTimeout(function () {
+    var slot = document.getElementById("delayed-slot");
+    slot.innerHTML = '<button id="delayed-btn" type="button">Delayed button</button>' +
+                     '<span id="delayed-readout">delayed=0</span>';
+    var n = 0;
+    document.getElementById("delayed-btn").addEventListener("click", function () {
+      n++; document.getElementById("delayed-readout").textContent = "delayed=" + n;
+    });
+  }, 1200);
+
+  // Clears late: a click issued immediately is obscured until this runs.
+  setTimeout(function () {
+    var o = document.getElementById("overlay");
+    if (o && o.parentNode) o.parentNode.removeChild(o);
+  }, 1500);
+
+  // Drag/drop via HTML5 events.
+  var src = document.getElementById("drag-source");
+  var tgt = document.getElementById("drop-target");
+  src.addEventListener("dragstart", function (e) { e.dataTransfer.setData("text/plain", "dragged"); });
+  tgt.addEventListener("dragover", function (e) { e.preventDefault(); });
+  tgt.addEventListener("drop", function (e) {
+    e.preventDefault();
+    document.getElementById("drop-readout").textContent = e.dataTransfer.getData("text/plain") || "dropped";
+  });
+
+  // A stable marker so the harness can prove it is on the fixture and not a cached page.
+  window.__CRAWLIO_FIXTURE__ = { version: 1, ready: true };
+</script>
+</body>
+</html>

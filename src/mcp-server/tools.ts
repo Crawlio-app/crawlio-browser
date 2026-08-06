@@ -5317,10 +5317,16 @@ const CODE_MODE_HINTS: Record<string, string> = {
   detect_technologies: "code mode: smart.detectTechnologies({ confidenceThreshold }) — not a bridge.send command",
   extract_data: "code mode: smart.extractData() — not a bridge.send command",
   detect_sections: "code mode: smart.detectSections({ maxDepth, maxSections }) — not a bridge.send command",
+  detect_tables: "code mode: smart.detectTables({ minRows }) — not a bridge.send command; returns the candidate array directly",
+  extract_table: "code mode: smart.extractTable(selector) — not a bridge.send command",
   // Server-composed with NO code-mode path — available only in --full mode:
   seo_audit: "full-mode (--full) tool only — not reachable via bridge.send or smart.* in code mode",
   crux_metrics: "full-mode (--full) tool only — calls the Google CrUX API server-side",
   check_robots_txt: "full-mode (--full) tool only — not reachable via bridge.send in code mode",
+  robot_training_start: "full-mode (--full) tool only — server-composed, no bridge.send or smart.* path",
+  robot_training_status: "full-mode (--full) tool only — server-composed, no bridge.send or smart.* path",
+  robot_training_stop: "full-mode (--full) tool only — server-composed; pass the runId returned by robot_training_start",
+  robot_training_artifacts: "full-mode (--full) tool only — server-composed; pass the outputDir returned by start/stop",
   // Storage tools: the schema's `type` param collides with the bridge envelope's own
   // `type` key, so in code mode the storage kind must be passed as `storageType`:
   get_storage: "code mode: bridge.send({ type: 'get_storage', storageType: 'local'|'session', key? })",
