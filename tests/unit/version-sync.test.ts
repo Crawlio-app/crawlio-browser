@@ -25,7 +25,7 @@ describe("check-version-sync — publish gate", () => {
 
   function fakeRepo(versions: {
     pkg: string; constants: string; prod: string; dev: string; server: string; dist?: string;
-    plugin?: string; claudePlugin?: string; lock?: string; lockRoot?: string;
+    plugin?: string; claudePlugin?: string; lock?: string; lockRoot?: string; publicMirror?: boolean;
   }): string {
     const root = mkdtempSync(join(tmpdir(), "crawlio-version-sync-"));
     mkdirSync(join(root, "src", "shared"), { recursive: true });
@@ -43,11 +43,16 @@ describe("check-version-sync — publish gate", () => {
       mkdirSync(join(root, "dist", "extension"), { recursive: true });
       writeFileSync(join(root, "dist/extension/manifest.json"), JSON.stringify({ version: versions.dist }));
     }
-    // The plugin manifests default to agreeing, so a test that says nothing about them is
-    // testing the surface it named rather than tripping over one it did not.
-    writeFileSync(join(root, "plugin.json"), JSON.stringify({ version: versions.plugin ?? versions.pkg }));
-    mkdirSync(join(root, ".claude-plugin"), { recursive: true });
-    writeFileSync(join(root, ".claude-plugin/plugin.json"), JSON.stringify({ version: versions.claudePlugin ?? versions.pkg }));
+    if (!versions.publicMirror) {
+      // The plugin manifests default to agreeing, so a test that says nothing about them is
+      // testing the surface it named rather than tripping over one it did not. The private-only
+      // exporter is the explicit context marker that keeps both manifests mandatory.
+      mkdirSync(join(root, "scripts"), { recursive: true });
+      writeFileSync(join(root, "scripts/export-oss.mjs"), "// private source marker\n");
+      writeFileSync(join(root, "plugin.json"), JSON.stringify({ version: versions.plugin ?? versions.pkg }));
+      mkdirSync(join(root, ".claude-plugin"), { recursive: true });
+      writeFileSync(join(root, ".claude-plugin/plugin.json"), JSON.stringify({ version: versions.claudePlugin ?? versions.pkg }));
+    }
     return root;
   }
 
@@ -70,6 +75,16 @@ describe("check-version-sync — publish gate", () => {
     const { code, output } = run(dir);
     expect(code).toBe(0);
     expect(output).toContain("version sync OK");
+  });
+
+  it("validates the seven versioned surfaces retained by the sanitized public mirror", () => {
+    dir = fakeRepo({
+      pkg: "1.11.0", constants: "1.11.0", prod: "1.11.0", dev: "1.11.0", server: "1.11.0",
+      dist: "1.11.0", publicMirror: true,
+    });
+    const { code, output } = run(dir);
+    expect(code).toBe(0);
+    expect(output).toContain("all 7 surfaces at 1.11.0");
   });
 
   it("covers the plugin manifests, which drifted to 2.0.0 while nothing checked them", () => {

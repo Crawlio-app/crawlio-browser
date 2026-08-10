@@ -58,7 +58,7 @@ function readConstantsVersion(relPath) {
 }
 
 export function collectVersions() {
-  return [
+  const core = [
     readJSONVersion("package.json"),
     // npm uses both fields when materializing the package tree. This lockfile sat at 1.8.0 while
     // package.json reached 1.10.0 because it was outside the release gate.
@@ -68,6 +68,18 @@ export function collectVersions() {
     readJSONVersion("src/extension/manifest.dev.json"),
     readJSONVersion("server.json"),
     readJSONVersion("dist/extension/manifest.json"),
+  ];
+  // The sanitized public mirror deliberately excludes plugin metadata and the private export
+  // machinery. Keep all nine release surfaces mandatory in the private source tree, while the
+  // reduced mirror validates the seven surfaces it actually contains. Requiring either the
+  // exporter or one plugin manifest prevents an accidentally deleted private manifest from being
+  // mistaken for the public mirror.
+  const pluginSurfacesRequired = existsSync(join(ROOT, "scripts/export-oss.mjs"))
+    || existsSync(join(ROOT, "plugin.json"))
+    || existsSync(join(ROOT, ".claude-plugin/plugin.json"));
+  if (!pluginSurfacesRequired) return core;
+  return [
+    ...core,
     // Both plugin manifests. The legacy .claude-plugin/ one sat at 2.0.0 against a 1.10.0 package
     // for exactly as long as nothing checked it — it is the same failure this script exists for,
     // one file over.
