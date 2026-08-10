@@ -1,10 +1,21 @@
-import { describe, expect, it } from "vitest";
+// Port-isolated before importing anything that reads WS_PORT. This starts a real listener, and
+// the production range 9333-9342 is usually occupied on a developer machine — the portal holds
+// one and every other bridge test contends for the rest. That made this file fail intermittently
+// in a full run and pass alone, which is the least useful way for a test to fail.
+
+import { describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { WebSocketBridge } from "../../src/mcp-server/websocket-bridge.js";
 import { BRIDGE_DIR } from "../../src/shared/constants.js";
 import { verifyHandshakeProof, randomNonce, HANDSHAKE_MESSAGE_TYPES } from "../../src/shared/bridge-handshake.js";
+
+// Relocate the port range BEFORE constants.ts is evaluated. A plain top-level assignment
+// does not work here: ES imports are hoisted, so WS_PORT is already read by the time it
+// runs — which is how these "isolated" suites ended up binding the production range.
+vi.hoisted(() => { process.env.CRAWLIO_WS_PORT = "19833"; });
+
 
 /**
  * Wire-level integration for the token bootstrap (rt-bridge ship-blocker follow-up):

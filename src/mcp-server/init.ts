@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, chmodSync, renameSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, cpSync, chmodSync, renameSync } from "fs";
 import { join, resolve, dirname, sep, basename } from "path";
 import { homedir, platform } from "os";
 import { createServer as createNetServer } from "net";
@@ -744,24 +744,22 @@ async function startDetachedServer(serverPath: string, nodePath: string): Promis
 
 // --- Skill installation ---
 
-interface SkillDef {
-  name: string;
-  files: string[];
+/**
+ * The skills to install, read from disk rather than listed here.
+ *
+ * A hardcoded list drifts the moment a skill is added, and an enumerated `files` array per skill
+ * drifts the moment one grows a `references/` directory — the copy would silently omit it and the
+ * installed skill would link to documentation that never arrived. Whatever is in `skills/` is what
+ * ships (it is a bare directory entry in package.json `files`), so whatever is there is what
+ * installs.
+ */
+function bundledSkillNames(skillsRoot: string): string[] {
+  if (!existsSync(skillsRoot)) return [];
+  return readdirSync(skillsRoot, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(join(skillsRoot, e.name, "SKILL.md")))
+    .map((e) => e.name)
+    .sort();
 }
-
-const BUNDLED_SKILLS: SkillDef[] = [
-  { name: "browser-automation", files: ["SKILL.md", "reference.md"] },
-  { name: "canonical-recording", files: ["SKILL.md"] },
-  { name: "robot-training", files: ["SKILL.md"] },
-  { name: "web-research", files: ["SKILL.md"] },
-  { name: "investigate", files: ["SKILL.md"] },
-  { name: "extract", files: ["SKILL.md"] },
-  { name: "compare", files: ["SKILL.md"] },
-  { name: "clone", files: ["SKILL.md"] },
-  { name: "dossier", files: ["SKILL.md"] },
-  { name: "monitor", files: ["SKILL.md"] },
-  { name: "test", files: ["SKILL.md"] },
-];
 
 export function installBrowserSkill(dryRun: boolean): void {
   console.log("");
@@ -776,39 +774,31 @@ export function installBrowserSkill(dryRun: boolean): void {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectClaudeDir = join(process.cwd(), ".claude");
   const hasProjectDir = existsSync(projectClaudeDir);
+  const skillsRoot = resolve(moduleDir, "..", "..", "skills");
 
-  for (const skill of BUNDLED_SKILLS) {
-    const skillSrcDir = resolve(moduleDir, "..", "..", "skills", skill.name);
+  const names = bundledSkillNames(skillsRoot);
+  if (names.length === 0) {
+    console.log(`    ${yellow("!")} No skills found at ${dim(skillsRoot)}`);
+    return;
+  }
 
-    if (!existsSync(join(skillSrcDir, "SKILL.md"))) {
-      console.log(`    ${yellow("!")} Skill source not found at ${dim(skillSrcDir)}`);
-      continue;
-    }
-
-    const userDest = join(claudeDir, "skills", skill.name);
-    const projectDest = hasProjectDir ? join(projectClaudeDir, "skills", skill.name) : null;
+  for (const name of names) {
+    const skillSrcDir = join(skillsRoot, name);
+    const userDest = join(claudeDir, "skills", name);
+    const projectDest = hasProjectDir ? join(projectClaudeDir, "skills", name) : null;
 
     if (dryRun) {
-      console.log(`    ${dim("~")} Would copy ${skill.files.join(" + ")} to ${userDest}`);
-      if (projectDest) {
-        console.log(`    ${dim("~")} Would copy ${skill.files.join(" + ")} to ${projectDest}`);
-      }
+      console.log(`    ${dim("~")} Would copy ${name}/ to ${userDest}`);
+      if (projectDest) console.log(`    ${dim("~")} Would copy ${name}/ to ${projectDest}`);
       continue;
     }
 
-    mkdirSync(userDest, { recursive: true });
-    for (const file of skill.files) {
-      const src = join(skillSrcDir, file);
-      if (existsSync(src)) copyFileSync(src, join(userDest, file));
-    }
+    // Whole directory, so a skill that grows references/ or scripts/ installs complete.
+    cpSync(skillSrcDir, userDest, { recursive: true });
     console.log(`    ${green("+")} Skill installed to ${dim(userDest)}`);
 
     if (projectDest) {
-      mkdirSync(projectDest, { recursive: true });
-      for (const file of skill.files) {
-        const src = join(skillSrcDir, file);
-        if (existsSync(src)) copyFileSync(src, join(projectDest, file));
-      }
+      cpSync(skillSrcDir, projectDest, { recursive: true });
       console.log(`    ${green("+")} Skill installed to ${dim(projectDest)}`);
     }
   }
@@ -1208,7 +1198,8 @@ async function printSummary(options: InitOptions): Promise<void> {
     const modeLabel = options.full ? "Full mode" : "Code mode";
     // Counted, not quoted. This line is the last thing an installer reads, and it spent several
     // releases claiming 114 tools in full mode and 3 in code mode when the real numbers were
-    // 145 and 6. Imported lazily so the tool builders load only when this summary is printed.
+    // Historical fixed counts drifted repeatedly. Imported lazily so the live builders are the
+    // only source of truth when this summary is printed.
     const { describeSurface } = await import("./surface.js");
     const surface = await describeSurface();
     const countLabel = options.full

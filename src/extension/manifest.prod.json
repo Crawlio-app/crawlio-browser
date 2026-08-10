@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Crawlio for Chrome",
-  "version": "1.9.5",
+  "version": "1.11.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmTjb8dwVYy3bUJ7jONp7V8Nbnb6dEdxC7/EujravNa1KrfkUDA5pY/aksnXOmOrJ6tpEDCPlBQdATYwwIZwU/6B12rHmy/yJ7A6LiIC1dreix5GnHiKJLzOTouIMcMHULb+fg8f6mrWe+m/+x3fauSF/U8PlhFyHuqX5H4exA6Grjg4aMcQEpPlu9+cQ98zBYTHUhTAZIMpV+7SZErBRY7RoBUyETYqEyE4p20oaB6UCgBysKcXOzD/XgyF8herCJJGiDfW2r7UDS/shQl90wy6hsIdAn4ZAZg2ISXjoK2CPV3bjvs3FpcNblO/mITpfkjc593KG304XS2/jtVeveQIDAQAB",
   "description": "Connect AI to your Browser. Let it navigate, click, take screenshots, inspect network traffic, and extract data.",
   "homepage_url": "https://www.crawlio.app/browser-agent",
@@ -37,19 +37,27 @@
   },
   "commands": {
     "connect-tab": {
-      "suggested_key": { "default": "Alt+Shift+C" },
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
       "description": "Connect to active tab"
     },
     "capture-page": {
-      "suggested_key": { "default": "Alt+Shift+X" },
+      "suggested_key": {
+        "default": "Alt+Shift+X"
+      },
       "description": "Capture current page"
     },
     "take-screenshot": {
-      "suggested_key": { "default": "Alt+Shift+S" },
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
       "description": "Take screenshot"
     },
     "toggle-recording": {
-      "suggested_key": { "default": "Alt+Shift+R" },
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
       "description": "Stop recording"
     }
   }

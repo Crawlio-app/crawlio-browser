@@ -1,5 +1,87 @@
 # Changelog
 
+## [1.11.0] - 2026-08-09
+
+Crawlio can now keep explicitly started training and monitoring inside the Chrome extension while
+the MCP server is disconnected. This release also makes the shipped tool, permission, skill, npm,
+and plugin claims executable release contracts instead of prose that can drift.
+
+### Added
+
+- **Extension-resident robot training and monitoring.** The MV3 worker owns page-event ingestion,
+  network and recording state, scheduled monitor captures, diffs, restart recovery, bounded
+  IndexedDB retention, privacy sanitization, and explicit MCP status/stop/clear controls. A replacement
+  MCP server can query or materialize the same run after reconnecting; stopping a training run
+  writes all 13 canonical artifacts, including a conservative OpenAPI 3.1 draft.
+- **`observe`, a seventh default-mode MCP tool.** The 11 shipped skills can now start, query, stop,
+  export, and explicitly clear training, recording, and monitoring work without requiring the
+  150-schema full mode. Confirmed training/recording clear deletes one stopped extension-retained
+  record while preserving the canonical bundle files.
+- **Strict real-Chrome release harnesses.** MCP stress, session isolation, Method Mode, recording,
+  and resident-disconnect suites verify the exact extension build and selected profile while
+  keeping the user's foreground tab and keyboard untouched.
+
+### Changed
+
+- The measured surface is now **150 full-mode tools**, **7 default-mode tools**, and a
+  **182-command catalog** (150 browser plus 32 Crawlio HTTP commands). Package, registry, plugin,
+  README, skill, and runtime claims are checked against the live builders.
+- Dedicated onboarding is the sole optional-permission request surface. It reviews and requests
+  the active manifest's complete optional set (`tabs`, `nativeMessaging`, and loopback host access)
+  in one explicit gesture; the popup/widget and runtime tools only report missing grants.
+- Session fleets are logical, extension-owned background tabs rather than visible Chrome tab
+  groups. Production keeps the exact required permission floor (`alarms`, `debugger`, `storage`),
+  adds no standing host permission, and does not add a Chrome Web Store warning.
+
+### Fixed
+
+- Token rotation and MV3 reconnect races can no longer strand the first queued command or discard
+  a completed long-running response. Queue draining now waits for explicit proof acceptance, and a
+  response may move only to a verified same-token replacement socket.
+- Screenshot format, MIME, selector/full-page options, and Method Mode capture shaping now agree
+  across the extension/server boundary.
+- Resident privacy sanitization now catches mixed-case `Referer`/`Referrer` URL fields before they
+  reach IndexedDB or exported artifacts.
+- The Node MCP now follows Crawlio.app's current loopback authentication contract by resolving the
+  local mode-0600 MCP capability and sending both required headers without logging the token.
+  Optional app absence or authorization failure no longer creates retry fans or misleading stacks.
+- The 11 shipped skills now use callable default-mode grants and schema-valid commands/fields;
+  release checks also reject unshipped agent claims, dangling package paths, and lockfile version
+  drift.
+- The optional ONNX provider no longer auto-installs `onnxruntime-node` and its vulnerable ZIP
+  dependency; the dynamic provider remains available only when a caller deliberately supplies a
+  runtime. The development build also overrides esbuild to the patched 0.28.2 line.
+- The public export now includes the deterministic extension build-ID helper, and the extension
+  build fails closed if that identity cannot be computed instead of silently emitting an empty ID.
+- The extension popup is once again a thin status surface: resident training/monitor counts,
+  retention controls, and the development-only master switch no longer appear there or leave an
+  unreachable disabled state behind.
+- A saturated ten-port bridge range no longer strands stdio startup: WebSocket bind errors are
+  consumed at their local owner, the server degrades to offline browser tools, and the surface gate
+  now reports premature child exit with its stderr instead of a misleading 30-second timeout.
+
+## [1.10.0] - 2026-08-07
+
+### Added
+
+- Multi-tab targeting across browser and Method Mode commands, with per-tab runtime state, input
+  serialization, frame isolation, and effect-based real-browser concurrency tests.
+- Chrome-profile discovery and explicit profile switching, including stable profile identity and
+  contention-safe bridge admission.
+- Agent Plugin packaging for the MCP server and all 11 shipped skills, plus MCP Registry publishing
+  under `app.crawlio/crawlio-browser`.
+- Permission reporting in extension health, Doctor output, and the onboarding/status surfaces.
+
+### Fixed
+
+- Targeting a background tab no longer steals focus, and closing or stopping one tab no longer
+  clears another tab's capture, frame, or Method Mode state.
+- Optional permissions are acquired once during onboarding instead of through a second popup prompt.
+- Stale extension builds, ambiguous Chrome profiles, and tolerated diagnostics can no longer produce
+  misleading E2E passes or failures.
+- Agent Plugin skills, package contents, command identities, and default-mode instructions are
+  checked as one shipped surface.
+
 ## [1.9.5] - 2026-08-06
 
 Background operation actually works now. Clicking, keyboard input and dragging on a tab the user

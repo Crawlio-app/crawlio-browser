@@ -18,7 +18,7 @@ Compare a target site against 2-4 competitors across all 11 comparison dimension
 ## Protocol
 
 1. **search** for comparison commands: `search("compare pages")` or `search("extract page")`
-2. **connect_tab** to the target URL
+2. **connect_tab** to the target URL with `{ background: true }`
 3. **execute** Code Mode to run `smart.comparePages()` for each target-vs-competitor pair
 4. Emit one `smart.finding()` per dimension per pair
 5. After all pairs, return `smart.findings()` grouped by dimension
@@ -37,7 +37,10 @@ for (const comp of competitors) {
     if (!dim.comparable) continue;
     smart.finding({
       claim: `${dim.name}: ${target} vs ${comp}`,
-      evidence: [`target: ${dim.siteA.status}`, `competitor: ${dim.siteB.status}`],
+      evidence: [
+        `target (${dim.siteA.type}): ${JSON.stringify(dim.siteA.value)}`,
+        `competitor (${dim.siteB.type}): ${JSON.stringify(dim.siteB.value)}`
+      ],
       sourceUrl: target,
       confidence: "high",
       method: "comparePages",
@@ -45,17 +48,18 @@ for (const comp of competitors) {
     });
   }
 
-  // Tech stack comparison
-  if (comparison.siteA.technologies || comparison.siteB.technologies) {
-    const targetTech = comparison.siteA.technologies?.map(t => t.name) || [];
-    const compTech = comparison.siteB.technologies?.map(t => t.name) || [];
+  // comparePages returns PageEvidence, not technographic results. Detect each stack explicitly.
+  const compTech = (await smart.detectTechnologies()).technologies.map(t => t.name);
+  await smart.navigate(target);
+  const targetTech = (await smart.detectTechnologies()).technologies.map(t => t.name);
+  if (targetTech.length || compTech.length) {
     smart.finding({
       claim: `Tech stacks differ: target [${targetTech.join(", ")}] vs ${comp} [${compTech.join(", ")}]`,
       evidence: [`target: ${targetTech.join(", ")}`, `competitor: ${compTech.join(", ")}`],
       sourceUrl: target,
       confidence: "high",
-      method: "comparePages + detectTechnologies",
-      dimension: "technology"
+      method: "detectTechnologies",
+      dimension: "framework"
     });
   }
 }
@@ -77,16 +81,16 @@ return { findings: smart.findings(), totalComparisons: competitors.length };
 
 The skill produces `Finding[]` via `smart.findings()`. Findings span all 11 scaffold dimensions:
 
-- **technology** — framework, libraries, build tools
+- **framework** — framework detection and runtime architecture signals
 - **performance** — LCP, CLS, load timing
-- **accessibility** — landmark count, alt text, ARIA
 - **security** — TLS state, headers, mixed content
 - **seo** — meta tags, structured data, headings
+- **accessibility** — landmark count, alt text, ARIA
+- **error-surface** — console errors and failed network requests
+- **third-party-load** — third-party request volume
+- **architecture** — framework and rendering architecture
+- **content-delivery** — transfer volume and delivery behavior
 - **mobile-readiness** — viewport, media queries, overflow
-- **content** — text density, media count
-- **navigation** — link structure, menus
 - **data-structure** — tables, structured data
-- **design** — visual patterns, layout
-- **network** — request count, third parties
 
 Patterns across competitors emerge when findings are grouped by dimension.

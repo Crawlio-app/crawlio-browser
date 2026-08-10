@@ -1,26 +1,14 @@
-// Popup — status + permission broker + Connect/Disconnect control
-
-/** Chrome permission → human-readable label */
-const PERM_LABELS: Record<string, string> = {
-  tabs: "See your open tabs",
-  activeTab: "Interact with the current page",
-  "http://127.0.0.1/*": "Connect locally",
-  nativeMessaging: "Block rogue local servers (verify the MCP server's identity)",
-  clipboardRead: "Read clipboard content",
-  clipboardWrite: "Copy to clipboard",
-  notifications: "Send notifications",
-};
+// Popup — status + Connect/Disconnect control. Optional grants belong exclusively to welcome.html.
+import { declaredOptionalPermissions, missingPermissions, isComplete } from "../shared/permissions";
 
 (async () => {
   const waitingCard = document.getElementById("waiting-card") as HTMLElement;
   const reconnectBtn = document.getElementById("reconnect-btn") as HTMLButtonElement;
   const disconnectBtn = document.getElementById("disconnect-btn") as HTMLButtonElement;
-  const setupCard = document.getElementById("setup-card") as HTMLElement;
-  const setupPerms = document.getElementById("setup-perms") as HTMLElement;
-  const enableBtn = document.getElementById("enable-btn") as HTMLButtonElement;
   const setupBtn = document.getElementById("setup-btn") as HTMLButtonElement;
   const statusLabel = document.getElementById("status-label") as HTMLElement | null;
   const statusDot = document.querySelector(".status-dot") as HTMLElement | null;
+  const accessStatus = document.getElementById("access-status") as HTMLElement;
 
   // --- State helpers ---
 
@@ -31,103 +19,58 @@ const PERM_LABELS: Record<string, string> = {
     reconnectBtn.style.display = connected ? "none" : "inline-block";
     disconnectBtn.style.display = connected ? "block" : "none";
     if (statusRow) {
-      statusRow.style.display = connected ? "flex" : "none";
+      statusRow.style.display = "flex";
     }
     if (statusDot) {
       statusDot.classList.toggle("connected", connected);
     }
     if (statusLabel) {
       statusLabel.classList.toggle("connected", connected);
-      statusLabel.textContent = "Connected";
+      statusLabel.textContent = connected ? "MCP connected" : "MCP disconnected";
     }
   }
 
-  function showSetupCard(pending: chrome.permissions.Permissions) {
-    const items: string[] = [];
-    for (const p of pending.permissions || []) {
-      items.push(PERM_LABELS[p] || p);
-    }
-    for (const o of pending.origins || []) {
-      items.push(PERM_LABELS[o] || o);
-    }
-    if (items.length === 0) {
-      setupCard.style.display = "none";
-      return;
-    }
-    setupPerms.innerHTML = "";
-    for (const label of items) {
-      const li = document.createElement("li");
-      li.textContent = label;
-      setupPerms.appendChild(li);
-    }
-    setupCard.style.display = "block";
+  function renderAccessStatus(onboardingComplete: boolean, missing: chrome.permissions.Permissions) {
+    const missingCount = (missing.permissions?.length ?? 0) + (missing.origins?.length ?? 0);
+    const ready = onboardingComplete && missingCount === 0;
+    accessStatus.classList.toggle("ready", ready);
+    accessStatus.classList.toggle("needs-onboarding", !ready);
+    accessStatus.textContent = ready
+      ? "Ready"
+      : missingCount > 0
+        ? `${missingCount} grant${missingCount === 1 ? "" : "s"} missing`
+        : "Onboarding incomplete";
+    setupBtn.textContent = onboardingComplete
+      ? "Review permissions in onboarding"
+      : "Complete onboarding";
+    setupBtn.style.display = ready ? "none" : "block";
   }
 
-  function hideSetupCard() {
-    setupCard.style.display = "none";
-  }
-
-  // --- Permission broker ---
-
-  async function tryAutoGrant(): Promise<boolean> {
+  async function refreshAccessStatus() {
     try {
-      const data = await chrome.storage.session.get("crawlio:pendingPermissions");
-      const pending = data["crawlio:pendingPermissions"] as chrome.permissions.Permissions | undefined;
-      if (!pending || (!pending.permissions?.length && !pending.origins?.length)) {
-        hideSetupCard();
-        return true;
-      }
-
-      // Attempt silent grant (popup open = user gesture)
-      const granted = await chrome.permissions.request({
-        permissions: pending.permissions || [],
-        origins: pending.origins || [],
-      });
-
-      if (granted) {
-        chrome.action.setBadgeText({ text: "" });
-        chrome.storage.session.remove("crawlio:pendingPermissions");
-        chrome.runtime.sendMessage({ type: "PERMISSIONS_GRANTED" });
-        hideSetupCard();
-        return true;
-      }
-    } catch {
-      // permissions.request may throw if popup closes during request
+      const [local, missing] = await Promise.all([
+        chrome.storage.local.get("crawlio:onboardingComplete"),
+        missingPermissions(declaredOptionalPermissions()),
+      ]);
+      renderAccessStatus(local["crawlio:onboardingComplete"] === true, missing);
+    } catch (error: unknown) {
+      // A status read failure must never hide the recovery route. The onboarding page remains the
+      // only place that can request optional access; the popup only links to it.
+      console.error("[Popup] Could not read browser access status:", error);
+      accessStatus.classList.remove("ready");
+      accessStatus.classList.add("needs-onboarding");
+      accessStatus.textContent = "Status unavailable";
+      setupBtn.textContent = "Review permissions in onboarding";
+      setupBtn.style.display = "block";
     }
-
-    // Silent grant failed or user denied — show the setup card
-    const data = await chrome.storage.session.get("crawlio:pendingPermissions");
-    const pending = data["crawlio:pendingPermissions"] as chrome.permissions.Permissions | undefined;
-    if (pending) {
-      showSetupCard(pending);
-    }
-    return false;
   }
 
-  // "Enable Crawlio" button — explicit user grant
-  enableBtn.addEventListener("click", async () => {
-    const data = await chrome.storage.session.get("crawlio:pendingPermissions");
-    const pending = data["crawlio:pendingPermissions"] as chrome.permissions.Permissions | undefined;
-    if (!pending) {
-      hideSetupCard();
-      return;
-    }
-
-    try {
-      const granted = await chrome.permissions.request({
-        permissions: pending.permissions || [],
-        origins: pending.origins || [],
-      });
-      if (granted) {
-        chrome.action.setBadgeText({ text: "" });
-        chrome.storage.session.remove("crawlio:pendingPermissions");
-        chrome.runtime.sendMessage({ type: "PERMISSIONS_GRANTED" });
-        hideSetupCard();
-      }
-    } catch {
-      // popup may close during request
-    }
-  });
+  function openOnboarding() {
+    chrome.tabs.create({ url: chrome.runtime.getURL("welcome.html") }).catch((error: unknown) => {
+      console.error("[Popup] Could not open onboarding:", error);
+    });
+    window.close();
+  }
 
   // --- Reconnect ---
 
@@ -135,21 +78,14 @@ const PERM_LABELS: Record<string, string> = {
     reconnectBtn.textContent = "Connecting...";
     reconnectBtn.disabled = true;
 
-    const hasPerms = await chrome.permissions.contains({
-      permissions: ["tabs"],
-      origins: ["http://127.0.0.1/*"],
-    });
-
-    if (!hasPerms) {
-      const granted = await chrome.permissions.request({
-        permissions: ["tabs"],
-        origins: ["http://127.0.0.1/*"],
-      });
-      if (!granted) {
-        reconnectBtn.textContent = "Reconnect";
-        reconnectBtn.disabled = false;
-        return;
-      }
+    // A revoked or newly declared permission is recovered on the dedicated onboarding page. The
+    // popup never invokes chrome.permissions.request(), including from an explicit reconnect.
+    const missing = await missingPermissions(declaredOptionalPermissions());
+    if (!isComplete(missing)) {
+      reconnectBtn.textContent = "Reconnect";
+      reconnectBtn.disabled = false;
+      openOnboarding();
+      return;
     }
 
     chrome.runtime.sendMessage({ type: "START_BRIDGE" });
@@ -202,23 +138,14 @@ const PERM_LABELS: Record<string, string> = {
         }
       });
     }
-    // Re-check pending permissions when they change
-    if (changes["crawlio:pendingPermissions"]) {
-      const val = changes["crawlio:pendingPermissions"].newValue;
-      if (val && (val.permissions?.length || val.origins?.length)) {
-        showSetupCard(val);
-      } else {
-        hideSetupCard();
-      }
-    }
   });
 
   // --- Welcome.html onboarding link ---
 
-  setupBtn.addEventListener("click", () => {
-    chrome.tabs.create({ url: chrome.runtime.getURL("welcome.html") });
-    window.close();
-  });
+  setupBtn.addEventListener("click", openOnboarding);
+
+  chrome.permissions.onAdded.addListener(() => { void refreshAccessStatus(); });
+  chrome.permissions.onRemoved.addListener(() => { void refreshAccessStatus(); });
 
   // --- Initial render ---
 
@@ -229,13 +156,6 @@ const PERM_LABELS: Record<string, string> = {
     updateUI(false);
   }
 
-  // Priority: welcome.html onboarding first, then permission broker fallback
-  const local = await chrome.storage.local.get("crawlio:onboardingComplete");
-  if (!local["crawlio:onboardingComplete"]) {
-    // Onboarding not done — show "Complete setup" link to welcome.html
-    setupBtn.style.display = "block";
-  } else {
-    // Onboarding done — check if permissions need re-granting (fallback)
-    await tryAutoGrant();
-  }
+  // The popup only reports onboarding state. Permission acquisition is owned by welcome.html.
+  await refreshAccessStatus();
 })();

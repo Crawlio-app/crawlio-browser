@@ -6,7 +6,7 @@
 
 ## [Documentation](https://docs.crawlio.app/browser-agent/overview) | [API Reference](https://docs.crawlio.app/browser-agent/tools) | [Chrome Extension](https://www.crawlio.app/browser-agent)
 
-MCP server that gives AI full control of a live Chrome browser via CDP. <!--n:full-->145<!--/n--> tools with framework-aware intelligence, typed evidence infrastructure, tracking pixel analysis, technographic fingerprinting, SEO auditing, and confidence-tracked findings — captures what static crawlers can't see.
+MCP server that gives AI full control of a live Chrome browser via CDP. <!--n:full-->150<!--/n--> tools with framework-aware intelligence, typed evidence infrastructure, tracking pixel analysis, technographic fingerprinting, SEO auditing, and confidence-tracked findings — captures what static crawlers can't see.
 
 ## When to use Crawlio Browser
 
@@ -45,6 +45,27 @@ npx crawlio-browser init --dry-run    # Show what would happen
 npx crawlio-browser init --yes        # Skip prompts (CI / scripted installs)
 npx crawlio-browser init -a claude    # Target specific MCP client
 ```
+
+### As an Agent Plugin
+
+The package is also an [Agent Plugins](https://agent-plugins.org) v1 plugin, so a conformant client
+can load it directly instead of running the wizard — `plugin.json` at the root, the eleven skills
+under `skills/`, and the MCP server declared in `mcp.json`.
+
+The product-facing `crawlio-*` workflows are folded into the eleven shipped skills. The similarly
+named definitions in `agents/` remain repo-local development fixtures: they import `src/evidence/*`
+and `loops/*`, neither of which is part of the npm runtime. They are excluded from `package.json`
+instead of advertising a second, non-executable product surface.
+
+Point the client at the installed package:
+
+```
+node_modules/crawlio-browser        # after `npm install crawlio-browser`
+```
+
+`mcp.json` resolves the server through `${PLUGIN_ROOT}/dist/mcp-server/index.js`, which is why the
+plugin has to be an **installed** package rather than an unpacked tarball — the server imports its
+dependencies at runtime, so a bare extract starts and then dies without answering.
 
 ### Inspecting what it exposes
 
@@ -136,15 +157,52 @@ Record browser interactions as structured data, then compile them into reusable 
 
 ### Robot Training
 
-Capture human-guided browser demonstrations as replayable robot-training bundles. `robot_training_start` opens a fresh connected tab, starts CDP network capture and session recording, injects an event-driven state monitor, and `robot_training_stop` persists `recording.json`, `network.json`, response bodies, state snapshots, and `flows.jsonl` for API synthesis or background replay.
+Capture human-guided browser demonstrations as replayable robot-training bundles. The default-mode
+`observe` lifecycle starts an event-driven recorder inside the extension; collection keeps running
+if the MCP process disconnects or restarts. On reconnection, `training_stop` exports the retained
+run and materializes the complete 13-file RecordingBundle for replay and API synthesis. Full mode
+keeps the existing `robot_training_*` names as compatibility aliases.
+
+Page monitoring is resident for the same reason: an extension-owned background tab and Chrome
+alarm collect bounded ARIA snapshots while no MCP server is present. Training and monitor history
+share a 25 MiB local budget, with 20 completed training runs, 50 monitor jobs, 200 snapshots total,
+and 50 snapshots per monitor as count caps. Old completed data is evicted first; active work is
+never silently evicted. Work starts only through explicit MCP lifecycle actions; the same actions
+report status, stop collection, clear monitor snapshots, and—with an exact id plus explicit
+confirmation—delete a stopped training/recording record from Chrome while preserving its
+materialized files. The extension popup remains a connection and browser-access status surface.
+Storage values are keys-only unless the caller explicitly opts in.
+Monitor snapshots intentionally retain compact ARIA page text locally; starting a monitor should
+therefore be treated as consent to retain the visible content of that URL until it is cleared.
 
 ### Auto-Settling & Actionability
 
 Every mutative action (`click`, `type`, `navigate`, `select_option`) runs actionability checks before acting — polling visibility, dimensions, enabled state, and overlay detection. After the action, a progressive backoff settle delay (`[0, 20, 100, 100, 500]ms`) waits for DOM mutations to quiesce. The AI doesn't need manual `sleep()` calls between actions.
 
+### Several Tabs at Once
+
+Any command that acts on a page takes an optional `tabId` from `list_tabs`. Omit it and the command runs on the connected tab, exactly as before; supply one and it runs on that tab instead, with the whole command surface available on each. Commands overlap, so two tabs can be driven at the same time:
+
+```js
+const [checkout, search] = await Promise.all([
+  bridge.send({ type: "browser_snapshot", tabId: 42 }),
+  bridge.send({ type: "browser_snapshot", tabId: 57 }),
+]);
+```
+
+Targeting a tab never changes which tab `connect_tab` points at, so an agent working several tabs cannot reassign the one a human is watching. Frame selection, coverage sessions, and framework detection are per tab. Network capture is the exception — it records one tab at a time and says which tab holds it rather than interleaving two.
+
+### Chrome Profiles
+
+An extension instance is confined to its own Chrome profile and cannot see any other, so with Crawlio enabled in more than one, commands land in whichever profile connected first. `list_profiles` shows the profiles that have connected and which is being driven; `switch_profile` moves the connection to another. One profile is driven at a time — the released extension reconnects in the background, so switching back is immediate.
+
+Profiles identify themselves with a UUID minted into their own extension storage. It distinguishes a profile without describing it: no account, no email, no path, and no additional permission.
+
+Selecting a profile keeps cooperating extensions out of each other's way — it is not a security boundary, since the id is asserted by the extension rather than proved. The bridge's existing protections are unchanged: one extension at a time, and each must prove the server holds the real bridge token before anything executes.
+
 ## Architecture
 
-A layered execution architecture where each layer absorbs a category of complexity that would otherwise fall on the model. The model sees three tools and a clean SDK. Everything beneath that surface is the runtime absorbing reality.
+A layered execution architecture where each layer absorbs a category of complexity that would otherwise fall on the model. The model sees four primary tools and a clean SDK. Everything beneath that surface is the runtime absorbing reality.
 
 The layer worth understanding is the one that assembles itself. Detection runs against the live page on first use, and the `smart` object is built to match what that page turned out to be — `smart.react.*` exists only where React does. Nothing about the target is known at startup, so the surface is composed per tab rather than declared up front.
 
@@ -153,7 +211,7 @@ The layer worth understanding is the one that assembles itself. Detection runs a
                      │        AI Model (LLM)             │
                      │  Writes code, reads errors, loops  │
                      └───────────────┬───────────────────┘
-                                     │  search, execute, connect_tab (+ 3 job tools)
+                                     │  search, execute, observe, connect_tab (+ 3 job tools)
                                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Crawlio Browser runtime                      │
@@ -178,7 +236,7 @@ The layer worth understanding is the one that assembles itself. Detection runs a
 │  │  ACTIONABILITY ENGINE                                      │  │
 │  │  7 core smart methods with built-in resilience             │  │
 │  │  click · type · navigate · waitFor · evaluate ·            │  │
-│  │  snapshot · screenshot                                     │  │
+│  │  snapshot · rebuild                                        │  │
 │  │                                                            │  │
 │  │  ↳ Absorbs: DOM timing, hydration delays, CSS animations, │  │
 │  │    disabled states, overlapping elements                   │  │
@@ -193,7 +251,7 @@ The layer worth understanding is the one that assembles itself. Detection runs a
 │  │  COMMAND CHANNEL                                           │  │
 │  │  bridge.send → CDP browser control via the extension       │  │
 │  │  crawlio.*   → Crawlio HTTP endpoints                      │  │
-│  │  178 searchable across both (145 browser + 33 HTTP)        │  │
+│  │  Live searchable catalog: browser + Crawlio HTTP           │  │
 │  └────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                                      │
@@ -237,7 +295,7 @@ This is an MCP server, not an alternative to MCP.
 
 | Dimension | Standard MCP | Cloudflare Code Mode | Crawlio Browser |
 |-----------|-------------|---------------------|-----------------|
-| **Tools in context** | 50-100+ schemas | 2 (`search`, `execute`) | <!--n:code-->6<!--/n--> (3 primary + 3 async job tools) |
+| **Tools in context** | 50-100+ schemas | 2 (`search`, `execute`) | <!--n:code-->7<!--/n--> (4 primary + 3 async job tools) |
 | **Execution environment** | N/A (tool calls) | V8 isolate (stateless) | Local async sandbox, tethered to a live browser |
 | **DOM access** | Via individual tool calls | None | Live, persistent, framework-aware |
 | **Framework awareness** | None | None | up to <!--n:ns-->17<!--/n--> namespaces, attached per page |
@@ -257,22 +315,23 @@ are genuinely stronger than what a local async sandbox provides.
 
 ## Two Modes
 
-### Code Mode (3 primary tools) — default
+### Code Mode (4 primary tools) — default
 
-Collapses <!--n:full-->145<!--/n--> tools into three high-level tools, plus `get_job_result`,
+Collapses <!--n:full-->150<!--/n--> tools into four high-level tools, plus `get_job_result`,
 `list_jobs`, and `cancel_job` for async execution — so `tools/list` reports
-<!--n:code-->6<!--/n-->.
+<!--n:code-->7<!--/n-->.
 
-That makes the `tools/list` payload **<!--n:reduction-->83<!--/n-->% smaller**, measured by
+That makes the `tools/list` payload **<!--n:reduction-->85<!--/n-->% smaller**, measured by
 serializing the result each mode actually returns rather than estimated from a tool count. Code
-mode is not free: `execute` and `search` carry long descriptions, which is why the figure is 83%
-and not the ~95% a naive tools-only ratio suggests. Check it yourself — `npx crawlio-browser
+mode is not free: `execute` and `search` carry long descriptions, so the measured reduction is
+smaller than a naive tools-only ratio suggests. Check it yourself — `npx crawlio-browser
 tools --json` prints both surfaces without connecting to anything.
 
 | Tool | Description |
 |------|-------------|
 | `search` | Discover available commands by keyword |
 | `execute` | Run async JS with `bridge`, `crawlio`, `smart`, `sleep`, and `compileRecording` in scope |
+| `observe` | Start/query/stop extension-resident training, recording, and page monitors |
 | `connect_tab` | Connect to a browser tab |
 
 ```javascript
@@ -283,7 +342,7 @@ const screenshot = await bridge.send({ type: 'take_screenshot' }, 10000);
 return screenshot;
 ```
 
-### Full Mode (<!--n:full-->145<!--/n--> tools)
+### Full Mode (<!--n:full-->150<!--/n--> tools)
 
 Every tool exposed directly to the LLM. Enable with `--full`:
 
@@ -488,7 +547,7 @@ await smart.scrollCapture()          // not a guessed scroll cadence
 ```
 
 It is a domain layer over Code Mode, not a replacement: the tool surface does not change, the
-model still sees the same three primary tools, and the same <!--n:catalog-->178<!--/n-->-command
+model still sees the same four primary tools, and the same <!--n:catalog-->182<!--/n-->-command
 catalog sits underneath. What changes is what happens *inside* `execute`.
 
 The surface is assembled per page. Detection recognizes <!--n:frameworks-->64<!--/n-->
@@ -504,8 +563,8 @@ runs again against that state, rather than rebuilding the situation from scratch
 
 | Layer | Optimizes For | Behavioral Variance | Evidence Quality |
 |-------|---------------|---------------------|-----------------|
-| **Raw MCP** (<!--n:full-->145<!--/n--> tools) | Completeness | High — flat tool list, no composition guidance | None — unstructured text |
-| **Code Mode** (<!--n:code-->6<!--/n--> tools) | Token efficiency | Medium — right primitives, ad-hoc composition | None — model-defined shapes |
+| **Raw MCP** (<!--n:full-->150<!--/n--> tools) | Completeness | High — flat tool list, no composition guidance | None — unstructured text |
+| **Code Mode** (<!--n:code-->7<!--/n--> tools) | Token efficiency | Medium — right primitives, ad-hoc composition | None — model-defined shapes |
 | **Method Mode** (+ <!--n:higher-->18<!--/n--> methods + protocol) | Consistency | Low — proper methods, protocol constraints | Convention — `{ finding, evidence, url }` |
 | **+ typed evidence** (gaps + confidence) | Correctness | Minimal — typed schemas, tool-enforced findings | Structural — typed records, gap tracking, confidence propagation |
 
@@ -705,7 +764,7 @@ Multi-framework detection returns a **primary** framework (meta-framework takes 
 ## Tools Reference
 
 The table below is a hand-written guide to the commonly used tools, not the complete set. For
-the full, current surface — all <!--n:full-->145<!--/n--> of them, read from the server itself —
+the full, current surface — all <!--n:full-->150<!--/n--> of them, read from the server itself —
 run `npx crawlio-browser tools --full`.
 
 <details>
@@ -720,7 +779,7 @@ run `npx crawlio-browser tools --full`.
 | `list_tabs` | List all open tabs with IDs and URLs |
 | `get_connection_status` | Check CDP connection state |
 | `reconnect_tab` | Force reconnect to fix stale connections |
-| `get_capabilities` | List all tools and their availability |
+| `get_capabilities` | Report live browser-bridge availability by tab, CDP domain, and permission state |
 
 ### Page Capture
 
@@ -733,7 +792,7 @@ run `npx crawlio-browser tools --full`.
 | `get_console_logs` | Get console logs (errors, warnings, info) |
 | `get_cookies` | Get cookies (sensitive values redacted) |
 | `get_dom_snapshot` | Simplified DOM tree with shadow DOM and iframe support |
-| `take_screenshot` | Screenshot as base64 PNG |
+| `take_screenshot` | Viewport/full-page/element image (JPEG default, PNG on request) |
 | `get_response_body` | Get response body for a captured network request |
 
 ### Navigation & Interaction
@@ -884,13 +943,20 @@ run `npx crawlio-browser tools --full`.
 | Tool | Description |
 |------|-------------|
 | `robot_training_start` | Start a fresh monitored demonstration run |
-| `robot_training_status` | Inspect active robot-training runs and recording state |
-| `robot_training_stop` | Stop a run and persist replay/API-synthesis artifacts |
+| `robot_training_status` | Query extension-retained runs and recording state |
+| `robot_training_stop` | Stop/export a resident run and persist all bundle artifacts |
+| `robot_training_clear` | Confirm deletion of one stopped extension-retained run; preserve artifact files |
 | `robot_training_artifacts` | List files in a robot-training artifact directory |
+| `monitor_page` | Start/query/stop extension-resident recurring page monitors |
 
 ### Crawlio App Integration
 
 > Optional — requires [Crawlio.app](https://crawlio.app) running locally.
+
+ControlServer authentication is automatic and local-only: the MCP reads `CRAWLIO_MCP_TOKEN` when
+explicitly set, otherwise Crawlio.app's mode-0600 `~/Library/Logs/Crawlio/mcp.token`, and sends it
+only to the discovered `127.0.0.1` ControlServer. The value is never returned in MCP results or
+written to logs.
 
 | Tool | Description |
 |------|-------------|
@@ -907,6 +973,21 @@ run `npx crawlio-browser tools --full`.
 - **Node.js** >= 18
 - **Chrome** (or Chromium) with the [Crawlio for Chrome extension](https://www.crawlio.app/browser-agent) installed
 - **Crawlio.app** (optional) — for site crawling and enrichment
+
+### Permission floor
+
+The production extension has no standing host access. Its required permissions are `debugger`
+(the CDP control plane), `storage` (bridge/session settings and durable resident metadata), and
+`alarms` (reconnect, idle-release, and resident monitor wakeups). The dedicated onboarding page
+asks once for every optional capability declared by the active build. In production that is `tabs`,
+`nativeMessaging`, and `http://127.0.0.1/*`, covering tab discovery/adoption, authenticated local
+token provisioning, and loopback bridge discovery.
+
+Onboarding is the only surface that can open Chrome's permission prompt. The extension popup and
+MCP tools only report missing access and route the user back to onboarding. `connect_tab({url})`,
+agent-owned tabs, robot training, and resident monitoring can still create and control their own
+tabs if the `tabs` metadata grant is denied. Crawlio does not request `<all_urls>`, `activeTab`,
+`tabGroups`, or `unlimitedStorage`.
 
 ## Build from Source
 

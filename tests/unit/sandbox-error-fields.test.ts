@@ -54,7 +54,7 @@ describe("structured error fields across the sandbox boundary", () => {
     const bridge = bridgeThatRejects(Object.assign(new Error("permission required"), {
       permission_required: true,
       missing: { permissions: ["tabs"] },
-      suggestion: "Grant the tabs permission from the extension popup.",
+      suggestion: "Grant browser access from Crawlio's dedicated onboarding page.",
     }));
     const { text } = await runCode(bridge, `
       try {

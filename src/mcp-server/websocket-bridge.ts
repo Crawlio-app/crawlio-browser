@@ -7,6 +7,9 @@ import { mkdirSync, writeFileSync, unlinkSync, readdirSync, readFileSync, chmodS
 import { WS_PORT, WS_PORT_MAX, WS_HOST, BRIDGE_DIR, TIMEOUTS, WS_HEARTBEAT_INTERVAL, WS_STALE_THRESHOLD, WS_RECONNECT_GRACE, PKG_VERSION } from "../shared/constants.js";
 import { isProblemCode, type ServerCommand, type ExtensionResponse, type ProblemCode } from "../shared/protocol.js";
 import { computeHandshakeProof, HANDSHAKE_MESSAGE_TYPES } from "../shared/bridge-handshake.js";
+import { applyTargetTab } from "./target-tab.js";
+import { ProfileRoster, isProfileId, type ProfileRecord } from "../shared/profile-identity.js";
+import { isNewerWorkerGeneration, parseWorkerGeneration, type WorkerGeneration } from "../shared/worker-generation.js";
 
 // Resolve the absolute path to index.js for the setup page
 function resolveIndexPath(): string {
@@ -175,6 +178,13 @@ interface QueuedMessage {
   reject: (reason: unknown) => void;
   enqueueTime: number;
   timeoutMs: number;
+  /**
+   * How long the caller allowed for a *response*, as distinct from timeoutMs — the budget for
+   * waiting on the queue, which carries a floor so a briefly-absent extension can still arrive.
+   * Draining used a flat 30s here, so `send(cmd, 4000)` could sit for 30 seconds once queued:
+   * the caller's own deadline was discarded the moment its command took the queue path.
+   */
+  commandTimeoutMs: number;
   // Expiry timer — cleared the moment the item leaves the queue (drained/evicted/cleared)
   // so a successfully-drained message doesn't leave a live timer dangling.
   timer?: ReturnType<typeof setTimeout>;
@@ -195,30 +205,41 @@ function notConnected(message: string): Error {
 export class MessageQueue {
   private queue: QueuedMessage[] = [];
 
-  enqueue(message: string, timeoutMs = DEFAULT_MSG_TIMEOUT): Promise<unknown> {
+  enqueue(message: string, timeoutMs = DEFAULT_MSG_TIMEOUT, commandTimeoutMs = timeoutMs): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (this.queue.length >= MAX_QUEUE_SIZE) {
         const oldest = this.queue.shift();
         if (oldest?.timer) clearTimeout(oldest.timer);
         oldest?.reject(notConnected("Queue overflow — message evicted"));
       }
-      const item: QueuedMessage = { message, resolve, reject, enqueueTime: Date.now(), timeoutMs };
+      const item: QueuedMessage = { message, resolve, reject, enqueueTime: Date.now(), timeoutMs, commandTimeoutMs };
       this.queue.push(item);
       // Independent timeout — reject if not drained before expiry (prevents infinite hang when WS never connects)
-      item.timer = setTimeout(() => {
-        const idx = this.queue.indexOf(item);
-        if (idx !== -1) {
-          this.queue.splice(idx, 1);
-          reject(notConnected(`Queued message expired after ${timeoutMs}ms — extension not connected`));
-        }
-      }, timeoutMs);
+      this.armExpiry(item, timeoutMs);
     });
   }
 
-  async drain(sendFn: (msg: string, resolve: (v: unknown) => void, reject: (e: Error) => void) => Promise<void>): Promise<void> {
+  /**
+   * Arm an item's queue-expiry timer for `ms`, replacing any existing one.
+   *
+   * Split out because an item can rejoin the queue after a failed transmission, and it must keep
+   * counting against its ORIGINAL deadline rather than getting a fresh full budget each time.
+   */
+  private armExpiry(item: QueuedMessage, ms: number): void {
+    if (item.timer) clearTimeout(item.timer);
+    item.timer = setTimeout(() => {
+      const idx = this.queue.indexOf(item);
+      if (idx !== -1) {
+        this.queue.splice(idx, 1);
+        item.reject(notConnected(`Queued message expired after ${item.timeoutMs}ms — extension not connected`));
+      }
+    }, ms);
+  }
+
+  async drain(sendFn: (msg: string, resolve: (v: unknown) => void, reject: (e: Error) => void, commandTimeoutMs: number) => Promise<void>): Promise<void> {
     while (this.queue.length > 0) {
       const item = this.queue.shift()!;
-      if (item.timer) clearTimeout(item.timer); // leaving the queue — drop its expiry timer
+      if (item.timer) { clearTimeout(item.timer); item.timer = undefined; } // leaving the queue
       if (Date.now() - item.enqueueTime > item.timeoutMs) {
         item.reject(notConnected("Queued message expired"));
         continue;
@@ -228,13 +249,27 @@ export class MessageQueue {
         // promise resolves on transmission confirmation — not on response receipt.
         // This prevents head-of-line blocking: a slow response (e.g. 30s navigate)
         // no longer blocks subsequent queued items from being transmitted.
-        await sendFn(item.message, item.resolve as (v: unknown) => void, item.reject as (e: Error) => void);
-      } catch (error) {
-        item.reject(error instanceof Error ? error : new Error(String(error)));
+        await sendFn(item.message, item.resolve as (v: unknown) => void, item.reject as (e: Error) => void, item.commandTimeoutMs);
+      } catch {
+        // Transmission never happened, so this command is still owed an answer and its caller is
+        // still waiting. Failing it here threw away work the queue exists to protect — put it
+        // back at the head with what remains of its deadline, and let the next drain carry it.
+        this.requeueFront(item);
         break; // Stop draining — connection likely lost, preserve remaining items
       }
       await new Promise(r => setTimeout(r, 50));
     }
+  }
+
+  /** Return an undeliverable item to the head of the queue, still on its original deadline. */
+  private requeueFront(item: QueuedMessage): void {
+    const remaining = item.timeoutMs - (Date.now() - item.enqueueTime);
+    if (remaining <= 0) {
+      item.reject(notConnected("Queued message expired"));
+      return;
+    }
+    this.queue.unshift(item);
+    this.armExpiry(item, remaining);
   }
 
   get depth(): number { return this.queue.length; }
@@ -249,7 +284,10 @@ export class MessageQueue {
 }
 
 interface ConnectionHealth {
+  /** True only when the attached extension is admitted and its identity handshake has settled. */
   connected: boolean;
+  /** Lower-level diagnostic: a socket exists, even if it is not ready to receive commands. */
+  socketConnected: boolean;
   latencyMs: number;
   uptime: number;
   reconnects: number;
@@ -258,6 +296,37 @@ interface ConnectionHealth {
   // bridge file so a multi-bridge consumer can elect the most-recently-active server.
   lastActivityAt: number;
   version: string;
+  // What the connected extension reports about its own optional permissions, asked once when
+  // it identifies itself. Exposed here because /health is the only thing a separate process
+  // (`crawlio-browser doctor`) can read — without it, "is nativeMessaging actually granted?"
+  // could only be inferred from side effects like whether a native-host process had spawned.
+  extensionPermissions?: {
+    granted: boolean;
+    permissions: Record<string, boolean>;
+    missing: string[];
+  };
+  // Chrome profiles seen this run, and which one holds the bridge. Same reasoning as
+  // extensionPermissions: /health is what a separate process can read, so putting the roster
+  // here is what lets `crawlio-browser doctor` report the active profile rather than guess.
+  profiles?: {
+    connected: string | null;
+    preferred: string | null;
+    seen: ProfileRecord[];
+  };
+}
+
+/**
+ * Per-send options.
+ *
+ * `queueWhenOffline` defaults to true, which is right for real work: an extension reconnecting
+ * after a service-worker restart should not lose the command in flight, so it waits on the queue
+ * with a 45s floor. It is wrong for a probe — "is a browser attached", "what framework is this" —
+ * where the offline answer is known immediately and the caller already handles it. Two such
+ * probes run on every `execute`, which is how a call with no browser attached came to block for
+ * 45 seconds before returning a result it could have produced at once.
+ */
+export interface SendOptions {
+  queueWhenOffline?: boolean;
 }
 
 const HEARTBEAT_INTERVAL = WS_HEARTBEAT_INTERVAL;
@@ -275,6 +344,41 @@ const CONTENTION_LOG_INTERVAL = 60_000;
 /// Application close code (4000–4999) telling a client the bridge is held by a
 /// live extension, so it can back off rather than treat this as an error.
 const WS_CLOSE_BRIDGE_BUSY = 4009;
+/** A newer worker from the incumbent profile may retry immediately after the stale one is freed. */
+const WS_CLOSE_NEWER_GENERATION_RETRY = 4010;
+/**
+ * How long a pinned profile has to take the bridge before the pin is dropped.
+ *
+ * The extension retries roughly every 3s, so this is many attempts — long enough that a browser
+ * still starting up wins, short enough that pinning a profile whose Chrome has quit does not
+ * leave every tool dead for the life of the process.
+ */
+const PROFILE_SWITCH_GRACE = 30_000;
+/**
+ * How long a refused client gets to identify itself before the socket closes.
+ *
+ * The extension sends `connected` in its open handler, so this only has to cover local delivery.
+ * Short on purpose: a refused client must not linger, and a silent one costs exactly this.
+ */
+const REFUSED_IDENTIFY_WINDOW = 750;
+
+/**
+ * How long we wait for the extension's identity challenge before releasing the queue anyway.
+ *
+ * Only reached by a client that never challenges — an extension predating the handshake. One that
+ * old cannot refuse us either, so releasing is both safe and the only way it ever gets a command.
+ * The real extension challenges in its open handler and answers in ~1ms, so this never fires in
+ * practice; it is purely the version-skew escape hatch.
+ */
+const HANDSHAKE_SETTLE_GRACE = 2_000;
+// Reloaded Chrome can leave an older anonymous worker knocking before the current generation
+// (which reports profileId/workerGeneration) arrives. Do not give that legacy-looking socket the
+// offline queue immediately: once transmitted, commands cannot safely be replayed after the
+// newer worker supersedes it. Genuine legacy extensions still become usable after this grace.
+const LEGACY_CLIENT_ADMISSION_GRACE = 10_000;
+
+/** Minimum gap between bridge-file writes. A burst of tool calls must not hammer the disk. */
+const BRIDGE_WRITE_INTERVAL = 1_000;
 
 const WS_RATE_LIMIT = 60; // max commands per second
 
@@ -387,15 +491,18 @@ export async function listenWalkingPortRange(
   for (let port = startPort; port <= maxPort; port++) {
     const listened = await new Promise<boolean>((resolve) => {
       const onError = (err: NodeJS.ErrnoException) => {
+        server.removeListener("listening", onListening);
         if (err.code === "EADDRINUSE") console.error(`[Bridge] Port ${port} in use — trying next...`);
         else console.error(`[Bridge] listen error on ${port}: ${err.code ?? err.message}`);
-        resolve(false); // once() auto-removed this handler; next iteration attaches a fresh one
+        resolve(false);
       };
-      server.once("error", onError);
-      server.listen(port, host, () => {
+      const onListening = () => {
         server.removeListener("error", onError);
         resolve(true);
-      });
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(port, host);
     });
     if (listened) return port;
   }
@@ -456,7 +563,73 @@ export class WebSocketBridge {
   // publish "just active" — that let a freshly-spawned idle bridge steal the election from
   // the bridge the user is actually driving. 0 sorts last in electActiveBridge.
   private lastActivityAt = 0;
+  /** Cached from the extension on identify; see refreshExtensionPermissions(). */
+  private extensionPermissions: ConnectionHealth["extensionPermissions"];
+  /** Chrome profiles seen this run — the switch targets. */
+  private readonly profiles = new ProfileRoster();
+  /** Profile of the extension currently holding the bridge, if it reported one. */
+  private connectedProfileId: string | null = null;
+  /** Extension/runtime generation currently holding the socket, used only for safe reload takeover. */
+  private connectedExtensionId: string | null = null;
+  private connectedWorkerGeneration: WorkerGeneration | null = null;
+  /**
+   * When set, only this profile's extension may hold the bridge.
+   *
+   * The server still talks to exactly one extension at a time — this chooses *which*, it does not
+   * multiplex. So the property that a rogue local server cannot knock a healthy extension off the
+   * bridge is untouched: every extension still proves the server holds the real bridge token
+   * before executing anything.
+   *
+   * It is a selector, NOT an isolation boundary, and nothing should be built on it as though it
+   * were. The profile id is asserted over the wire rather than proved, and /health publishes the
+   * pinned id unauthenticated, so a client that wanted to could read it and claim it. What the
+   * pin buys is that the *cooperating* extensions — every real one — stay out of the way, which
+   * is the actual problem: with Crawlio enabled in several profiles, commands used to land in
+   * whichever one won the race. Making it enforceable would mean binding the id to something the
+   * extension proves, which the native-host channel could carry.
+   */
+  private preferredProfileId: string | null = null;
+  /**
+   * Whether the connected socket may be transmitted to.
+   *
+   * False between accepting a socket and learning which profile it is, but only while a profile
+   * is pinned. This is the whole isolation: an extension that never identifies simply never
+   * receives commands, which closes the "omit profileId to dodge the filter" hole without a
+   * refusal loop, and stops queued work from executing against the wrong browser.
+   */
+  private clientAdmitted = false;
+  /** Delays queue transmission to an anonymous pre-generation client during reload convergence. */
+  private legacyAdmissionTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * True once our identity proof is on the wire for the current socket — or once it's clear the
+   * client is never going to ask for one.
+   *
+   * No command may reach the extension ahead of that proof. The extension refuses anything
+   * arriving while its handshake verdict is still pending, and (before this) answered nothing, so
+   * the caller waited out its entire timeout for a command that had been dropped on the floor.
+   * That was not a race anyone could win: the drain runs synchronously from the connection and
+   * `connected` handlers, while the proof is answered from an async crypto promise, so the first
+   * command after every reconnect went out ahead of it by construction. Gating transmission here
+   * makes the ordering an invariant instead of a coin flip.
+   */
+  private handshakeSettled = false;
+  private handshakeSettleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Current extensions acknowledge that they accepted our nonce-bound proof before work drains. */
+  private handshakeAckRequired = false;
+  private handshakeNonce: string | null = null;
+  /** A connected socket owes us a permission check, deferred until it can receive one. */
+  private permissionsRefreshPending = false;
+  /** Profile the currently-pending commands were transmitted to; see failPendingOnProfileTakeover. */
+  private pendingProfileId: string | null = null;
+  private profileRefusals = 0;
+  private lastProfileRefusalLog = 0;
+  /** Cleared when the preferred profile fails to take the bridge; see switchProfile(). */
+  private switchRevertTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Exit handler registered in start(); held so stop() can unregister it. */
+  private exitCleanup: (() => void) | null = null;
   private lastBridgeWriteAt = 0;
+  /** Trailing-edge write owed to a throttled touchBridgeFile(); see there. */
+  private bridgeTouchTimer: ReturnType<typeof setTimeout> | null = null;
   // Set in stop(): a torn-down bridge must never re-advertise itself by re-writing its
   // bridge file from a late noteActivity()/touchBridgeFile().
   private stopped = false;
@@ -471,7 +644,15 @@ export class WebSocketBridge {
     this.heartbeatTimer = setInterval(() => {
       if (this.client?.readyState === WebSocket.OPEN) {
         this.lastPingSent = Date.now();
+        // A protocol-level WebSocket ping proves the TCP peer is alive, but Chrome handles its
+        // pong below the extension service worker. It therefore does not count as extension
+        // activity and cannot keep an MV3 worker alive. Send the protocol ping for transport
+        // health and an ordinary protocol command for the worker lifetime; the latter reaches
+        // background.ts and receives the existing `pong` response without touching page state.
         this.client.ping();
+        if (this.isReady) {
+          this.client.send(JSON.stringify({ type: "ping", id: `__crawlio_keepalive__:${this.lastPingSent}` }));
+        }
         if (this.lastPong > 0 && Date.now() - this.lastPong > STALE_THRESHOLD) {
           console.error(`[Bridge] WebSocket stale — no pong in ${STALE_THRESHOLD / 1000}s, closing`);
           this.client.terminate();
@@ -500,11 +681,17 @@ export class WebSocketBridge {
    */
   private refuseContendedConnection(ws: WebSocket): void {
     this.noteContention();
-    try {
-      ws.close(WS_CLOSE_BRIDGE_BUSY, "bridge busy — a live extension holds this session");
-    } catch {
-      // Already gone; nothing to close.
-    }
+    // Let it say who it is on the way out.
+    //
+    // Refusing at the socket means a second profile's extension never reaches the `connected`
+    // message, so it never enters the roster — and with two Chrome profiles running, list_profiles
+    // showed one and switch_profile called the other "has not connected to this server". The
+    // profile you would actually want to switch to is precisely the one being refused.
+    //
+    // This accepts nothing but an identification: no command can be issued, the socket is closed
+    // either way, and the only state written is a profile id that is already validated and an
+    // extension id that is already clamped.
+    this.identifyOnTheWayOut(ws);
 
     // One probe per contention round, however many clients are knocking.
     if (this.contentionProbeTimer) return;
@@ -526,6 +713,63 @@ export class WebSocketBridge {
   }
 
   /**
+   * Record a refused client's profile, then close it.
+   *
+   * Waits a moment for the `connected` message the extension sends immediately on open. Anything
+   * else is ignored, and the socket closes on identification or on the deadline, whichever comes
+   * first — a client that stays silent simply costs one short timer.
+   */
+  private identifyOnTheWayOut(ws: WebSocket): void {
+    const close = () => {
+      try { ws.close(WS_CLOSE_BRIDGE_BUSY, "bridge busy — a live extension holds this session"); } catch { /* already gone */ }
+    };
+    const deadline = setTimeout(() => { ws.off("message", onMessage); close(); }, REFUSED_IDENTIFY_WINDOW);
+    if (deadline.unref) deadline.unref();
+
+    const onMessage = (raw: WebSocket.RawData) => {
+      let closeCode = WS_CLOSE_BRIDGE_BUSY;
+      let closeReason = "bridge busy — a live extension holds this session";
+      try {
+        const len = typeof raw === "string" ? Buffer.byteLength(raw) : (raw as Buffer).length;
+        if (len > 64 * 1024) return; // an identification is tiny; anything larger is not one
+        const msg = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (msg.type !== "connected" || !isProfileId(msg.profileId)) return;
+        const extensionId = typeof msg.extensionId === "string" ? msg.extensionId.slice(0, 128) : "unknown";
+        const generation = parseWorkerGeneration(msg.workerGeneration);
+        const now = new Date().toISOString();
+        const sameExtension = this.connectedExtensionId !== null && extensionId === this.connectedExtensionId;
+        const sameProfile = this.connectedProfileId === null || msg.profileId === this.connectedProfileId;
+        if (
+          sameExtension &&
+          sameProfile &&
+          isNewerWorkerGeneration(generation, this.connectedWorkerGeneration)
+        ) {
+          // A Chrome unpacked-extension reload can leave the prior worker alive behind its native
+          // port. The healthy incumbent would otherwise win forever, while the popup opened from
+          // the new generation claimed it was connected to a different/partial bridge. Release
+          // only an explicitly newer generation of the SAME extension/profile; the candidate is
+          // still closed and must reconnect through the normal handshake before receiving work.
+          console.error("[Bridge] Newer extension worker superseded the incumbent — releasing stale generation");
+          this.client?.terminate();
+          closeCode = WS_CLOSE_NEWER_GENERATION_RETRY;
+          closeReason = "newer extension generation — retry";
+        }
+        // Seen, but not driving anything — it is being turned away.
+        const incumbentIsSameProfile = msg.profileId === this.connectedProfileId;
+        this.profiles.observe(msg.profileId, extensionId, now);
+        // A second generation of the SAME profile commonly knocks while Chrome is retiring an
+        // extension reload. Refusing that socket must not mark the still-live incumbent profile
+        // offline in /health; only a genuinely different refused profile is disconnected.
+        if (!incumbentIsSameProfile) this.profiles.disconnect(msg.profileId, now);
+      } catch { /* not JSON, or not for us */ }
+      clearTimeout(deadline);
+      ws.off("message", onMessage);
+      try { ws.close(closeCode, closeReason); } catch { close(); }
+    };
+    ws.on("message", onMessage);
+  }
+
+  /**
    * Rate-limit the contention log. With N extensions installed, refusal is the
    * steady state rather than an incident, and `server.err` is not rotated.
    */
@@ -539,6 +783,25 @@ export class WebSocketBridge {
     );
     this.lastContentionLog = now;
     this.contentionRefusals = 0;
+  }
+
+  /**
+   * Rate-limit the profile-refusal log.
+   *
+   * With a profile pinned, every other installed extension retries on its reconnect backoff, so
+   * refusal is the steady state rather than an incident — and server.err is not rotated. Same
+   * reasoning, and same shape, as noteContention().
+   */
+  private noteProfileRefusal(): void {
+    this.profileRefusals++;
+    const now = Date.now();
+    if (now - this.lastProfileRefusalLog < CONTENTION_LOG_INTERVAL) return;
+    console.error(
+      `[Bridge] Refused ${this.profileRefusals} connection(s) from other Chrome profiles since last report — ` +
+      `profile ${this.preferredProfileId} is selected. Use switch_profile to change it.`
+    );
+    this.lastProfileRefusalLog = now;
+    this.profileRefusals = 0;
   }
 
   private writeBridgeFile(port: number, token: string, lastActivityAt = this.lastActivityAt): string {
@@ -572,10 +835,28 @@ export class WebSocketBridge {
   // Re-write the bridge file with the current lastActivityAt, throttled to ≤1 FS write/sec
   // so a burst of tool calls can't hammer the disk. The first write happens in start();
   // this only refreshes lastActivityAt for the multi-bridge election.
+  //
+  // The throttle DEFERS; it must never drop. start() stamps lastBridgeWriteAt, and a freshly
+  // spawned server takes its first tool call within a few hundred milliseconds — so the one
+  // write that decides whether this server is ever reachable always landed inside the window,
+  // and discarding it left the file saying `lastActivityAt: 0`. With that first call then parked
+  // on the queue waiting for a browser, no second call ever arrived to rewrite it: the native
+  // host kept electing whichever older server tied at zero with the lowest pid, and every call
+  // this server made expired on the queue. That is the whole of "MCP fails every time".
   private touchBridgeFile(): void {
     if (this.stopped) return; // no re-advertising after teardown
     const now = Date.now();
-    if (now - this.lastBridgeWriteAt < 1000) return;
+    const since = now - this.lastBridgeWriteAt;
+    if (since < BRIDGE_WRITE_INTERVAL) {
+      if (!this.bridgeTouchTimer) {
+        this.bridgeTouchTimer = setTimeout(() => {
+          this.bridgeTouchTimer = null;
+          this.touchBridgeFile();
+        }, BRIDGE_WRITE_INTERVAL - since);
+        this.bridgeTouchTimer.unref?.(); // never hold the process open for a discovery hint
+      }
+      return;
+    }
     this.lastBridgeWriteAt = now;
     try {
       this.writeBridgeFile(this.actualPort, this.bridgeToken);
@@ -584,14 +865,138 @@ export class WebSocketBridge {
 
   getHealth(): ConnectionHealth {
     return {
-      connected: this.isConnected,
+      connected: this.isReady,
+      socketConnected: this.isConnected,
       latencyMs: this.latencyMs,
-      uptime: this.connectTime > 0 && this.isConnected ? Date.now() - this.connectTime : 0,
+      uptime: this.connectTime > 0 && this.isReady ? Date.now() - this.connectTime : 0,
       reconnects: Math.max(0, this.reconnectCount),
       queueDepth: this.messageQueue.depth,
       lastActivityAt: this.lastActivityAt,
       version: PKG_VERSION,
+      ...(this.extensionPermissions ? { extensionPermissions: this.extensionPermissions } : {}),
+      ...(this.profiles.size > 0 || this.preferredProfileId !== null
+        ? {
+            profiles: {
+              connected: this.isReady ? this.connectedProfileId : null,
+              preferred: this.preferredProfileId,
+              seen: this.profiles.list(),
+            },
+          }
+        : {}),
     };
+  }
+
+  /** Profiles seen this run, most recently seen first, marking which holds the bridge. */
+  listProfiles(): { connected: string | null; preferred: string | null; seen: ProfileRecord[] } {
+    return {
+      connected: this.isConnected ? this.connectedProfileId : null,
+      preferred: this.preferredProfileId,
+      seen: this.profiles.list(),
+    };
+  }
+
+  /**
+   * Choose which profile may hold the bridge, and release the current one if it is not that.
+   *
+   * The displaced extension backs off and retries, the wanted profile's extension is accepted on
+   * its next attempt, and the rest keep being refused — the same loop contention refusal already
+   * relies on. Nothing new reconnects; the preference just changes who wins.
+   *
+   * Passing null clears the preference, restoring first-come.
+   */
+  switchProfile(profileId: string | null): { switched: boolean; reason?: string } {
+    if (this.switchRevertTimer) { clearTimeout(this.switchRevertTimer); this.switchRevertTimer = null; }
+
+    if (profileId === null) {
+      this.preferredProfileId = null;
+      // Whatever is attached is now acceptable, so release anything queued behind the pin.
+      if (this.isConnected) this.admitClient();
+      return { switched: true };
+    }
+    if (!isProfileId(profileId)) {
+      return { switched: false, reason: `"${profileId}" is not a profile id — use list_profiles to see them.` };
+    }
+    if (!this.profiles.has(profileId)) {
+      return {
+        switched: false,
+        reason:
+          `Profile ${profileId} has not connected to this server, so switching to it would leave the bridge empty. ` +
+          `Open Chrome in that profile with the Crawlio extension enabled, then try again.`,
+      };
+    }
+
+    this.preferredProfileId = profileId;
+    if (this.connectedProfileId === profileId && this.isConnected) {
+      this.admitClient();
+      return { switched: true };
+    }
+
+    // The roster never forgets a profile, so "has connected at some point" is not "is running
+    // now" — the browser may have quit hours ago. Rather than leave every extension refused
+    // forever, give the wanted one a window to appear and put things back if it does not. The
+    // alternative is a dead bridge for the life of the process, recoverable only by an agent that
+    // happens to know to clear the pin.
+    this.switchRevertTimer = setTimeout(() => {
+      this.switchRevertTimer = null;
+      if (this.connectedProfileId === profileId) return; // it arrived
+      console.error(`[Bridge] Profile ${profileId} did not take the bridge within ${PROFILE_SWITCH_GRACE / 1000}s — clearing the preference`);
+      this.preferredProfileId = null;
+      if (this.isConnected) this.admitClient();
+    }, PROFILE_SWITCH_GRACE);
+    if (this.switchRevertTimer.unref) this.switchRevertTimer.unref();
+
+    // Close rather than terminate: a clean close lets the extension's own reconnect path run.
+    if (this.connectedProfileId) this.profiles.disconnect(this.connectedProfileId, new Date().toISOString());
+    this.clientAdmitted = false;
+    this.client?.close(WS_CLOSE_BRIDGE_BUSY, "switching profile");
+    return { switched: true };
+  }
+
+  /**
+   * Ask the extension which optional permissions it holds and cache the answer.
+   *
+   * Asked for the full optional set rather than the per-feature subset the tool gate uses: this
+   * is a diagnostic, so the interesting case is precisely the one a feature gate hides — a
+   * partial grant where browsing works but `nativeMessaging` is absent, leaving the extension
+   * trust-on-first-use and the rogue-server defense inactive.
+   */
+  /**
+   * Ask the socket that just connected what it is allowed to do, once it can actually be asked.
+   *
+   * This is housekeeping about one specific socket, so it must never take the offline queue: a
+   * connection that is refused moments later would leave its permission check parked there, to be
+   * delivered to whichever browser connects next and answered on that browser's behalf. Deferred
+   * to the transmit-ready moment instead, which is also when the answer becomes meaningful.
+   */
+  private refreshPermissionsWhenReady(): void {
+    this.permissionsRefreshPending = true;
+    this.flushPermissionsRefresh();
+  }
+
+  private flushPermissionsRefresh(): void {
+    if (!this.permissionsRefreshPending || !this.canTransmit) return;
+    this.permissionsRefreshPending = false;
+    this.refreshExtensionPermissions();
+  }
+
+  private refreshExtensionPermissions(): void {
+    // queueWhenOffline:false so a socket that dies between the readiness check and here can never
+    // strand this on the queue.
+    this.send({ type: "check_permissions", permissions: ["tabs", "nativeMessaging"] } as never, 5000, { queueWhenOffline: false })
+      .then((data) => {
+        const d = data as { permissions?: Record<string, boolean>; missing?: { permissions?: string[] } } | null;
+        if (!d?.permissions) return;
+        const missing = d.missing?.permissions ?? [];
+        this.extensionPermissions = {
+          granted: missing.length === 0,
+          permissions: d.permissions,
+          missing,
+        };
+        if (missing.length) {
+          console.error(`[Bridge] Extension is missing optional permission(s): ${missing.join(", ")}`);
+        }
+      })
+      .catch(() => { /* diagnostic only — never disturb the connection */ });
   }
 
   push(data: unknown): void {
@@ -698,6 +1103,16 @@ export class WebSocketBridge {
       },
     });
 
+    // `ws` forwards HTTP-server bind errors through this emitter before the per-attempt HTTP
+    // listener below receives them. Without a WSS listener, a saturated port range throws from
+    // EventEmitter and strands bridge.start() before the stdio MCP transport can start. Consume
+    // expected bind failures here; listenWalkingPortRange remains the owner of retry/logging.
+    this.wss.on("error", (error: Error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!this.httpServer?.listening && (code === "EADDRINUSE" || code === "EACCES" || code === "EADDRNOTAVAIL")) return;
+      console.error("[Bridge] WebSocket server error:", error.message);
+    });
+
     this.wss.on("connection", (ws) => {
       if (this.client && this.client.readyState === WebSocket.OPEN) {
         // Eviction exists so an extension whose transport died can reclaim the
@@ -742,29 +1157,22 @@ export class WebSocketBridge {
         }
       });
 
-      if (this.messageQueue.depth > 0) {
-        console.error(`[Bridge] Draining ${this.messageQueue.depth} queued messages`);
-        this.messageQueue.drain((msg, resolve, reject) => {
-          return new Promise<void>((txResolve, txReject) => {
-            if (!this.isConnected) { txReject(new Error("Disconnected during drain")); return; }
-            const parsed = JSON.parse(msg) as ServerCommand;
-            const timer = setTimeout(() => {
-              this.pending.delete(parsed.id);
-              reject(Object.assign(new Error(`Queued command timed out: ${parsed.type}`), { problem: "timeout" satisfies ProblemCode }));
-            }, TIMEOUTS.WS_COMMAND);
-            this.pending.set(parsed.id, { resolve, reject, timer });
-            this.client!.send(msg, (err) => {
-              if (err) {
-                clearTimeout(timer);
-                this.pending.delete(parsed.id);
-                txReject(err);
-              } else {
-                txResolve(); // Transmission confirmed — response handled by pending map
-              }
-            });
-          });
-        }).catch((e) => console.error("[Bridge] Queue drain error:", e));
-      }
+      // Nothing may be transmitted until this socket has our identity proof; see
+      // handshakeSettled. The grace timer is the escape hatch for a client that never challenges.
+      this.handshakeSettled = false;
+      this.handshakeAckRequired = false;
+      this.handshakeNonce = null;
+      if (this.handshakeSettleTimer) clearTimeout(this.handshakeSettleTimer);
+      this.handshakeSettleTimer = setTimeout(() => {
+        this.handshakeSettleTimer = null;
+        this.settleHandshake();
+      }, HANDSHAKE_SETTLE_GRACE);
+
+      // Admission waits for the `connected` identity frame below. Current extensions include a
+      // profile or worker generation and are admitted immediately; legacy anonymous clients get
+      // a short grace so a just-reloaded current worker can supersede them before queued work is
+      // irreversibly transmitted to the retiring generation.
+      this.clientAdmitted = false;
 
       ws.on("message", (raw) => {
         try {
@@ -783,11 +1191,28 @@ export class WebSocketBridge {
           // can reject a rogue listener that never read the 0600 bridge file. New
           // message type — ignored by older extensions, so non-breaking.
           if (parsed.type === HANDSHAKE_MESSAGE_TYPES.challenge && typeof parsed.nonce === "string") {
+            this.handshakeNonce = parsed.nonce;
             // Bind OUR listening port into the proof so a relayed proof from a different
             // port fails the extension's expected-port check.
             void computeHandshakeProof(this.bridgeToken, parsed.nonce, this.actualPort).then(proof => {
-              try { ws.send(JSON.stringify({ type: HANDSHAKE_MESSAGE_TYPES.handshake, proof })); } catch { /* socket closed */ }
+              try {
+                ws.send(JSON.stringify({ type: HANDSHAKE_MESSAGE_TYPES.handshake, proof }));
+                // The proof is now ahead of anything queued, and WebSocket delivery is ordered, so
+                // a legacy extension can retain the old proof-first behavior. Current extensions
+                // explicitly ACK the verdict; only that acknowledgement releases their queue.
+                if (ws === this.client && !this.handshakeAckRequired) this.settleHandshake();
+              } catch { /* socket closed */ }
             }).catch(() => { /* crypto failed — drop; the extension times out and refuses */ });
+            return;
+          }
+          if (parsed.type === HANDSHAKE_MESSAGE_TYPES.accepted) {
+            const accepted = parsed.accepted === true;
+            const nonceMatches = typeof parsed.nonce === "string" && parsed.nonce === this.handshakeNonce;
+            if (ws === this.client && this.handshakeAckRequired && accepted && nonceMatches) {
+              this.settleHandshake();
+            } else if (ws === this.client && this.handshakeAckRequired && !accepted && nonceMatches) {
+              console.error("[Bridge] Extension rejected identity proof — retaining queued commands for reconnect");
+            }
             return;
           }
           const msg = parsed as unknown as ExtensionResponse;
@@ -795,7 +1220,7 @@ export class WebSocketBridge {
             this.onPortRefreshRequested?.();
             return;
           }
-          this.handleMessage(msg);
+          this.handleMessage(msg, ws);
         } catch (e) {
           console.error("[Bridge] Invalid message:", e);
         }
@@ -808,7 +1233,7 @@ export class WebSocketBridge {
         }
       });
 
-      ws.on("close", () => {
+      ws.on("close", (code, reason) => {
         // Guard: only act if THIS ws is still the active client.
         // When the extension reconnects, the old ws's close fires async
         // AFTER this.client already points to the new connection.
@@ -816,10 +1241,34 @@ export class WebSocketBridge {
           console.error("[Bridge] Stale client closed (already replaced)");
           return;
         }
-        console.error("[Bridge] Extension disconnected");
+        const closeReason = reason.toString("utf8").trim();
+        console.error(
+          `[Bridge] Extension disconnected (code ${code}${closeReason ? `: ${closeReason}` : ""})`,
+        );
         this.stopHeartbeat();
         this.client = null;
         this.connectTime = 0;
+        // The roster describes which browsers are reachable now, so a departed profile must stop
+        // claiming to be connected — list_profiles, /health and doctor all read it verbatim, and
+        // switchProfile would early-return "already there" for a profile that has quit.
+        if (this.connectedProfileId) this.profiles.disconnect(this.connectedProfileId, new Date().toISOString());
+        // Remember who the in-flight commands were addressed to. The grace below keeps them alive
+        // on the bet that the same browser comes back and answers; if a different profile takes
+        // the bridge instead, that bet is wrong and they have to be failed — see handleMessage.
+        this.pendingProfileId = this.connectedProfileId;
+        this.connectedProfileId = null;
+        this.connectedExtensionId = null;
+        this.connectedWorkerGeneration = null;
+        this.clientAdmitted = false;
+        this.handshakeSettled = false; // the next socket must prove itself before it gets anything
+        this.handshakeAckRequired = false;
+        this.handshakeNonce = null;
+        this.permissionsRefreshPending = false; // that socket's permissions are no longer our question
+        if (this.legacyAdmissionTimer) {
+          clearTimeout(this.legacyAdmissionTimer);
+          this.legacyAdmissionTimer = null;
+        }
+        if (this.handshakeSettleTimer) { clearTimeout(this.handshakeSettleTimer); this.handshakeSettleTimer = null; }
         // Grace period: wait for extension to reconnect before rejecting pending commands
         // Prevent premature session deletion on transport close
         if (this.pending.size > 0) {
@@ -876,28 +1325,157 @@ export class WebSocketBridge {
       );
     }
 
-    // Cleanup on exit
-    const cleanup = () => removeBridgeFile();
-    process.on("SIGTERM", cleanup);
-    process.on("SIGINT", cleanup);
-    process.on("beforeExit", cleanup);
+    // Cleanup on exit. Kept on the instance so stop() can unregister: production runs one bridge
+    // per process, but tests start many, and without removal each one leaves three process
+    // listeners behind — enough to trip Node's MaxListeners warning and mask a real leak.
+    this.exitCleanup = () => removeBridgeFile();
+    process.on("SIGTERM", this.exitCleanup);
+    process.on("SIGINT", this.exitCleanup);
+    process.on("beforeExit", this.exitCleanup);
   }
 
   get isConnected(): boolean {
     return this.client?.readyState === WebSocket.OPEN;
   }
 
+  /** Whether the current socket is safe and eligible to receive MCP commands. */
+  get isReady(): boolean {
+    return this.canTransmit;
+  }
+
+  /**
+   * Connected AND cleared to receive commands.
+   *
+   * Distinct from isConnected, which stays the answer to "is an extension attached" for /health
+   * and the status surfaces. A socket that has not yet said which profile it is, while a profile
+   * is pinned, is attached but must not be sent anything.
+   */
+  private get canTransmit(): boolean {
+    return this.isConnected && this.clientAdmitted && this.handshakeSettled;
+  }
+
+  /**
+   * Fail in-flight commands that the newly-arrived browser cannot possibly answer.
+   *
+   * A disconnect keeps pending commands alive through the reconnect grace, because the usual case
+   * is the same extension bouncing and coming back to answer them. With two Chrome profiles
+   * competing for one bridge that assumption breaks: the command was transmitted to profile A,
+   * A's socket died, and B took the bridge. B never saw it, so nothing will ever resolve it and
+   * the caller sat out its whole timeout — a 30-second wait for an answer that could not come.
+   * Failing it here turns that into an immediate, accurate error the caller can act on.
+   */
+  private failPendingOnProfileTakeover(profileId: string | null): void {
+    if (!profileId || !this.pendingProfileId || profileId === this.pendingProfileId) {
+      // Same browser back, or nothing to attribute — the grace period's own bet still stands.
+      if (profileId) this.pendingProfileId = null;
+      return;
+    }
+    const orphaned = this.pending.size;
+    this.pendingProfileId = null;
+    if (orphaned === 0) return;
+    console.error(`[Bridge] Profile ${profileId} took the bridge — failing ${orphaned} command(s) sent to the previous profile`);
+    for (const [id, req] of this.pending) {
+      clearTimeout(req.timer);
+      req.reject(notConnected("A different Chrome profile took the bridge before this command was answered"));
+      this.pending.delete(id);
+    }
+  }
+
+  /**
+   * The socket has our identity proof (or has proved it will never ask) — release the queue.
+   *
+   * Idempotent, and safe to call from either the proof callback or the grace timer, whichever
+   * gets there first.
+   */
+  private settleHandshake(): void {
+    if (this.handshakeSettleTimer) { clearTimeout(this.handshakeSettleTimer); this.handshakeSettleTimer = null; }
+    if (this.handshakeSettled) return;
+    this.handshakeSettled = true;
+    if (this.clientAdmitted) this.drainQueue();
+    this.flushPermissionsRefresh();
+  }
+
   get queueDepth(): number { return this.messageQueue.depth; }
 
-  async send(command: Omit<ServerCommand, "id"> & Record<string, unknown>, timeout: number = TIMEOUTS.WS_COMMAND): Promise<unknown> {
+  /**
+   * Hand the queued commands to the connected extension.
+   *
+   * Split out of the connection handler because with a profile pinned the drain must wait until
+   * the socket has identified itself — draining on connect sent commands intended for the chosen
+   * profile to whichever extension reconnected first, and attributed the results to the wrong one.
+   */
+  private drainQueue(): void {
+    // Called from every point that could unblock the queue — connection, admission, handshake
+    // settle — because none of them alone means the queue may move. Whichever lands last does the
+    // draining; the earlier ones return here.
+    if (!this.canTransmit) return;
+    if (this.messageQueue.depth === 0) return;
+    console.error(`[Bridge] Draining ${this.messageQueue.depth} queued messages`);
+    this.messageQueue.drain((msg, resolve, reject, commandTimeoutMs) => {
+      return new Promise<void>((txResolve, txReject) => {
+        if (!this.canTransmit) { txReject(new Error("Disconnected during drain")); return; }
+        const parsed = JSON.parse(msg) as ServerCommand;
+        const timer = setTimeout(() => {
+          this.pending.delete(parsed.id);
+          reject(Object.assign(new Error(`Queued command timed out: ${parsed.type}`), { problem: "timeout" satisfies ProblemCode }));
+        }, commandTimeoutMs);
+        this.pending.set(parsed.id, { resolve, reject, timer });
+        this.client!.send(msg, (err) => {
+          if (err) {
+            clearTimeout(timer);
+            this.pending.delete(parsed.id);
+            txReject(err);
+          } else {
+            txResolve(); // Transmission confirmed — response handled by pending map
+          }
+        });
+      });
+    }).catch((e) => console.error("[Bridge] Queue drain error:", e));
+  }
+
+  /**
+   * Admit the connected socket, releasing anything queued for it.
+   *
+   * Called once a socket has proved to be the profile the agent asked for. Idempotent, because a
+   * re-identifying extension sends `connected` more than once.
+   */
+  private admitClient(): void {
+    if (this.legacyAdmissionTimer) {
+      clearTimeout(this.legacyAdmissionTimer);
+      this.legacyAdmissionTimer = null;
+    }
+    if (this.clientAdmitted) return;
+    this.clientAdmitted = true;
+    this.drainQueue();
+    this.flushPermissionsRefresh();
+  }
+
+  async send(
+    command: Omit<ServerCommand, "id"> & Record<string, unknown>,
+    timeout: number = TIMEOUTS.WS_COMMAND,
+    opts: SendOptions = {},
+  ): Promise<unknown> {
     const id = randomUUID();
-    const fullCommand = { ...command, id } as ServerCommand;
+    const fullCommand = { ...applyTargetTab(command), id } as ServerCommand;
     const serialized = JSON.stringify(fullCommand);
 
-    if (!this.isConnected) {
-      console.error(`[Bridge] Queuing command (offline): ${command.type} (queue depth: ${this.messageQueue.depth + 1})`);
-      const queueTimeout = Math.max(timeout, 45_000);
-      return this.messageQueue.enqueue(serialized, queueTimeout);
+    if (!this.canTransmit) {
+      // An admitted socket that is only waiting on the handshake has a browser behind it; the
+      // wait is the ~1ms it takes to answer a challenge. Treating that as "offline" would make a
+      // probe report no browser, and would put a 45-second floor on a millisecond wait.
+      const settling = this.isConnected && this.clientAdmitted && !this.handshakeSettled;
+
+      // A probe asks a question whose offline answer is already known, so waiting out the queue
+      // floor buys nothing and costs the caller 45 seconds. Fail it now and let the caller
+      // degrade, which is what every probe call site already does in its catch.
+      if (opts.queueWhenOffline === false && !settling) {
+        return Promise.reject(notConnected(`Extension not connected: ${command.type}`));
+      }
+      const why = settling ? "settling identity handshake" : this.isConnected ? "awaiting profile identity" : "offline";
+      console.error(`[Bridge] Queuing command (${why}): ${command.type} (queue depth: ${this.messageQueue.depth + 1})`);
+      // Only a genuinely absent browser needs the floor — it covers the extension arriving late.
+      const queueTimeout = settling ? timeout : Math.max(timeout, 45_000);
+      return this.messageQueue.enqueue(serialized, queueTimeout, timeout);
     }
 
     return new Promise((resolve, reject) => {
@@ -920,7 +1498,7 @@ export class WebSocketBridge {
     });
   }
 
-  private handleMessage(msg: ExtensionResponse): void {
+  private handleMessage(msg: ExtensionResponse, ws: WebSocket): void {
     // Extension-initiated actions (fire-and-forget, no response expected)
     if (msg.type === "open_crawlio_app") {
       import("child_process").then(({ execFile }) => {
@@ -930,11 +1508,81 @@ export class WebSocketBridge {
     }
 
     if (msg.type === "connected") {
-      console.error(`[Bridge] Extension identified: ${msg.extensionId}`);
+      // Only the socket that currently holds the bridge may identify. `ws` keeps emitting
+      // messages while it is CLOSING, and a replacement socket is admitted in the meantime, so a
+      // late `connected` from the outgoing socket would otherwise close its replacement — handing
+      // any extension a repeatable way to evict the healthy incumbent.
+      if (ws !== this.client) return;
+
+      // Protocol v2: the extension will tell us whether it accepted the proof. Cancel the legacy
+      // grace path so a stale-token connection can never receive queued work before that verdict.
+      if (msg.handshakeAck === true) {
+        this.handshakeAckRequired = true;
+        if (this.handshakeSettleTimer) {
+          clearTimeout(this.handshakeSettleTimer);
+          this.handshakeSettleTimer = null;
+        }
+      }
+
+      const profileId = isProfileId(msg.profileId) ? msg.profileId : null;
+      const extensionId = typeof msg.extensionId === "string" ? msg.extensionId.slice(0, 128) : "unknown";
+      const workerGeneration = parseWorkerGeneration(msg.workerGeneration);
+      const now = new Date().toISOString();
+
+      // Identity is set once per socket. Going from unidentified to identified is expected — the
+      // extension re-identifies when its stored profile id resolves after connecting — but a
+      // socket changing which profile it claims is not, and would let one connection fill the
+      // roster with fabricated profiles.
+      if (profileId && this.connectedProfileId && profileId !== this.connectedProfileId) {
+        console.error(`[Bridge] Ignoring profile change ${this.connectedProfileId} -> ${profileId} on a live socket`);
+        return;
+      }
+
+      if (profileId) this.profiles.observe(profileId, extensionId, now);
+
+      // A pinned profile decides who may drive the browser. Anything else is released so the
+      // wanted extension can take the socket — including a client that declines to identify,
+      // which would otherwise hold the bridge simply by staying anonymous.
+      if (this.preferredProfileId !== null && profileId !== this.preferredProfileId) {
+        if (profileId) this.profiles.disconnect(profileId, now);
+        this.noteProfileRefusal();
+        // Same close code as contention, so the extension treats it as "someone else has it".
+        ws.close(WS_CLOSE_BRIDGE_BUSY, "another Chrome profile is selected");
+        return;
+      }
+
+      if (profileId) this.connectedProfileId = profileId;
+      this.connectedExtensionId = extensionId;
+      if (workerGeneration) this.connectedWorkerGeneration = workerGeneration;
+      console.error(`[Bridge] Extension identified: ${extensionId}${profileId ? ` (profile ${profileId})` : ""}`);
+      this.failPendingOnProfileTakeover(profileId);
+      if (this.switchRevertTimer) { clearTimeout(this.switchRevertTimer); this.switchRevertTimer = null; }
+      // A current, fully hydrated extension identifies its persisted profile, so it is safe to
+      // release queued work immediately. A worker-generation id alone is not sufficient: a
+      // short-lived replacement can connect before its profile storage read resolves, then die
+      // with the first command in flight. Wait for its follow-up identity frame instead.
+      if (profileId) {
+        this.admitClient();
+      } else if (!this.legacyAdmissionTimer) {
+        const legacySocket = ws;
+        this.legacyAdmissionTimer = setTimeout(() => {
+          this.legacyAdmissionTimer = null;
+          if (this.client === legacySocket) this.admitClient();
+        }, LEGACY_CLIENT_ADMISSION_GRACE);
+        this.legacyAdmissionTimer.unref?.();
+      }
+      // Ask once what it actually holds, and cache it for /health. Best-effort: a failure here
+      // must never affect the connection, so nothing is awaited and nothing is thrown.
+      this.refreshPermissionsWhenReady();
       return;
     }
 
     if (msg.type === "pong") {
+      // Application-level heartbeats pass through the MV3 service worker (unlike WebSocket
+      // control frames), so their reply is also a liveness signal even when no request is
+      // waiting in the command map.
+      this.lastPong = Date.now();
+      if (this.lastPingSent > 0) this.latencyMs = this.lastPong - this.lastPingSent;
       const req = this.pending.get(msg.id);
       if (req) {
         clearTimeout(req.timer);
@@ -974,9 +1622,21 @@ export class WebSocketBridge {
 
   async stop(): Promise<void> {
     this.stopped = true; // gate noteActivity/touchBridgeFile so we don't re-write the bridge file
+    if (this.bridgeTouchTimer) { clearTimeout(this.bridgeTouchTimer); this.bridgeTouchTimer = null; }
     this.stopHeartbeat();
     if (this.reconnectGraceTimer) { clearTimeout(this.reconnectGraceTimer); this.reconnectGraceTimer = null; }
     if (this.contentionProbeTimer) { clearTimeout(this.contentionProbeTimer); this.contentionProbeTimer = null; }
+    if (this.switchRevertTimer) { clearTimeout(this.switchRevertTimer); this.switchRevertTimer = null; }
+    if (this.legacyAdmissionTimer) { clearTimeout(this.legacyAdmissionTimer); this.legacyAdmissionTimer = null; }
+    this.profiles.disconnectAll(new Date().toISOString());
+    this.connectedProfileId = null;
+    this.connectedExtensionId = null;
+    this.connectedWorkerGeneration = null;
+    this.clientAdmitted = false;
+    this.handshakeSettled = false;
+    this.handshakeAckRequired = false;
+    this.handshakeNonce = null;
+    if (this.handshakeSettleTimer) { clearTimeout(this.handshakeSettleTimer); this.handshakeSettleTimer = null; }
     // Clear in-flight command timers so they can't fire after teardown.
     for (const [id, req] of this.pending) {
       clearTimeout(req.timer);
@@ -987,6 +1647,12 @@ export class WebSocketBridge {
     this.client?.close();
     this.wss?.close();
     this.httpServer?.close();
+    if (this.exitCleanup) {
+      process.off("SIGTERM", this.exitCleanup);
+      process.off("SIGINT", this.exitCleanup);
+      process.off("beforeExit", this.exitCleanup);
+      this.exitCleanup = null;
+    }
     removeBridgeFile();
   }
 }

@@ -38,6 +38,25 @@ function bridgeHealthFetch(connected: boolean): typeof fetch {
   }) as typeof fetch;
 }
 
+
+/** Bridge health that also reports what the extension says it holds. */
+function permissionHealthFetch(extensionPermissions: unknown): typeof fetch {
+  return (async (url: RequestInfo | URL) => {
+    const u = String(url);
+    if (u.includes(":9333/health")) {
+      return {
+        ok: true,
+        json: async () => ({
+          service: "crawlio-mcp", pid: process.pid, port: 9333, connected: true,
+          uptime: 12, queueDepth: 0, version: "1.9.5",
+          ...(extensionPermissions === undefined ? {} : { extensionPermissions }),
+        }),
+      } as unknown as Response;
+    }
+    throw new Error(`unexpected fetch ${u}`);
+  }) as typeof fetch;
+}
+
 /** Deps where every core check can reach a healthy state, portal deliberately down. */
 function healthyDeps(overrides: Partial<DoctorDeps> = {}): DoctorDeps {
   const nmDir = mkdtempSync(join(tmpdir(), "doctor-nm-"));
@@ -216,4 +235,44 @@ describe("doctor — render", () => {
     expect(text).toContain("degraded");
     expect(text).toContain("--json");
   });
+
+  // A partial grant is invisible to every other check: browsing works, so bridge/portal/native
+  // host all report ok while the extension cannot verify which local server it is talking to.
+  describe("extension.permissions", () => {
+    const find = (r: Awaited<ReturnType<typeof collectDoctorReport>>) =>
+      r.checks.find((c) => c.id === "extension.permissions")!;
+
+    it("is ok when the extension holds everything", async () => {
+      const report = await collectDoctorReport(healthyDeps({
+        fetchFn: permissionHealthFetch({ granted: true, permissions: { tabs: true, nativeMessaging: true }, missing: [] }),
+      }));
+      const check = find(report);
+      expect(check.status).toBe("ok");
+      expect(check.detail).toContain("nativeMessaging");
+    });
+
+    it("warns, and says why it matters, when nativeMessaging is the missing one", async () => {
+      const report = await collectDoctorReport(healthyDeps({
+        fetchFn: permissionHealthFetch({ granted: false, permissions: { tabs: true, nativeMessaging: false }, missing: ["nativeMessaging"] }),
+      }));
+      const check = find(report);
+      expect(check.status).toBe("warn");
+      expect(check.detail).toMatch(/cannot verify which local server/);
+      expect(check.fix).toMatch(/dedicated onboarding page/i);
+      expect(check.fix).not.toMatch(/badge|popup|widget/i);
+    });
+
+    it("warns when an older extension reports nothing, rather than claiming ok", async () => {
+      const report = await collectDoctorReport(healthyDeps({ fetchFn: permissionHealthFetch(undefined) }));
+      const check = find(report);
+      expect(check.status).toBe("warn");
+      expect(check.fix).toMatch(/[Rr]eload/);
+    });
+
+    it("is off, not failing, when no extension is connected", async () => {
+      const report = await collectDoctorReport(healthyDeps({ fetchFn: bridgeHealthFetch(false) }));
+      expect(find(report).status).toBe("off");
+    });
+  });
+
 });

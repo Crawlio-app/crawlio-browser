@@ -187,8 +187,25 @@
     document.getElementById("drop-readout").textContent = e.dataTransfer.getData("text/plain") || "dropped";
   });
 
+  // A child frame, so frame-scoped targeting has something to target. Its document declares a
+  // different marker from the top document, which is how the harness tells which frame an
+  // evaluation actually ran in — a frame bug that silently evaluated in the top document would
+  // otherwise return a plausible answer.
+  (function () {
+    var frame = document.createElement("iframe");
+    frame.id = "child-frame";
+    frame.setAttribute("title", "fixture child frame");
+    frame.style.cssText = "width:280px;height:80px;border:1px solid #ccc;display:block;margin-top:16px";
+    frame.srcdoc =
+      "<!doctype html><html><body>" +
+      "<p id='frame-marker'>CHILD-FRAME</p>" +
+      "<script>window.__CRAWLIO_FRAME__ = 'child';<\/script>" +
+      "</body></html>";
+    document.body.appendChild(frame);
+  })();
+
   // A stable marker so the harness can prove it is on the fixture and not a cached page.
-  window.__CRAWLIO_FIXTURE__ = { version: 1, ready: true };
+  window.__CRAWLIO_FIXTURE__ = { version: 1, ready: true, frame: "top" };
 </script>
 </body>
 </html>

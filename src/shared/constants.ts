@@ -2,7 +2,7 @@ import { homedir } from "os";
 import { join } from "path";
 
 // Single source of truth — bump here, tests enforce sync with package.json
-export const PKG_VERSION = "1.9.5";
+export const PKG_VERSION = "1.11.0";
 
 // CRAWLIO_WS_PORT relocates the whole 10-slot range (tests/dev isolation).
 // The extension only discovers the default range (background.ts WS_PORT_END),
@@ -34,4 +34,8 @@ export const TIMEOUTS = {
 // Bridge heartbeat — tuned for heavy execute sessions
 export const WS_HEARTBEAT_INTERVAL = 20_000;  // 20s between pings
 export const WS_STALE_THRESHOLD = 90_000;     // 90s before declaring stale
-export const WS_RECONNECT_GRACE = 5_000;      // 5s grace period before rejecting pending commands
+// A replacement MV3 worker can need the 30s alarm safety-net plus identity handshake before it
+// reconnects. Keep pending requests through that guaranteed fallback; long lifecycle tools have
+// 60s budgets, and authenticated response rerouting can then deliver work completed during the
+// socket handoff without replaying the original (possibly mutating) command.
+export const WS_RECONNECT_GRACE = 40_000;

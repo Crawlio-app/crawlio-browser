@@ -74,7 +74,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .status-dot {
@@ -100,62 +100,25 @@ body {
   color: var(--text-100);
 }
 
-/* --- Setup card --- */
-.setup-card {
-  background: var(--bg-200);
-  border-radius: 10px;
-  padding: 14px;
+.access-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 12px;
+  font-size: 11px;
 }
 
-.setup-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-100);
-  margin-bottom: 4px;
-}
+.access-title { color: var(--text-200); }
 
-.setup-desc {
-  font-size: 12px;
+.access-status {
   color: var(--text-200);
-  margin-bottom: 10px;
-  line-height: 1.4;
-}
-
-.setup-perms {
-  list-style: none;
-  margin-bottom: 12px;
-}
-
-.setup-perms li {
-  font-size: 12px;
-  color: var(--text-200);
-  padding: 2px 0;
-}
-
-.setup-perms li::before {
-  content: "\00B7\00A0\00A0";
-  font-weight: 700;
-}
-
-.btn-enable {
-  display: block;
-  width: 100%;
-  padding: 9px;
-  border: none;
-  border-radius: 8px;
-  font-family: var(--font);
-  font-size: 13px;
   font-weight: 600;
-  cursor: pointer;
-  background: var(--accent);
-  color: #fff;
-  transition: background 0.15s;
+  text-align: right;
 }
 
-.btn-enable:hover {
-  background: var(--accent-hover);
-}
+.access-status.ready { color: #15803d; }
+.access-status.needs-onboarding { color: #b45309; }
 
 /* --- Waiting card (auto-connect state) --- */
 .waiting-card {
@@ -237,12 +200,14 @@ body {
 }
 
 .btn-disconnect {
-  background: var(--red);
-  color: #fff;
+  background: var(--bg-200);
+  color: var(--red);
+  border: 1px solid rgba(220,38,38,0.16);
 }
 
 .btn-disconnect:hover {
-  background: var(--red-hover);
+  background: rgba(220,38,38,0.08);
+  color: var(--red-hover);
 }
 
 /* --- Setup link (opens welcome.html onboarding) --- */

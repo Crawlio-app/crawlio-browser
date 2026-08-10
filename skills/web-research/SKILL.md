@@ -25,7 +25,7 @@ Connect to each target page and extract comprehensive data using `smart.extractP
 
 ```js
 // Connect first
-await connect_tab({ url: "https://example.com" })
+await connect_tab({ url: "https://example.com", background: true })
 
 // Extract everything in one call
 const page = await smart.extractPage()
@@ -154,7 +154,7 @@ When comparing sites, evaluate these dimensions:
 - **`comparePages()` for 2-site comparisons** — returns `{ siteA, siteB, scaffold }` with 11 fixed comparison dimensions
 - **`smart.finding()` for validated findings** — enforces claim + evidence + sourceUrl + confidence + method schema
 - **No `smart.screenshot()`** — it doesn't exist. Use `bridge.send({ type: 'take_screenshot' })` or `smart.scrollCapture()`
-- **No `smart.snapshot({ compact: true })`** — compact option doesn't exist. Use `smart.snapshot()` or `{ interactive: true }`
+- **Scope large snapshots** — use `smart.snapshot({ compact: true, maxDepth: 8, selector: "#main" })`; use `{ interactive: true }` when only actionable controls matter
 - **No `location.href = "..."` for navigation** — use `smart.navigate(url)`. Direct assignment breaks CDP
 
 ## Example: Competitive Audit

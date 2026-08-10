@@ -18,7 +18,7 @@ Capture the visual DNA of a page: design tokens, typography scale, spacing syste
 ## Protocol
 
 1. **search** for the right commands: `search("design tokens extract CSS")` or `search("detect technologies")`
-2. **connect_tab** to the target URL (or use an already-connected tab)
+2. **connect_tab** to the target URL with `{ background: true }` (or use an already-connected owned tab)
 3. **execute** Code Mode with smart.* methods to extract evidence
 4. Emit one `smart.finding()` per design dimension discovered
 5. Return `smart.findings()` as the final output
@@ -50,11 +50,12 @@ smart.finding({
   dimension: "design-system"
 });
 
-// Typography
-if (page.fonts?.length) {
+// Typography — detect_fonts returns an object, not a bare array
+const detectedFonts = Array.isArray(page.fonts?.fonts) ? page.fonts.fonts : [];
+if (detectedFonts.length) {
   smart.finding({
-    claim: `${page.fonts.length} font families loaded`,
-    evidence: page.fonts.map(f => f.name || f),
+    claim: `${detectedFonts.length} font faces detected`,
+    evidence: detectedFonts.map(f => `${f.family} ${f.weight} (${f.status})`),
     sourceUrl: page.capture.url,
     confidence: "high",
     method: "extractPage",
@@ -80,7 +81,7 @@ const tables = await smart.detectTables();
 if (tables.length) {
   smart.finding({
     claim: `${tables.length} repeating UI patterns detected`,
-    evidence: tables.map(t => `${t.selector}: ${t.rowCount} rows, ${t.columns.length} cols`),
+    evidence: tables.map(t => `${t.selector}: ${t.rowCount} rows, ${Math.round(t.confidence * 100)}% confidence (${t.strategy})`),
     sourceUrl: page.capture.url,
     confidence: "high",
     method: "detectTables",

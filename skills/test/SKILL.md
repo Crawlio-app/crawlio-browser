@@ -16,7 +16,7 @@ Run pass/fail assertions across accessibility, performance, security, SEO, and m
 ## Protocol
 
 1. **search** for extraction commands: `search("extract page accessibility")`
-2. **connect_tab** to the target URL
+2. **connect_tab** to the target URL with `{ background: true }`
 3. **execute** Code Mode: `smart.extractPage()` gathers all dimensions in one call
 4. Emit one `smart.finding()` per assertion — claim states pass or fail
 5. Return `smart.findings()` + `page.gaps`
@@ -63,18 +63,18 @@ if (page.security) {
   smart.finding({
     claim: page.security.securityState === "secure"
       ? "TLS connection is secure" : `Security state: ${page.security.securityState || "unknown"}`,
-    evidence: [`protocol: ${page.security.protocol || "unknown"}`],
+    evidence: [`protocol: ${page.security.certificate?.protocol || "unknown"}`],
     sourceUrl: page.capture.url, confidence: "high",
     method: "extractPage", dimension: "security"
   });
 }
 
 // SEO
-if (page.capture?.meta) {
-  const m = page.capture.meta;
+if (page.meta) {
+  const m = page.meta;
   smart.finding({
-    claim: m.title && m.description ? "Title + meta description present" : "SEO meta tags incomplete",
-    evidence: [`title: ${m.title || "missing"} (${m.title?.length || 0} chars)`,
+    claim: m._title && m.description ? "Title + meta description present" : "SEO meta tags incomplete",
+    evidence: [`title: ${m._title || "missing"} (${m._title?.length || 0} chars)`,
                `description: ${m.description || "missing"} (${m.description?.length || 0} chars)`],
     sourceUrl: page.capture.url, confidence: "high",
     method: "extractPage", dimension: "seo"

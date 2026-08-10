@@ -5,6 +5,7 @@ import {
   timingSafeStringEqual,
   randomNonce,
   evaluateServerTrust,
+  canRerouteBridgeResponse,
 } from "../../src/shared/bridge-handshake.js";
 
 /**
@@ -82,5 +83,22 @@ describe("bridge-handshake (server-identity proof)", () => {
     expect(evaluateServerTrust(true, false)).toBe("refuse");   // rogue-server hole closed
     expect(evaluateServerTrust(false, false)).toBe("tofu-allow"); // no provisioning -> unchanged
     expect(evaluateServerTrust(false, true)).toBe("trusted");
+  });
+
+  it("reroutes an in-flight response only to a verified replacement with the same trusted identity", () => {
+    const trustedReplacement = {
+      commandToken: "native-provisioned-token",
+      currentToken: "native-provisioned-token",
+      sameActivePort: true,
+      replacementOpen: true,
+      replacementVerified: true,
+    };
+    expect(canRerouteBridgeResponse(trustedReplacement)).toBe(true);
+    expect(canRerouteBridgeResponse({ ...trustedReplacement, currentToken: "rotated-token" })).toBe(false);
+    expect(canRerouteBridgeResponse({ ...trustedReplacement, commandToken: null })).toBe(false);
+    expect(canRerouteBridgeResponse({ ...trustedReplacement, currentToken: null })).toBe(false);
+    expect(canRerouteBridgeResponse({ ...trustedReplacement, sameActivePort: false })).toBe(false);
+    expect(canRerouteBridgeResponse({ ...trustedReplacement, replacementOpen: false })).toBe(false);
+    expect(canRerouteBridgeResponse({ ...trustedReplacement, replacementVerified: false })).toBe(false);
   });
 });

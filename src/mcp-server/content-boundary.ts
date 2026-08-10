@@ -39,7 +39,7 @@ export function wrapPageContent(content: string, origin: string): string {
 /**
  * Tools whose output contains page-sourced content and should be wrapped.
  *
- * Excludes: search (tool descriptions), connect_tab/disconnect_tab/list_tabs (tab metadata),
+ * Excludes: search (tool descriptions), connect_tab/disconnect_tab (tab metadata),
  * get_connection_status/reconnect_tab/get_capabilities (status), create_tab/close_tab/switch_tab (tab ops),
  * start_recording/stop_recording/get_recording_status/compile_recording (recording ops),
  * extract_site/get_crawl_status/get_crawled_urls/enrich_url (crawlio HTTP ops),
@@ -105,6 +105,14 @@ export const PAGE_SOURCED_TOOLS = new Set([
   "ocr_screenshot",
   // Code mode — execute runs in page context
   "execute",
+  // ...and so does a BACKGROUND execute, whose output arrives here instead. Same code, same
+  // page, same untrusted text — but `execute({background:true})` returns only a jobId, so the
+  // content reaches the model through the poll. Leaving these unwrapped meant the identical
+  // script was marked untrusted when run in the foreground and trusted when run in the
+  // background. list_jobs carries reportPhase() labels, which sandbox code can fill with page
+  // text just as easily as a return value.
+  "get_job_result",
+  "list_jobs",
   // Coverage results
   "stop_css_coverage",
   "stop_js_coverage",

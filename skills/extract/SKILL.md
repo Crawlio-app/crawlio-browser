@@ -24,7 +24,7 @@ Extract structured data from a page. Detect tables, pull JSON-LD, extract repeat
 ### 1. Connect
 
 ```
-connect_tab({ url: "https://target.com/data-page" })
+connect_tab({ url: "https://target.com/data-page", background: true })
 ```
 
 ### 2. Acquire + Normalize
@@ -48,7 +48,7 @@ const table = await smart.extractTable("table.pricing"); // specific table extra
 For visually-rendered data (canvas, images, anti-scrape sites):
 
 ```js
-const ocr = await bridge.send({ type: "ocr_screenshot", fullPage: true });
+const ocr = await ocrScreenshot({ fullPage: true });
 ```
 
 ### 3. Analyze — produce findings
@@ -67,11 +67,11 @@ for (const table of data.tables || []) {
   });
 
   // Data quality — flag sparse columns
-  const empty = table.columns.filter(c => c.emptyRate > 0.5);
+  const empty = table.columns.filter(c => c.fillRate < 0.5);
   if (empty.length) {
     smart.finding({
       claim: `${empty.length} columns in "${table.selector}" are >50% empty`,
-      evidence: empty.map(c => `${c.name}: ${Math.round(c.emptyRate * 100)}% empty`),
+      evidence: empty.map(c => `${c.name}: ${Math.round((1 - c.fillRate) * 100)}% empty`),
       sourceUrl: page.capture.url, confidence: "medium",
       method: "extractData", dimension: "data-quality"
     });

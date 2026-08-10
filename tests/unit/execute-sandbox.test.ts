@@ -73,10 +73,10 @@ describe("Execute Sandbox — Parameter Accessibility", () => {
     expect(JSON.parse(result.content[0].text)).toBe("slept");
   });
 
-  it("T4: TIMEOUTS.connect_tab is 30000", async () => {
+  it("T4: TIMEOUTS.connect_tab covers a full background-tab takeover", async () => {
     const result = await execute.handler({ code: "return TIMEOUTS.connect_tab" });
     expect(result.isError).toBe(false);
-    expect(JSON.parse(result.content[0].text)).toBe(30000);
+    expect(JSON.parse(result.content[0].text)).toBe(60000);
   });
 
   it("T5: smart has 7 core keys", async () => {
@@ -277,7 +277,7 @@ describe("Execute Sandbox — Escape Resistance", () => {
     // The hardening must not break legitimate TIMEOUTS access (cf. T4).
     const val = await execute.handler({ code: "return TIMEOUTS.connect_tab" });
     expect(val.isError).toBe(false);
-    expect(JSON.parse(val.content[0].text)).toBe(30000);
+    expect(JSON.parse(val.content[0].text)).toBe(60000);
   });
 });
 

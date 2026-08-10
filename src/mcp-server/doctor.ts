@@ -74,6 +74,10 @@ interface BridgeHealth {
   uptime?: number;
   queueDepth?: number;
   version?: string;
+  /** What the extension reported about its own optional permissions when it identified. */
+  extensionPermissions?: { granted: boolean; permissions: Record<string, boolean>; missing: string[] };
+  /** Chrome profiles seen this run, and which holds the bridge. Absent on older servers. */
+  profiles?: { connected: string | null; preferred: string | null; seen: Array<{ profileId: string; connected: boolean }> };
 }
 
 /**
@@ -94,6 +98,8 @@ async function fetchBridgeHealth(bridge: LiveBridge, fetchFn: typeof fetch): Pro
       uptime: typeof body.uptime === "number" ? body.uptime : undefined,
       queueDepth: typeof body.queueDepth === "number" ? body.queueDepth : undefined,
       version: typeof body.version === "string" ? body.version : undefined,
+      extensionPermissions: body.extensionPermissions as BridgeHealth["extensionPermissions"],
+      profiles: body.profiles as BridgeHealth["profiles"],
     };
   } catch {
     return null;
@@ -148,6 +154,109 @@ async function checkBridges(deps: Required<Pick<DoctorDeps, "bridgesDir" | "fetc
     detail: "no bridge server running",
     evidence,
     fix: "Normal when no MCP client session is active — bridge servers start with the client. Open Claude Code/Cursor with crawlio-browser configured, or run `npx crawlio-browser init --portal` for an always-on server.",
+  };
+}
+
+/**
+ * Does the connected extension actually hold its optional permissions?
+ *
+ * A partial grant is the failure this exists to catch: `tabs` present so browsing works and
+ * everything looks fine, `nativeMessaging` absent so the extension can never receive the
+ * trusted bridge token and stays trust-on-first-use — meaning a rogue local server can win the
+ * bridge election and drive CDP. Every other check passed in exactly that state, so the doctor
+ * reported "healthy" while the rogue-server defense was switched off.
+ */
+async function checkExtensionPermissions(
+  deps: Required<Pick<DoctorDeps, "bridgesDir" | "fetchFn">> & DoctorDeps,
+): Promise<DoctorCheck> {
+  const live = listLiveBridges(deps.bridgesDir, deps.isPidAlive ?? defaultIsPidAlive, deps.readDir, deps.readFile);
+  const healths: BridgeHealth[] = [];
+  for (const b of live) {
+    const h = await fetchBridgeHealth(b, deps.fetchFn);
+    if (h) healths.push(h);
+  }
+  const connected = healths.find((h) => h.connected);
+  const reported = connected?.extensionPermissions;
+  const evidence: Record<string, unknown> = { reported: reported ?? null };
+
+  if (!connected) {
+    return {
+      id: "extension.permissions", status: "off",
+      detail: "no extension connected — nothing to report",
+      evidence,
+    };
+  }
+  if (!reported) {
+    return {
+      id: "extension.permissions", status: "warn",
+      detail: "extension connected but did not report its permissions",
+      evidence,
+      fix: "The extension predates permission reporting. Reload it at chrome://extensions to get an accurate answer.",
+    };
+  }
+  if (reported.granted) {
+    const held = Object.keys(reported.permissions).filter((p) => reported.permissions[p]);
+    return {
+      id: "extension.permissions", status: "ok",
+      detail: `all optional permissions granted (${held.join(", ")})`,
+      evidence,
+    };
+  }
+  const missing = reported.missing.join(", ");
+  const securityRelevant = reported.missing.includes("nativeMessaging");
+  return {
+    id: "extension.permissions", status: "warn",
+    detail: securityRelevant
+      ? `missing ${missing} — the extension cannot verify which local server it talks to`
+      : `missing ${missing}`,
+    evidence,
+    fix: "Open Crawlio's dedicated onboarding page, review and grant all requested browser access, then rerun doctor.",
+  };
+}
+
+/**
+ * Which Chrome profile is being driven.
+ *
+ * Worth a check of its own because the failure it catches is silent: with the extension enabled
+ * in two profiles, commands land in whichever one won the bridge, and the only symptom is that
+ * the page the operator is looking at never changes.
+ */
+async function checkProfiles(
+  deps: Required<Pick<DoctorDeps, "bridgesDir" | "fetchFn">> & DoctorDeps,
+): Promise<DoctorCheck> {
+  const live = listLiveBridges(deps.bridgesDir, deps.isPidAlive ?? defaultIsPidAlive, deps.readDir, deps.readFile);
+  const healths: BridgeHealth[] = [];
+  for (const b of live) {
+    const h = await fetchBridgeHealth(b, deps.fetchFn);
+    if (h) healths.push(h);
+  }
+  const connected = healths.find((h) => h.connected);
+  const profiles = connected?.profiles;
+  const evidence: Record<string, unknown> = { profiles: profiles ?? null };
+
+  if (!connected) {
+    return { id: "extension.profile", status: "off", detail: "no extension connected — no profile to report", evidence };
+  }
+  if (!profiles?.connected) {
+    return {
+      id: "extension.profile", status: "warn",
+      detail: "extension connected but did not identify its Chrome profile",
+      evidence,
+      fix: "The extension predates profile identity. Reload it at chrome://extensions.",
+    };
+  }
+
+  const others = profiles.seen.filter((p) => p.profileId !== profiles.connected);
+  const detail = others.length
+    ? `driving profile ${profiles.connected}; ${others.length} other profile(s) seen`
+    : `driving profile ${profiles.connected}`;
+  return {
+    id: "extension.profile", status: "ok",
+    detail: profiles.preferred ? `${detail} (pinned)` : detail,
+    evidence,
+    ...(others.length && !profiles.preferred
+      ? { fix: "More than one profile has connected. Use switch_profile to pin the one you mean." }
+      : {}),
   };
 }
 
@@ -293,6 +402,8 @@ export async function collectDoctorReport(deps: DoctorDeps = {}): Promise<Doctor
   };
   const checks = [
     await checkBridges(filled),
+    await checkExtensionPermissions(filled),
+    await checkProfiles(filled),
     await checkPortal(filled),
     checkNativeHost(filled),
     checkClientConfigs(filled),

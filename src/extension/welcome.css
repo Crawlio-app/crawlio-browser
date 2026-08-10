@@ -259,6 +259,23 @@ body {
   margin-bottom: 16px;
 }
 
+/* Permission breakdown in the authorize modal. Each Chrome prompt gets a line, so the user
+   reads what they are about to be asked before Chrome asks it. */
+.modal-list {
+  text-align: left;
+  margin: 0 0 16px;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-200);
+}
+
+.modal-list li { margin-bottom: 8px; }
+
+.modal-list li:last-child { margin-bottom: 0; }
+
+.modal-list b { color: var(--text-100); font-weight: 600; }
+
 .modal-detail {
   display: flex;
   align-items: flex-start;
@@ -280,6 +297,14 @@ body {
   font-size: 13px;
   color: var(--text-200);
   line-height: 1.5;
+}
+
+.permission-status {
+  min-height: 18px;
+  margin: -12px 0 12px;
+  color: #b91c1c;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .modal .btn + .btn {

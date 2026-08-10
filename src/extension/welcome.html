@@ -31,7 +31,7 @@
       </div>
 
       <div class="divider"></div>
-      <button id="connect-btn" class="btn btn-primary">Grant Access</button>
+      <button id="connect-btn" class="btn btn-primary">Review &amp; Grant Access</button>
     </div>
   </div>
 
@@ -42,11 +42,13 @@
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
       </div>
       <h2>Authorize browser access</h2>
-      <p>Crawlio needs access to your open tabs so your AI can analyze pages, capture screenshots, and automate tasks on your behalf.</p>
+      <p>Chrome will ask once for every optional capability declared by this Crawlio build:</p>
+      <ul id="permission-list" class="modal-list"></ul>
       <div class="modal-detail">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <span>Your data stays local. Crawlio never sends browsing data to external servers.</span>
       </div>
+      <p id="permission-status" class="permission-status" role="alert"></p>
       <button id="authorize-btn" class="btn btn-primary">Authorize</button>
       <button id="cancel-btn" class="btn btn-ghost">Cancel</button>
     </div>

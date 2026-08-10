@@ -17,21 +17,18 @@
         <span id="status-label" class="status-label"></span>
       </div>
 
-      <!-- Setup card: visible only when pending permissions exist -->
-      <div id="setup-card" class="setup-card" style="display:none">
-        <div class="setup-title">Finish setup</div>
-        <div class="setup-desc">Your AI needs these to control the browser:</div>
-        <ul id="setup-perms" class="setup-perms"></ul>
-        <button id="enable-btn" class="btn btn-enable">Enable Crawlio</button>
+      <div class="access-row">
+        <span class="access-title">Browser access</span>
+        <span id="access-status" class="access-status">Checking…</span>
       </div>
 
       <div id="waiting-card" class="waiting-card" style="display:none">
         <span class="waiting-dot"></span>
-        <span class="waiting-text">Waiting for MCP server...</span>
+        <span class="waiting-text">Waiting for an MCP server…</span>
       </div>
       <button id="reconnect-btn" class="reconnect-link" style="display:none">Reconnect</button>
-      <button id="disconnect-btn" class="btn btn-disconnect" style="display:none">Disconnect</button>
-      <button id="setup-btn" class="setup-link" style="display:none">Complete setup</button>
+      <button id="disconnect-btn" class="btn btn-disconnect" style="display:none">Disconnect MCP</button>
+      <button id="setup-btn" class="setup-link" style="display:none">Complete onboarding</button>
     </div>
   </div>
 

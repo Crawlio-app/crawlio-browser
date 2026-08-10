@@ -11,7 +11,6 @@ import {
   pruneClosedTab,
   loadSessionGroups,
   NO_GROUP,
-  SESSION_GROUP_DELIVERABLE_TITLE,
   type SessionGroup,
 } from "@/extension/session-groups";
 
@@ -19,16 +18,12 @@ function group(sessionId: string, tabs: SessionGroup["tabs"], groupId = 100): Se
   return { sessionId, groupId, title: "Crawlio", tabs };
 }
 
-// Minimal stateful chrome mock for the tabGroups + storage surface the module touches.
-function installChrome(opts: { hasTabGroups?: boolean } = {}) {
+// Minimal stateful Chrome mock for the storage + tab-close surface the logical registry touches.
+function installChrome() {
   const store: Record<string, unknown> = {};
   const calls = {
-    group: [] as Array<Record<string, unknown>>,
-    ungroup: [] as unknown[],
     remove: [] as unknown[],
-    update: [] as Array<{ groupId: number; props: Record<string, unknown> }>,
   };
-  let nextGroupId = 100;
   const chrome = {
     storage: {
       session: {
@@ -36,19 +31,8 @@ function installChrome(opts: { hasTabGroups?: boolean } = {}) {
         set: async (obj: Record<string, unknown>) => { Object.assign(store, obj); },
       },
     },
-    permissions: {
-      contains: (_q: unknown, cb: (granted: boolean) => void) => cb(opts.hasTabGroups !== false),
-    },
     tabs: {
-      group: async (o: { tabIds: number | number[]; groupId?: number }) => {
-        calls.group.push(o);
-        return o.groupId ?? nextGroupId++;
-      },
-      ungroup: async (ids: number | number[]) => { calls.ungroup.push(ids); },
       remove: async (ids: number | number[]) => { calls.remove.push(ids); },
-    },
-    tabGroups: {
-      update: async (groupId: number, props: Record<string, unknown>) => { calls.update.push({ groupId, props }); },
     },
   };
   (globalThis as unknown as { chrome: unknown }).chrome = chrome;
@@ -99,32 +83,29 @@ describe("session-groups pure helpers", () => {
   });
 });
 
-describe("session-groups chrome operations", () => {
+describe("session-groups logical operations", () => {
   beforeEach(() => { installChrome(); });
 
-  it("addTabToSessionGroup creates a Chrome group, titles it, and persists membership", async () => {
-    const { calls } = installChrome();
+  it("addTabToSessionGroup persists logical membership without a tabGroups grant", async () => {
+    installChrome();
     const g = await addTabToSessionGroup("s1", 11, "agent", "Research");
-    expect(g.groupId).toBeGreaterThan(0);
+    expect(g.groupId).toBe(NO_GROUP);
     expect(g.tabs).toEqual([{ tabId: 11, origin: "agent" }]);
-    expect(calls.group).toHaveLength(1);
-    expect(calls.update[0]?.props).toEqual({ title: "Research" });
 
     const persisted = await loadSessionGroups();
     expect(persisted.s1.tabs).toEqual([{ tabId: 11, origin: "agent" }]);
 
-    // Adding a second tab reuses the existing groupId.
+    // Adding a second tab reuses the same logical record.
     const g2 = await addTabToSessionGroup("s1", 12, "agent", "Research");
-    expect(g2.groupId).toBe(g.groupId);
+    expect(g2.groupId).toBe(NO_GROUP);
     expect(g2.tabs.map(t => t.tabId).sort()).toEqual([11, 12]);
   });
 
-  it("degrades gracefully without the tabGroups permission", async () => {
-    const { calls } = installChrome({ hasTabGroups: false });
+  it("works when Chrome exposes no tab-group APIs", async () => {
+    installChrome();
     const g = await addTabToSessionGroup("s2", 21, "agent");
     expect(g.groupId).toBe(NO_GROUP);
-    expect(calls.group).toHaveLength(0); // never calls chrome.tabs.group when not permitted
-    expect(g.tabs).toEqual([{ tabId: 21, origin: "agent" }]); // membership still tracked
+    expect(g.tabs).toEqual([{ tabId: 21, origin: "agent" }]);
   });
 
   it("claimTabIntoSession rejects a tab owned by another session", async () => {
@@ -135,7 +116,7 @@ describe("session-groups chrome operations", () => {
     await expect(claimTabIntoSession("owner", 5)).resolves.toBeTruthy();
   });
 
-  it("finalizeSession closes agent tabs, moves deliverables, and clears the registry", async () => {
+  it("finalizeSession closes throwaway agent tabs and clears the registry", async () => {
     const { calls } = installChrome();
     await addTabToSessionGroup("s3", 1, "agent");
     await addTabToSessionGroup("s3", 2, "agent");
@@ -146,19 +127,18 @@ describe("session-groups chrome operations", () => {
       { tabId: 3, status: "handoff" },
     ]);
     expect(result).toEqual({ deliverable: [1], handoff: [3], closed: [2], released: [] });
-    expect(calls.remove).toContainEqual([2]);                       // throwaway agent tab closed
-    expect(calls.update.some(u => u.props.title === SESSION_GROUP_DELIVERABLE_TITLE)).toBe(true);
+    expect(calls.remove).toContainEqual([2]);
 
     const persisted = await loadSessionGroups();
     expect(persisted.s3).toBeUndefined();                            // session record removed
   });
 
-  it("renameSessionGroup updates the stored title and the Chrome group", async () => {
-    const { calls } = installChrome();
+  it("renameSessionGroup updates the stored logical title", async () => {
+    installChrome();
     await addTabToSessionGroup("s4", 1, "agent");
     const g = await renameSessionGroup("s4", "Final report");
     expect(g?.title).toBe("Final report");
-    expect(calls.update.some(u => u.props.title === "Final report")).toBe(true);
+    expect((await loadSessionGroups()).s4.title).toBe("Final report");
   });
 
   it("pruneClosedTab removes a closed tab from its session group", async () => {

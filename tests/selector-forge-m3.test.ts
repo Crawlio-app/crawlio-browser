@@ -160,17 +160,37 @@ describe("robot training capture stores verified selector + 5-rail bundle", () =
       };
 
       const bridge = createMockBridge([
-        { tabId: 101, url: "https://shop.example.com", title: "Shop", connected: true }, // create_tab
-        "started",                                                                        // start_network_capture
-        { sessionId: "rec_1" },                                                           // start_recording
-        { result: { ok: true, monitor: "robot-training" } },                              // browser_evaluate(monitor)
-        { result: stateLog },                                                             // browser_evaluate(state log)
-        recording,                                                                        // stop_recording
-        { body: "{}", base64Encoded: false },                                             // get_response_body
-        recording.pages[0].network,                                                       // stop_network_capture
-        [],                                                                               // get_console_logs
-        { cookies: [] },                                                                  // get_cookies
-        { result: { url: "https://shop.example.com", title: "Shop" } },                   // browser_evaluate(finalMeta)
+        {
+          resident: true,
+          bridgeRequiredForCollection: false,
+          runId: "rt_m3",
+          targetUrl: "https://shop.example.com",
+          outputDir,
+          tabId: 101,
+          recordingId: "rec_1",
+          startedAt: "2026-06-22T00:00:00Z",
+          status: "recording",
+          monitor: { installed: true, survivesNavigation: true },
+        },
+        {
+          resident: true,
+          bridgeRequiredForCollection: false,
+          run: {
+            runId: "rt_m3",
+            targetUrl: "https://shop.example.com",
+            outputDir,
+            tabId: 101,
+            recordingId: "rec_1",
+            startedAt: "2026-06-22T00:00:00Z",
+            stoppedAt: "2026-06-22T00:00:01Z",
+            status: "stopped",
+          },
+          recording,
+          network: recording.pages[0].network,
+          bodies: { "1": { body: "{}", base64Encoded: false } },
+          state: { cookies: [] },
+          stateLog,
+        },
       ]);
 
       const tools = createTools(bridge as never, createMockCrawlio());

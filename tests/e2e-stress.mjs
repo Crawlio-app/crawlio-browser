@@ -23,19 +23,52 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createServer } from "node:http";
 import { readFileSync, mkdtempSync, existsSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURE = join(ROOT, "tests/fixtures/stress/index.html");
 const BRIDGE_WAIT_MS = 60_000;
-const CASE_TIMEOUT_MS = 45_000;
+const CASE_TIMEOUT_MS = 60_000;
+const CRAWLIO_PORT_FILE = join(homedir(), "Library", "Logs", "Crawlio", "control.port");
+const CRAWLIO_TOKEN_FILE = join(homedir(), "Library", "Logs", "Crawlio", "mcp.token");
 
 const green = (s) => `\x1b[32m${s}\x1b[0m`;
 const red = (s) => `\x1b[31m${s}\x1b[0m`;
 const yellow = (s) => `\x1b[33m${s}\x1b[0m`;
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
+
+async function probeCrawlioSidecar() {
+  if (!existsSync(CRAWLIO_PORT_FILE) || !existsSync(CRAWLIO_TOKEN_FILE)) {
+    return { state: "unavailable", detail: "optional Crawlio app discovery files are absent" };
+  }
+
+  const port = Number.parseInt(readFileSync(CRAWLIO_PORT_FILE, "utf-8").trim(), 10);
+  const token = readFileSync(CRAWLIO_TOKEN_FILE, "utf-8").trim();
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !token) {
+    return { state: "error", detail: "optional Crawlio app discovery metadata is invalid" };
+  }
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+      headers: {
+        "X-Crawlio-MCP-Token": token,
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (response.ok) return { state: "ready", detail: `authenticated on port ${port}` };
+    if (response.status === 401 || response.status === 403) {
+      return { state: "error", detail: `optional Crawlio app rejected its MCP capability (HTTP ${response.status})` };
+    }
+    return { state: "error", detail: `optional Crawlio app readiness failed (HTTP ${response.status})` };
+  } catch {
+    // Discovery files can outlive a crashed or force-quit companion app. That is ordinary optional
+    // integration absence, not an authenticated enrichment failure in the browser candidate.
+    return { state: "unavailable", detail: `optional Crawlio app is not listening on port ${port}` };
+  }
+}
 
 // --- fixture server -------------------------------------------------------------------------
 
@@ -78,9 +111,9 @@ function unwrap(result) {
  * bridge, which is the one condition under which the election can pick it. Scoped to the run:
  * the editor respawns its server afterwards, and by then ours is the verified incumbent.
  */
-async function waitForBridge(transport, timeoutMs = BRIDGE_WAIT_MS, evictRivals = false) {
+async function waitForBridge(transport, timeoutMs = BRIDGE_WAIT_MS, nudge = null) {
   const started = Date.now();
-  const evicted = new Set();
+  const rivals = new Set();   // other servers seen holding the extension, for the contention note
   while (Date.now() - started < timeoutMs) {
     for (let port = 9333; port <= 9342; port++) {
       try {
@@ -88,18 +121,65 @@ async function waitForBridge(transport, timeoutMs = BRIDGE_WAIT_MS, evictRivals 
         if (!res.ok) continue;
         const health = await res.json();
         if (health.pid === transport.pid) {
-          if (health.connected) return { ok: true, ms: Date.now() - started, port, version: health.version, evicted: evicted.size };
+          if (health.connected) return { ok: true, ms: Date.now() - started, port, version: health.version, rivals: rivals.size };
           continue;
         }
-        if (evictRivals && health.connected && !evicted.has(health.pid)) {
-          evicted.add(health.pid);
-          try { process.kill(health.pid); } catch { /* already gone */ }
-        }
+        // Deliberately no kill here. The extension elects the bridge with the freshest
+        // lastActivityAt, and every tool dispatch publishes that stamp — so this server wins by
+        // being used. SIGKILL-ing the incumbent also killed the stdio server the developer's
+        // editor had spawned, dropping their MCP connection on every run.
+        if (health.connected) rivals.add(health.pid);
       } catch { /* port not listening */ }
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    // Make this server the most recently active one, which is what the extension elects on.
+    if (nudge) await nudge();
+    await new Promise((r) => setTimeout(r, 700));
   }
-  return { ok: false, ms: Date.now() - started, evicted: evicted.size };
+  return { ok: false, ms: Date.now() - started, rivals: rivals.size };
+}
+
+/**
+ * Refuse to grade a browser that is running a different build than the one on disk.
+ *
+ * Chrome does not hot-reload unpacked extensions, and stale copies of older releases sit around
+ * as loadable directories. When an old build answers, the suite reports a scatter of unrelated
+ * failures — clicks landing nowhere, tools rejecting long expressions — that read as regressions
+ * in code that is actually fine. Comparing the build stamp turns an hour of misdiagnosis into
+ * one line.
+ */
+async function assertCurrentBuild(getCapabilities) {
+  let onDisk = null;
+  try {
+    const bundle = readFileSync(join(ROOT, "dist/extension/background.js"), "utf-8");
+    onDisk = (/buildId:"([^"]+)"/.exec(bundle) ?? [])[1] ?? null;
+  } catch { /* not built — nothing to compare against */ }
+  if (!onDisk) return { ok: true, reason: "no local build to compare" };
+
+  // Must be asked the way the mode under test can ask. get_capabilities is a full-mode tool; in
+  // code mode it is reachable only through execute, so calling it directly threw, `loaded` stayed
+  // null, and the guard reported "a build too old to report its id" — aborting the entire code
+  // phase over a build that was current. The diagnosis was wrong, not the build.
+  let caps = {};
+  const deadline = Date.now() + 15_000;
+  let polling = true;
+  while (polling) {
+    try { caps = await getCapabilities(); } catch { /* old build may not answer */ }
+    polling = caps?.buildId !== onDisk && Date.now() < deadline;
+    if (!polling) break;
+    // A stale reload generation can win the first socket and then be superseded by the current
+    // worker. Re-stamping this server also keeps the authenticated bridge election pointed here.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+  }
+  const loaded = caps?.buildId ?? null;
+  if (loaded === onDisk) return { ok: true, loaded };
+  return {
+    ok: false,
+    loaded,
+    onDisk,
+    reason: loaded
+      ? `Chrome is running build ${loaded}, but dist/extension is ${onDisk}.`
+      : `Chrome is running a build too old to report its id (dist/extension is ${onDisk}).`,
+  };
 }
 
 /** Is the extension still reachable? Distinguishes "asleep" from "tool broken" on a timeout. */
@@ -154,10 +234,15 @@ function makeApi(client, mode) {
 
   async function cmd(type, args = {}) {
     if (mode === "full") return call(type, args);
+    // connect_tab is one of code mode's seven first-class tools. Sending it through execute
+    // instead tests the sandbox's arbitrary 25s bridge deadline, not the documented MCP path
+    // (whose connection workflow includes tab load + CDP domain setup).
+    if (type === "connect_tab") return call(type, args);
     const viaSmart = SMART_PATH[type];
     if (viaSmart) return call("execute", { code: `return await ${viaSmart(args)};` });
     const payload = JSON.stringify({ type, ...args });
-    return call("execute", { code: `return await bridge.send(${payload}, 25000);` });
+    const commandTimeout = type === "browser_navigate" ? 40000 : 25000;
+    return call("execute", { code: `return await bridge.send(${payload}, ${commandTimeout});` });
   }
 
   return {
@@ -258,9 +343,9 @@ function buildMatrix(fixtureUrl, artifactDir) {
       },
     },
     {
-      // The headline divergence: the same command reached two ways behaves differently, and the
-      // one `search` documents for code mode is the one that misses.
-      group: "input", name: "raw bridge.send click vs smart.click (divergence probe)", codeOnly: true,
+      // Regression probe: raw bridge access and the recommended smart wrapper must both apply the
+      // effect; smart additionally owns actionability polling and settling.
+      group: "input", name: "raw bridge.send and smart.click both work", codeOnly: true,
       async run(api) {
         await api.cmd("browser_navigate", { url: fixtureUrl });
         const raw = await api.exec(
@@ -457,6 +542,17 @@ function buildMatrix(fixtureUrl, artifactDir) {
       },
     },
     {
+      group: "integration", name: "authenticated optional Crawlio enrichment is accepted",
+      fullOnly: true, requiresCrawlioSidecar: true,
+      async run(api) {
+        const result = await api.call("enrich_url", { url: fixtureUrl, waitMs: 0 });
+        return {
+          ok: result?.enrichmentSent === true,
+          detail: `enrichmentSent=${String(result?.enrichmentSent)}`,
+        };
+      },
+    },
+    {
       group: "capture", name: "get_accessibility_tree returns nodes",
       async run(api) {
         const r = await api.cmd("get_accessibility_tree", {});
@@ -510,7 +606,7 @@ function buildMatrix(fixtureUrl, artifactDir) {
     {
       // Server-composed with no smart.* binding and no bridge command, so code mode cannot
       // reach it at all — the same shape as seo_audit, but undeclared in CODE_MODE_HINTS.
-      group: "robot-training", name: "start / status / stop / artifacts round-trip", fullOnly: true,
+      group: "robot-training", name: "start / status / stop / artifacts / clear round-trip", fullOnly: true,
       async run(api) {
         // Opens its OWN tab; active:false keeps focus, outputDir keeps artifacts out of the repo.
         const started = await api.cmd("robot_training_start", {
@@ -526,15 +622,25 @@ function buildMatrix(fixtureUrl, artifactDir) {
         const status = await api.cmd("robot_training_status", { runId });
         const stopped = await api.cmd("robot_training_stop", { runId, closeTab: true });
         const artifacts = await api.cmd("robot_training_artifacts", { outputDir: outDir });
+        const cleared = await api.cmd("robot_training_clear", { runId, confirm: true });
+        const afterClear = await api.cmd("robot_training_status", { runId });
         // Trust the disk over the response shape: the bundle is what actually matters, and an
         // empty `files` array must not be mistaken for "nothing was written".
         const listed = Array.isArray(artifacts?.files) ? artifacts.files.length : 0;
         const onDisk = existsSync(outDir) ? readdirSync(outDir).length : 0;
         const wrote = Math.max(listed, onDisk);
-        const failed = [started, status, stopped, artifacts].some((r) => /"error"|Invalid input/i.test(JSON.stringify(r)));
+        // A tool that actually fails throws out of unwrap(), so this only has to catch the soft
+        // shapes returned as data. Scanning the whole JSON for "error" caught a nested,
+        // BY-DESIGN-tolerated one instead: robot_training_start reports domainState, and an
+        // optional domain that declines to enable records {"success":false,"error":...} inside an
+        // otherwise successful response. That read as a failed round-trip when the bundle was fine.
+        const softFailure = (r) =>
+          typeof r?.error === "string" ||
+          (typeof r?._raw === "string" && /Invalid input|\[problem:/i.test(r._raw));
+        const failed = [started, status, stopped, artifacts, cleared, afterClear].some(softFailure);
         return {
-          ok: !failed && wrote > 0,
-          detail: `runId=${runId} artifacts=${wrote} files`,
+          ok: !failed && wrote > 0 && cleared?.cleared === runId && (afterClear?.runs?.length ?? 0) === 0,
+          detail: `runId=${runId} artifacts=${wrote} files retained=${afterClear?.runs?.length ?? "?"}`,
         };
       },
     },
@@ -543,10 +649,22 @@ function buildMatrix(fixtureUrl, artifactDir) {
     {
       group: "tabs", name: "list_tabs includes the fixture tab",
       async run(api) {
-        const r = await api.cmd("list_tabs", {});
-        const tabs = r?.tabs ?? r ?? [];
-        const hit = JSON.stringify(tabs).includes("127.0.0.1");
-        return { ok: Array.isArray(tabs) ? tabs.length > 0 && hit : hit, detail: `tabs=${(tabs.length ?? "?")}` };
+        try {
+          const r = await api.cmd("list_tabs", {});
+          const tabs = r?.tabs ?? r ?? [];
+          const hit = JSON.stringify(tabs).includes("127.0.0.1");
+          return { ok: Array.isArray(tabs) ? tabs.length > 0 && hit : hit, detail: `tabs=${(tabs.length ?? "?")}` };
+        } catch (error) {
+          // `tabs` is intentionally optional. On the permission-floor profile, the correct E2E
+          // behavior is a structured refusal while owned background tabs remain fully usable.
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            ok: /permission|tabs/i.test(message),
+            detail: /permission|tabs/i.test(message)
+              ? "optional tabs permission absent — structured refusal confirmed"
+              : message.slice(0, 100),
+          };
+        }
       },
     },
     {
@@ -562,7 +680,7 @@ function buildMatrix(fixtureUrl, artifactDir) {
     {
       group: "emulation", name: "set_viewport changes innerWidth",
       async run(api) {
-        await api.cmd("set_viewport", { width: 820, height: 640, deviceScaleFactor: 1, isMobile: false });
+        await api.cmd("set_viewport", { width: 820, height: 640, deviceScaleFactor: 1, mobile: false });
         const r = await api.evaluate("String(window.innerWidth)");
         const w = Number(r?.result ?? r?._raw ?? 0);
         return { ok: w === 820, detail: `innerWidth=${w}` };
@@ -604,7 +722,7 @@ function buildMatrix(fixtureUrl, artifactDir) {
 
 // --- run ------------------------------------------------------------------------------------
 
-async function runMode(mode, fixtureUrl, artifactDir, findings, takeover) {
+async function runMode(mode, fixtureUrl, artifactDir, findings, takeover, crawlioSidecar) {
   const header = `${mode === "full" ? "FULL MODE (--full)" : "CODE MODE (default)"}`;
   console.log(`\n${"=".repeat(72)}\n${header}\n${"=".repeat(72)}`);
 
@@ -612,12 +730,12 @@ async function runMode(mode, fixtureUrl, artifactDir, findings, takeover) {
   // sticky to the current active port, and otherwise takes the LOWEST port
   // (bridge-discipline.ts electActiveBridge). So freeing 9333 and binding it before the editor
   // respawns is what decides this — any pause here hands 9333 straight back.
+  // No port is freed by force. Port order only breaks a TIE in electActiveBridge; the primary
+  // signal is recency, which waitForBridge supplies by calling a tool. Killing whoever held 9333
+  // was how this suite kept disconnecting the developer's own editor.
   if (takeover) {
     const held = await findIncumbent(null);
-    if (held) {
-      try { process.kill(held.pid); } catch { /* already gone */ }
-      console.log(`  ${dim(`freed port ${held.port} from pid ${held.pid}; claiming it now`)}`);
-    }
+    if (held) console.log(`  ${dim(`pid ${held.pid} holds port ${held.port}; winning the election by activity instead of freeing it`)}`);
   }
 
   const transport = new StdioClientTransport({
@@ -628,13 +746,17 @@ async function runMode(mode, fixtureUrl, artifactDir, findings, takeover) {
   });
   const client = new Client({ name: `e2e-stress-${mode}`, version: "1.0.0" });
   await client.connect(transport);
+  const api = makeApi(client, mode);
 
   // Case #0: how long until a freshly spawned server can actually be used.
-  const bridge = await waitForBridge(transport, BRIDGE_WAIT_MS, takeover);
+  // Any tool call publishes the activity stamp the election reads. In code mode
+  // get_capabilities is not exposed directly, so nudge through execute just like a real client.
+  const nudge = () => api.cmd("get_capabilities").catch(() => {});
+  const bridge = await waitForBridge(transport, BRIDGE_WAIT_MS, nudge);
   if (bridge.ok) {
-    const contended = (bridge.evicted ?? 0) > 0;
+    const contended = (bridge.rivals ?? 0) > 0;
     console.log(`  ${green("PASS")} cold start — extension reached this server in ${dim(`${(bridge.ms / 1000).toFixed(1)}s`)}` +
-      ` (port ${bridge.port}, v${bridge.version}${contended ? `, after evicting ${bridge.evicted} rival server(s)` : ""})`);
+      ` (port ${bridge.port}, v${bridge.version}${contended ? `, after winning the election from ${bridge.rivals} live server(s)` : ""})`);
     // Only report this as a product finding when nothing was competing. With rivals present the
     // elapsed time measures this harness winning an election, not how long a user would wait.
     if (bridge.ms > 5000 && !contended) {
@@ -645,20 +767,46 @@ async function runMode(mode, fixtureUrl, artifactDir, findings, takeover) {
     findings.push(`[${mode}] the extension never connected to a freshly spawned server within ${BRIDGE_WAIT_MS / 1000}s`);
   }
 
+  const buildCheck = await assertCurrentBuild(() => api.cmd("get_capabilities"));
+  if (!buildCheck.ok) {
+    console.log(`  ${red("STOP")} ${buildCheck.reason}`);
+    console.log(`  ${dim("Load unpacked from " + join(ROOT, "dist/extension") + " at chrome://extensions, then re-run.")}`);
+    findings.push(`[${mode}] aborted: stale extension build loaded — ${buildCheck.reason}`);
+    try { await client.close(); } catch { /* already gone */ }
+    return { mode, results: [], coldStartMs: bridge.ms, connected: bridge.ok, aborted: true };
+  }
+  console.log(`  ${green("PASS")} extension build matches dist ${dim(buildCheck.loaded ?? "")}`);
+
   const tools = await client.listTools();
   const available = new Set(tools.tools.map((t) => t.name));
   console.log(`  ${dim(`tools/list reports ${available.size}`)}`);
 
-  const api = makeApi(client, mode);
-  let priorTab = null;
+  if (mode === "code") {
+    const capabilityReport = await api.cmd("get_capabilities");
+    const reportedTools = new Map((capabilityReport?.tools ?? []).map((tool) => [tool.name, tool.status]));
+    const capabilityTruth = reportedTools.get("list_tabs") === "available"
+      && reportedTools.get("get_user_tabs") === "available"
+      && !reportedTools.has("get_user_history")
+      && !reportedTools.has("get_downloads");
+    const optionalPermissionTruth = JSON.stringify(capabilityReport?.permissions?.granted) === JSON.stringify(["tabs", "nativeMessaging"])
+      && (capabilityReport?.permissions?.missing?.length ?? 0) === 0
+      && (capabilityReport?.permissions?.originsMissing?.length ?? 0) === 0;
+    console.log(`  ${capabilityTruth && optionalPermissionTruth ? green("PASS") : red("FAIL")} live capability report matches completed onboarding and excludes removed commands`);
+    if (!capabilityTruth || !optionalPermissionTruth) {
+      findings.push(`[${mode}] capability report disagrees with completed onboarding or advertises removed history/download commands`);
+    }
+  }
+
+  let fixtureTabId = null;
   const results = [];
 
   try {
-    // Remember where the user was, then work in a tab of our own.
-    const before = await api.cmd("get_connection_status", {});
-    priorTab = before?.connectedTab?.url ?? null;
-
-    await api.cmd("connect_tab", { url: fixtureUrl });
+    // The harness owns a background tab. Keeping the connection explicitly backgrounded makes
+    // CDP input use focus emulation and guarantees synthetic keyboard/mouse events never compete
+    // with the user's foreground Chrome tab.
+    const connected = await api.cmd("connect_tab", { url: fixtureUrl, background: true });
+    fixtureTabId = connected?.tabId ?? null;
+    if (!fixtureTabId) throw new Error("connect_tab did not return the owned fixture tab id");
     // connect_tab reuses a tab already on this URL without reloading it, so the readouts would
     // still hold counts from the previous mode's run. Navigate explicitly for a clean slate.
     await api.cmd("browser_navigate", { url: fixtureUrl });
@@ -677,6 +825,19 @@ async function runMode(mode, fixtureUrl, artifactDir, findings, takeover) {
         results.push({ ...c, status: "skip", detail: "code-mode only — compares execute() paths, which full mode does not expose" });
         console.log(`  ${yellow("SKIP")} ${c.name} ${dim("— code-mode only")}`);
         continue;
+      }
+      if (c.requiresCrawlioSidecar) {
+        if (crawlioSidecar.state === "unavailable") {
+          results.push({ ...c, status: "skip", detail: crawlioSidecar.detail });
+          console.log(`  ${yellow("SKIP")} ${c.name} ${dim(`— ${crawlioSidecar.detail}`)}`);
+          continue;
+        }
+        if (crawlioSidecar.state !== "ready") {
+          results.push({ ...c, status: "fail", detail: crawlioSidecar.detail });
+          console.log(`  ${red("FAIL")} ${c.name} ${dim(crawlioSidecar.detail)}`);
+          findings.push(`[${mode}] ${c.group}/${c.name}: ${crawlioSidecar.detail}`);
+          continue;
+        }
       }
       const t0 = Date.now();
       try {
@@ -699,12 +860,11 @@ async function runMode(mode, fixtureUrl, artifactDir, findings, takeover) {
       }
     }
   } finally {
-    // Put the browser back the way we found it.
-    try {
-      if (priorTab && !priorTab.startsWith("http://127.0.0.1")) {
-        await api.cmd("connect_tab", { url: priorTab });
-      }
-    } catch { /* best effort */ }
+    // Close only the background tab created by this harness. Never activate, navigate, or
+    // reconnect the user's foreground tab during teardown.
+    if (fixtureTabId) {
+      try { await api.cmd("close_tab", { tabId: fixtureTabId }); } catch { /* best effort */ }
+    }
     try { await client.close(); } catch { /* already gone */ }
   }
 
@@ -742,19 +902,29 @@ async function main() {
     console.log(`taking over from pid ${incumbent.pid} on port ${incumbent.port} (v${incumbent.version})`);
   }
   const takeover = Boolean(incumbent);
+  const crawlioSidecar = await probeCrawlioSidecar();
 
   const { server, url } = await serveFixture();
   const artifactDir = mkdtempSync(join(tmpdir(), "crawlio-stress-"));
   console.log(`fixture: ${url}\nartifacts: ${artifactDir}`);
+  console.log(`Crawlio sidecar: ${crawlioSidecar.state} (${crawlioSidecar.detail})`);
+
+  const requestedMode = ["code", "full"].find((mode) => process.argv.includes(`--mode=${mode}`)) ?? null;
 
   const findings = [];
   const runs = [];
   try {
-    runs.push(await runMode("code", url, artifactDir, findings, takeover));
-    // The extension needs a moment to notice the first server's socket close and re-elect;
-    // claiming the port again while it is mid-flap produces connect/disconnect churn.
-    await new Promise((r) => setTimeout(r, 6000));
-    runs.push(await runMode("full", url, artifactDir, findings, takeover));
+    if (requestedMode !== "full") {
+      runs.push(await runMode("code", url, artifactDir, findings, takeover, crawlioSidecar));
+    }
+    if (requestedMode === null) {
+      // The extension needs a moment to notice the first server's socket close and re-elect;
+      // claiming the port again while it is mid-flap produces connect/disconnect churn.
+      await new Promise((r) => setTimeout(r, 6000));
+    }
+    if (requestedMode !== "code") {
+      runs.push(await runMode("full", url, artifactDir, findings, takeover, crawlioSidecar));
+    }
   } finally {
     server.close();
   }

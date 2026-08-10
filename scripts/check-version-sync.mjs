@@ -30,6 +30,26 @@ function readJSONVersion(relPath) {
   }
 }
 
+function readPackageLockVersion(relPath) {
+  const full = join(ROOT, relPath);
+  if (!existsSync(full)) return { path: relPath, version: null, missing: true };
+  try {
+    const lock = JSON.parse(readFileSync(full, "utf8"));
+    const topLevel = lock.version ?? null;
+    const rootPackage = lock.packages?.[""]?.version ?? null;
+    if (topLevel !== rootPackage) {
+      return {
+        path: relPath,
+        version: null,
+        unreadable: `top-level version ${topLevel ?? "missing"} disagrees with packages[""].version ${rootPackage ?? "missing"}`,
+      };
+    }
+    return { path: relPath, version: topLevel };
+  } catch (error) {
+    return { path: relPath, version: null, unreadable: error.message };
+  }
+}
+
 function readConstantsVersion(relPath) {
   const full = join(ROOT, relPath);
   if (!existsSync(full)) return { path: relPath, version: null, missing: true };
@@ -40,11 +60,19 @@ function readConstantsVersion(relPath) {
 export function collectVersions() {
   return [
     readJSONVersion("package.json"),
+    // npm uses both fields when materializing the package tree. This lockfile sat at 1.8.0 while
+    // package.json reached 1.10.0 because it was outside the release gate.
+    readPackageLockVersion("package-lock.json"),
     readConstantsVersion("src/shared/constants.ts"),
     readJSONVersion("src/extension/manifest.prod.json"),
     readJSONVersion("src/extension/manifest.dev.json"),
     readJSONVersion("server.json"),
     readJSONVersion("dist/extension/manifest.json"),
+    // Both plugin manifests. The legacy .claude-plugin/ one sat at 2.0.0 against a 1.10.0 package
+    // for exactly as long as nothing checked it — it is the same failure this script exists for,
+    // one file over.
+    readJSONVersion("plugin.json"),
+    readJSONVersion(".claude-plugin/plugin.json"),
   ];
 }
 

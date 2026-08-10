@@ -26,7 +26,7 @@ framework, performance, security, seo, accessibility, error-surface, third-party
 ### 1. Connect
 
 ```
-connect_tab({ url: "https://site-a.com" })
+connect_tab({ url: "https://site-a.com", background: true })
 ```
 
 `comparePages` handles navigation to both sites internally.
@@ -39,7 +39,7 @@ const comparison = await smart.comparePages(
   "https://site-b.com"
 );
 // comparison.siteA / siteB — full PageEvidence (capture, performance, security, etc.)
-// comparison.scaffold.dimensions[] — 11 objects: { name, comparable, siteA.status, siteB.status }
+// comparison.scaffold.dimensions[] — 11 objects: { name, comparable, siteA.type/value, siteB.type/value }
 // comparison.scaffold.sharedFields / missingFields
 // comparison.siteA.gaps[] / siteB.gaps[] — what failed per site
 ```
@@ -53,7 +53,7 @@ for (const dim of comparison.scaffold.dimensions) {
   if (!dim.comparable) {
     smart.finding({
       claim: `${dim.name}: not comparable — data missing`,
-      evidence: [`siteA: ${dim.siteA.status}`, `siteB: ${dim.siteB.status}`],
+      evidence: [`siteA: ${dim.siteA.type}`, `siteB: ${dim.siteB.type}`],
       sourceUrl: comparison.siteA.capture?.url || "unknown",
       confidence: "low", method: "comparePages", dimension: dim.name
     });
@@ -61,7 +61,10 @@ for (const dim of comparison.scaffold.dimensions) {
   }
   smart.finding({
     claim: `${dim.name}: both sites present — ready for comparison`,
-    evidence: [`siteA: ${dim.siteA.status}`, `siteB: ${dim.siteB.status}`],
+    evidence: [
+      `siteA (${dim.siteA.type}): ${JSON.stringify(dim.siteA.value)}`,
+      `siteB (${dim.siteB.type}): ${JSON.stringify(dim.siteB.value)}`
+    ],
     sourceUrl: comparison.siteA.capture?.url || "unknown",
     confidence: "high", method: "comparePages", dimension: dim.name
   });

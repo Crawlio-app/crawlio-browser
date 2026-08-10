@@ -59,7 +59,7 @@ export const DECLARED_EGRESS: readonly EgressEntry[] = Object.freeze([
     host: "127.0.0.1 (Crawlio.app control server)",
     klass: "local",
     purpose: "enrichment + crawled-URL queries against the local app",
-    carries: "nothing leaves the machine",
+    carries: "captured data plus Crawlio.app's local-user MCP capability; nothing leaves the machine",
     control: "n/a — loopback",
   },
   {
@@ -85,6 +85,7 @@ export const DECLARED_EGRESS: readonly EgressEntry[] = Object.freeze([
 export const DECLARED_EXTENSION_SURFACE = Object.freeze({
   permissions: Object.freeze(["alarms", "debugger", "storage"]),
   host_permissions: Object.freeze([] as string[]),
+  optional_permissions: Object.freeze(["tabs", "nativeMessaging"]),
   optional_host_permissions: Object.freeze(["http://127.0.0.1/*"]),
 });
 
@@ -178,6 +179,7 @@ export function renderEgressAudit(r: EgressAuditReport): string {
       r.extension.host_permissions.length ? r.extension.host_permissions.join(", ") : green("none")
     }`,
   );
+  out.push(`    optional permissions   ${r.extension.optional_permissions.join(", ") || "none"}`);
   out.push(`    optional host access   ${r.extension.optional_host_permissions.join(", ") || "none"}`);
   out.push("");
   out.push(dim("    No <all_urls> and no standing host permissions: the extension cannot read a"));

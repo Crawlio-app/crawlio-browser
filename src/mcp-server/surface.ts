@@ -31,8 +31,16 @@ export interface SurfaceDescription {
   full: ToolSummary[];
   /** Tools a client sees by default (code mode). */
   code: ToolSummary[];
-  /** What `search` indexes: every full-mode tool plus the Crawlio HTTP endpoints. */
-  catalog: { total: number; browser: number; crawlioHttp: number };
+  /**
+   * What `search` indexes: every full-mode tool plus the Crawlio HTTP endpoints.
+   *
+   * `names` carries the whole set, not just the size, because prose has to be checked against it.
+   * A skill that tells the model to call something is only correct if that something is in here,
+   * and the Crawlio HTTP commands (reached through `crawlio.api()` rather than `bridge.send()`)
+   * are just as callable as the browser tools — a checker that knew only the MCP tool list would
+   * flag every one of them.
+   */
+  catalog: { total: number; browser: number; crawlioHttp: number; names: string[] };
   /**
    * The `smart` object at its maximum extent — every namespace present at once, which no
    * single real page produces. Reported as "up to N" for that reason.
@@ -92,6 +100,7 @@ export async function describeSurface(): Promise<SurfaceDescription> {
       total: catalog.length,
       browser: full.length,
       crawlioHttp: catalog.length - full.length,
+      names: catalog.map((c) => c.name).sort(),
     },
     smart: {
       core: Object.keys(smart).filter((k) => SMART_CORE_KEYS.has(k)).sort(),

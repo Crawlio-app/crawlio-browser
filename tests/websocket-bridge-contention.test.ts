@@ -1,8 +1,15 @@
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer, type Server } from "node:http";
 import WebSocket from "ws";
+
+// Relocate the port range BEFORE constants.ts is evaluated. A plain top-level assignment
+// does not work here: ES imports are hoisted, so WS_PORT is already read by the time it
+// runs — which is how these "isolated" suites ended up binding the production range.
+vi.hoisted(() => { process.env.CRAWLIO_WS_PORT = "19333"; });
+
 
 // BRIDGE_DIR is derived from homedir() at module load, so redirect HOME onto a
 // temp directory BEFORE importing the bridge. Without this the suite writes
@@ -11,7 +18,6 @@ const fakeHome = mkdtempSync(join(tmpdir(), "crawlio-bridge-test-"));
 process.env.HOME = fakeHome;
 // Bind away from the production range (9333-9342): a live crawlio-browser on
 // this machine would otherwise race these bridges for slots (EADDRINUSE flake).
-process.env.CRAWLIO_WS_PORT = "19333";
 
 const { WebSocketBridge } = await import("../src/mcp-server/websocket-bridge.js");
 
@@ -112,5 +118,35 @@ describe("WebSocketBridge client contention", () => {
     const only = await connect(bridge.port);
     expect(await closeCodeWithin(only, 500)).toBeNull();
     expect(only.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("degrades cleanly when the complete ten-port range is occupied", async () => {
+    const blockers: Server[] = [];
+    const listen = (server: Server, port: number) => new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
+    });
+
+    try {
+      for (let port = 19333; port <= 19342; port++) {
+        const blocker = createServer((_request, response) => {
+          response.writeHead(200, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ service: "foreign-test-server" }));
+        });
+        await listen(blocker, port);
+        blockers.push(blocker);
+      }
+
+      const bridge = new WebSocketBridge();
+      await expect(bridge.start()).resolves.toBeUndefined();
+      bridges.push(bridge);
+      expect(bridge.isConnected).toBe(false);
+      expect(blockers.every((server) => server.listening)).toBe(true);
+    } finally {
+      await Promise.all(blockers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+    }
   });
 });

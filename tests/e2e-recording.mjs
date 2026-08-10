@@ -8,7 +8,13 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const FIXTURE = join(ROOT, "tests/fixtures/stress/index.html");
 const BRIDGE_WAIT_MS = 45_000;
 const BRIDGE_POLL_MS = 2_000;
 
@@ -18,6 +24,8 @@ let step = 0;
 let passed = 0;
 let failed = 0;
 let bridgePort = null;
+let ownedTabId = null;
+let fixtureServer = null;
 
 // --- Helpers ---
 
@@ -27,6 +35,20 @@ function log(icon, msg) {
 
 function assert(condition, label) {
   if (!condition) throw new Error(`Assertion failed: ${label}`);
+}
+
+function serveFixture() {
+  const html = readFileSync(FIXTURE, "utf-8");
+  return new Promise((resolve) => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      response.end(html);
+    });
+    server.listen(0, "127.0.0.1", () => {
+      fixtureServer = server;
+      resolve(`http://127.0.0.1:${server.address().port}/`);
+    });
+  });
 }
 
 async function runStep(name, fn) {
@@ -49,7 +71,9 @@ async function callTool(name, args = {}) {
     const errText = result.content?.map(c => c.text).join("\n") || "Unknown error";
     throw new Error(errText);
   }
-  const text = result.content?.find(c => c.type === "text")?.text;
+  const text = (result.content?.find(c => c.type === "text")?.text ?? "")
+    .replace(/---\s*(?:END_)?CRAWLIO_PAGE_CONTENT[\s\S]*?---/g, "")
+    .trim();
   if (!text) return {};
   try { return JSON.parse(text); } catch { return { _raw: text }; }
 }
@@ -57,6 +81,17 @@ async function callTool(name, args = {}) {
 /** Call the execute tool with code that runs in the smart.* sandbox */
 async function execute(code) {
   return callTool("execute", { code });
+}
+
+async function cleanupOwnedTab() {
+  if (!ownedTabId || !client) return;
+  const tabId = ownedTabId;
+  ownedTabId = null;
+  // Code mode does not expose close_tab as a top-level MCP tool. Teardown must cross the same
+  // execute -> bridge path as the test commands or it silently leaves the background tab open.
+  try {
+    await execute(`return await bridge.send({ type: "close_tab", tabId: ${JSON.stringify(tabId)} }, 5000);`);
+  } catch { /* best effort */ }
 }
 
 /** Wait for the MCP server's bridge to have an extension connection */
@@ -68,13 +103,16 @@ async function waitForBridge() {
         const res = await fetch(`http://127.0.0.1:${port}/health`);
         if (res.ok) {
           const health = await res.json();
-          if (health.connected && health.pid === transport.serverProcess?.pid) {
+          if (health.connected && health.pid === transport.pid) {
             bridgePort = port;
             return true;
           }
         }
       } catch { /* port not listening */ }
     }
+    // Stamp this fresh server as active so the extension elects it without killing or stopping
+    // the user's always-on MCP process.
+    await client.callTool({ name: "get_capabilities", arguments: {} }).catch(() => {});
     log("  ", `Waiting for extension to connect to bridge... (${Math.round((Date.now() - start) / 1000)}s)`);
     await new Promise(r => setTimeout(r, BRIDGE_POLL_MS));
   }
@@ -85,12 +123,15 @@ async function waitForBridge() {
 
 async function main() {
   console.log("=== E2E Recording Pipeline Test (MCP stdio) ===\n");
+  const fixtureUrl = await serveFixture();
+  console.log(`fixture: ${fixtureUrl}\n`);
 
   // 1. Spawn MCP server via stdio
   console.log("Spawning MCP server (stdio mode)...");
   transport = new StdioClientTransport({
     command: "node",
     args: ["dist/mcp-server/index.js"],
+    cwd: ROOT,
     env: { ...process.env },
   });
 
@@ -109,11 +150,13 @@ async function main() {
 
   // --- Test Steps ---
 
-  // Step 1: Connect to test page
-  await runStep("Connect to example.com", async () => {
-    const result = await callTool("connect_tab", { url: "https://example.com" });
+  // Step 1: Connect to an agent-owned background page so recording and synthetic input never
+  // compete with the user's foreground Chrome tab.
+  await runStep("Connect to the local fixture in the background", async () => {
+    const result = await callTool("connect_tab", { url: fixtureUrl, background: true });
     log("  ", `result: ${JSON.stringify(result).slice(0, 200)}`);
     assert(result.tabId || result.connected, "tab connected");
+    ownedTabId = result.tabId ?? null;
   });
 
   // Step 2: Start recording
@@ -130,7 +173,7 @@ async function main() {
 
   // Step 3: Check recording status (initial)
   await runStep("Recording status (initial)", async () => {
-    const status = await callTool("get_recording_status");
+    const status = await execute(`return await bridge.send({ type: "get_recording_status" }, 5000);`);
     log("  ", `active=${status.active}, pages=${status.pageCount}, interactions=${status.interactionCount}`);
     assert(status.active === true, "still active");
     assert(status.sessionId === sessionId, "sessionId matches");
@@ -138,25 +181,26 @@ async function main() {
     assert(status.interactionCount === 0, "0 interactions initially");
   });
 
-  // Step 4: Navigate to httpbin form
-  await runStep("Navigate to httpbin.org/forms/post", async () => {
+  // Step 4: Navigate to a second local page. Every fixture path returns the same deterministic
+  // form, so recording behavior never depends on an external site's availability or markup.
+  await runStep("Navigate to a second local fixture page", async () => {
     await execute(`
-      await smart.navigate("https://httpbin.org/forms/post");
-      await sleep(2000);
+      await smart.navigate(${JSON.stringify(fixtureUrl + "recording-second")});
+      await sleep(500);
     `);
   });
 
   // Step 5: Type into form field
-  await runStep("Type into custname field", async () => {
+  await runStep("Type into the fixture name field", async () => {
     await execute(`
-      await smart.type('input[name="custname"]', "Crawlio Test User");
+      await smart.type("#name-input", "Crawlio Test User");
     `);
   });
 
   // Step 6: Click a checkbox
-  await runStep("Click cheese topping", async () => {
+  await runStep("Click the fixture checkbox", async () => {
     await execute(`
-      await smart.click('input[name="topping"][value="cheese"]');
+      await smart.click("#agree-check");
     `);
   });
 
@@ -171,7 +215,7 @@ async function main() {
 
   // Step 8: Check recording status (mid-recording)
   await runStep("Recording status (mid-recording)", async () => {
-    const status = await callTool("get_recording_status");
+    const status = await execute(`return await bridge.send({ type: "get_recording_status" }, 5000);`);
     log("  ", `active=${status.active}, pages=${status.pageCount}, interactions=${status.interactionCount}`);
     assert(status.active === true, "still active");
     assert(status.interactionCount >= 3, `interactions >= 3 (got ${status.interactionCount})`);
@@ -263,12 +307,16 @@ async function main() {
   console.log("\n=== Results ===");
   console.log(`  Total: ${step}  Passed: \x1b[32m${passed}\x1b[0m  Failed: \x1b[31m${failed}\x1b[0m`);
 
+  await cleanupOwnedTab();
   await client.close();
+  fixtureServer?.close();
   process.exit(failed > 0 ? 1 : 0);
 }
 
 main().catch(async (e) => {
   console.error(`\x1b[31mFATAL: ${e.message}\x1b[0m`);
+  await cleanupOwnedTab();
   try { await client?.close(); } catch { /* already exiting on a fatal error */ }
+  fixtureServer?.close();
   process.exit(1);
 });

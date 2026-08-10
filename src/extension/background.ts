@@ -1,10 +1,46 @@
 /// <reference path="../env.d.ts" />
 // Background service worker — WebSocket client + command dispatcher
 import { EnrichmentAccumulator } from "./enrichment-store";
-import type { CookieEntry, FrameworkDetection } from "../shared/types";
+import type { CookieEntry, FrameworkDetection, NetworkEntry, RecordingSession } from "../shared/types";
 import { DEVICE_PROFILES } from "../shared/device-profiles";
+import {
+  declaredOptionalPermissions,
+  declaredRequiredPermissions,
+  isComplete,
+  missingPermissions,
+} from "../shared/permissions";
 import { buildEvalParams as buildEvalParamsPure } from "../shared/frame-context";
-import { putCapture, putNetworkEntries, putConsoleLogs, getConsoleLogs, clearAll } from "./capture-store";
+import {
+  applyCapabilityPermissions,
+  type BrowserCapabilityStatus,
+} from "./capability-permissions";
+import {
+  clearAll,
+  clearLiveCaptureStreams,
+  deleteMonitorJob,
+  deleteResidentTraining,
+  getConsoleLogs,
+  getNetworkEntries,
+  getMonitorJob,
+  getResidentTraining,
+  listMonitorJobs,
+  listMonitorSnapshots,
+  listResidentTraining,
+  pruneResidentStorage,
+  putCapture,
+  putConsoleLogs,
+  putMonitorJob,
+  putMonitorSnapshot,
+  putNetworkEntries,
+  putResidentTraining,
+  RESIDENT_MONITOR_JOB_LIMIT,
+  type ResidentMonitorJob,
+  type ResidentMonitorSnapshot,
+  type ResidentTrainingRecord,
+} from "./capture-store";
+import {
+  migrateLegacyResidentObservationState,
+} from "./resident-observation-migration";
 import { resetIcon, setDynamicIcon, clearBadge, setTooltip } from "./icon-generator";
 
 import { setupContextMenus, handleContextMenuClick } from "./context-menus";
@@ -26,9 +62,30 @@ import {
 import { installAgentCursorInPage } from "./injected/agent-cursor";
 import { BridgeRetryGate, SingletonConnection, closeFailedHandshake, safeWebSocketSend, planBridgeConnections, type BridgeProbe } from "./bridge-discipline";
 import { DOMAIN_ENABLE_PARAMS, mergeDomainState, type DomainEnableResult } from "./domain-state";
-import { randomNonce, verifyHandshakeProof, evaluateServerTrust, HANDSHAKE_MESSAGE_TYPES } from "../shared/bridge-handshake";
+import {
+  canRerouteBridgeResponse,
+  randomNonce,
+  verifyHandshakeProof,
+  evaluateServerTrust,
+  HANDSHAKE_MESSAGE_TYPES,
+} from "../shared/bridge-handshake";
 import { MAX_EVAL_EXPRESSION_LENGTH, isProblemCode, type ProblemCode } from "../shared/protocol";
 import { planIdleRelease, resolveIdleReleaseMs, MIN_IDLE_RELEASE_MS, DEFAULT_IDLE_RELEASE_MS } from "./idle-release";
+import { createTabRuntimeRegistry, type TabRuntimeState } from "../shared/tab-runtime-state";
+import { getOrCreateProfileId } from "../shared/profile-identity";
+import { isNewerWorkerGeneration, parseWorkerGeneration, type WorkerGeneration } from "../shared/worker-generation";
+import { diffSnapshots } from "../shared/snapshot-diff";
+import {
+  buildResidentTrainingMonitorScript,
+  RESIDENT_TRAINING_BINDING,
+  UNINSTALL_RESIDENT_TRAINING_MONITOR_SCRIPT,
+} from "./injected/resident-training-monitor";
+import {
+  sanitizeNetworkEntry,
+  sanitizeTextPayload,
+  sanitizeUrlValue,
+  sanitizeValue,
+} from "./resident-sanitizer";
 
 if (__DEV__) console.log("[Crawlio] v3 — browser capture via MCP loaded");
 
@@ -71,6 +128,10 @@ const SESSION_CONSOLE_CAP = 1000;
 // Native Messaging transport.
 const NATIVE_HOST = "com.crawlio.agent";
 const NATIVE_PING_TIMEOUT = 10000; // 10s
+const WS_CLOSE_NEWER_GENERATION_RETRY = 4010;
+const WORKER_GENERATION_KEY = "crawlio:workerGeneration";
+const currentWorkerGeneration: WorkerGeneration = { id: crypto.randomUUID(), startedAt: Date.now() };
+let workerSuperseded = false;
 const nativeConnection = new SingletonConnection<chrome.runtime.Port>((port) => {
   try { port.disconnect(); } catch { /* already disconnected */ }
 }, wireNativePort);
@@ -127,7 +188,7 @@ function stopKeepalive() {
 }
 
 function shouldStayAlive(): boolean {
-  return debuggerAttachedTabId !== null || getActiveAgentSessionCount() > 0 || accumulator.count() > 0 || networkCapturing || wsBridges.size > 0 || nativeConnection.current !== null;
+  return !workerSuperseded && (debuggerAttachedTabId !== null || getActiveAgentSessionCount() > 0 || accumulator.count() > 0 || capturingTabId !== null || wsBridges.size > 0 || nativeConnection.current !== null);
 }
 
 // New-bridge fast discovery (see NEW_BRIDGE_SCAN_INTERVAL). Lives on the keepalive
@@ -158,7 +219,7 @@ async function persistState() {
   await accumulator.ensureQuota();
   const domainState = debuggerAttachedTabId !== null ? tabDomainState.get(debuggerAttachedTabId) ?? null : null;
   // Persist recording state (minus non-serializable fields: timeoutHandle, networkSnapshotKeys Set)
-  const recordingState = activeRecording ? {
+  const recordingState = activeRecording ? sanitizeValue({
     sessionId: activeRecording.sessionId,
     startedAt: activeRecording.startedAt,
     _startedAtMs: activeRecording._startedAtMs,
@@ -172,13 +233,13 @@ async function persistState() {
     totalInteractions: activeRecording.totalInteractions,
     networkSnapshotKeys: Array.from(activeRecording.networkSnapshotKeys),
     consoleSnapshotIndex: activeRecording.consoleSnapshotIndex,
-  } : null;
+  }) : null;
   try {
     await chrome.storage.session.set({
       "crawlio:sw-state": {
         debuggerAttachedTabId,
         accumulatorData: accumulator.getAll(),
-        networkCapturing,
+        networkCapturing: capturingTabId !== null,
         domainState,
         wasEverConnected,
         recordingState,
@@ -196,7 +257,12 @@ async function persistState() {
 async function restoreState() {
   const data = await chrome.storage.session.get("crawlio:sw-state");
   const state = data["crawlio:sw-state"];
-  if (!state || Date.now() - state.timestamp > STATE_STALENESS_MS) return;
+  if (!state) return;
+  // chrome.storage.session is cleared by a browser restart, so an old record can only be from a
+  // service-worker sleep in this browser session. Keep the historical staleness guard for idle
+  // connection metadata, but never discard a live recording solely because the worker slept for
+  // more than a minute — resident training explicitly promises to survive that lifecycle.
+  if (Date.now() - state.timestamp > STATE_STALENESS_MS && !state.recordingState) return;
 
   // Restore wasEverConnected so SW restart retries indefinitely
   if (state.wasEverConnected) wasEverConnected = true;
@@ -210,15 +276,43 @@ async function restoreState() {
   if (state.debuggerAttachedTabId !== null) {
     try {
       const tab = await chrome.tabs.get(state.debuggerAttachedTabId);
-      if (tab?.url?.startsWith("http") && !tab.discarded) {
-        // Tab still exists — attempt re-attach + re-enable domains
-        await ensureDebugger(state.debuggerAttachedTabId, true);
+      const connected = (await chrome.storage.session.get("crawlio:connectedTab"))["crawlio:connectedTab"];
+      const knownUrl = tab?.url ?? connected?.url;
+      if (knownUrl?.startsWith("http") && !tab.discarded) {
+        // Tab still exists — rehydrate the capture journal before enabling Network so events
+        // arriving after this point append to, rather than replace, the pre-restart history.
+        if (state.networkCapturing) {
+          try {
+            const [storedNetwork, storedConsole] = await Promise.all([
+              getNetworkEntries(),
+              getConsoleLogs(),
+            ]);
+            networkEntries.clear();
+            for (const entry of storedNetwork) {
+              if (typeof entry.requestId === "string") {
+                networkEntries.set(entry.requestId, entry as NetworkMapEntry);
+              }
+            }
+            networkCaptureSeq = Math.max(
+              0,
+              ...Array.from(networkEntries.values(), (entry) => (entry._seq ?? -1) + 1),
+            );
+            consoleLogs = storedConsole;
+            consoleWriteIndex = consoleLogs.length;
+          } catch (error) {
+            console.warn("[Crawlio] Could not rehydrate live capture journal:", error);
+          }
+          await startNetworkCapture(state.debuggerAttachedTabId, { preserveBuffers: true, makePrimary: true });
+        } else {
+          await ensureDebugger(state.debuggerAttachedTabId, true);
+        }
         // Restore connectedTab state so MCP tools work
         await chrome.storage.session.set({ "crawlio:connectedTab": {
-          tabId: tab.id!, url: tab.url || "", title: tab.title || "Untitled",
+          ...connected,
+          tabId: tab.id!, url: knownUrl, title: tab.title || connected?.title || "Untitled",
           favIconUrl: tab.favIconUrl, windowId: tab.windowId,
         }});
-        writeStatus({ capturing: false, activeTabId: tab.id! });
+        writeStatus({ capturing: state.networkCapturing === true, activeTabId: tab.id! });
         if (__DEV__) console.log(`[Crawlio] SW recovery: re-attached to tab ${state.debuggerAttachedTabId}`);
       } else {
         // Tab is not HTTP — clear stale state
@@ -285,8 +379,10 @@ function startPersistTimer() {
   persistTimer = setInterval(() => { persistState().catch(() => {}); }, PERSIST_INTERVAL);
 }
 
-// Restore state on SW startup (before any other async work)
-restoreState().catch(() => {});
+// Restore state on SW startup (before any other async work). Resident observation waits on this
+// promise so it can distinguish a recoverable service-worker restart from a browser restart that
+// cleared session storage.
+const swStateRestore = restoreState().catch(() => {});
 
 // --- Message Port Lifecycle ---
 const activePorts = new Map<number, chrome.runtime.Port>(); // tabId → port
@@ -567,7 +663,50 @@ const intentionalClose = new WeakSet<WebSocket>();
 const connectingPorts = new Set<number>(); // ports with pending WebSocket handshake
 // Per-port server-identity handshake state. `verified` flips true only when
 // the server proves it holds the real bridge token under our trusted token.
-const bridgeTrust = new Map<number, { nonce: string; verified: boolean }>();
+// `waiters` holds commands that arrived before the verdict did — see awaitHandshakeVerdict().
+const bridgeTrust = new Map<number, { nonce: string; verified: boolean; waiters?: Array<() => void> }>();
+
+/**
+ * Most commands a rogue server could pile up while we decide about it. Generous next to real
+ * traffic (a drained queue is a handful of commands) and small enough that a flood can't grow
+ * the heap.
+ */
+const MAX_HANDSHAKE_WAITERS = 64;
+
+/**
+ * Park a command until this port's handshake verdict lands, capped by the handshake window.
+ *
+ * A command can arrive before `verified` is set for two reasons, and refusing it in either case
+ * looked identical to the caller: nothing came back, and it waited out its whole timeout for a
+ * command we had silently dropped. The proof is verified through an `await`, so the handler
+ * yields and the very next frame is processed while the verdict is still in flight; and a server
+ * that releases its queue before answering the challenge puts a command on the wire ahead of the
+ * proof outright. Both windows are milliseconds, and on the far side of them the command is
+ * perfectly legitimate — so wait rather than discard.
+ */
+function awaitHandshakeVerdict(port: number): Promise<void> {
+  const trust = bridgeTrust.get(port);
+  if (!trust) return Promise.resolve(); // nothing pending — the caller re-evaluates and refuses
+  const waiters = trust.waiters ?? (trust.waiters = []);
+  if (waiters.length >= MAX_HANDSHAKE_WAITERS) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const settle = () => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+    // Bound the wait by the same window that governs the handshake, so a server that answers
+    // nothing costs a command this much and no more.
+    const timer = setTimeout(settle, WS_HANDSHAKE_TIMEOUT);
+    waiters.push(settle);
+  });
+}
+
+/** Wake everything parked on `port` — the verdict arrived, or the socket is gone. */
+function releaseHandshakeWaiters(port: number): void {
+  const trust = bridgeTrust.get(port);
+  if (!trust?.waiters) return;
+  const waiters = trust.waiters;
+  trust.waiters = [];
+  for (const wake of waiters) wake();
+}
 // Per-port identity-handshake deadline. When a trusted token is held, a socket that
 // does not prove its identity within WS_HANDSHAKE_TIMEOUT is dropped — so a silent
 // rogue candidate can't linger and an unverified "active" bridge can't hold the slot.
@@ -581,6 +720,39 @@ chrome.storage.local.get("crawlio:bridgeToken").then(d => {
   const t = (d as Record<string, unknown>)["crawlio:bridgeToken"];
   if (typeof t === "string" && t) trustedBridgeToken = t;
 }).catch(() => { /* storage unavailable — stay in TOFU mode */ });
+// This Chrome profile's id, sent with `connected` so the server can tell one profile's extension
+// from another's — chrome.runtime.id cannot, being identical across profiles.
+//
+// Resolved once at startup and cached, because the socket's open handler is synchronous. Reading
+// storage is fast enough that it normally wins the race with bridge discovery, but on a fresh
+// install it may not; identifyProfile() below closes that gap rather than leaving the profile
+// invisible to list_profiles for the rest of the session.
+let cachedProfileId: string | null = null;
+getOrCreateProfileId(
+  {
+    get: (key) => chrome.storage.local.get(key),
+    set: (items) => chrome.storage.local.set(items),
+  },
+  () => crypto.randomUUID(),
+).then((id) => {
+  cachedProfileId = id;
+  // Already connected? Then `connected` went out unidentified — say who we are now. The server
+  // records the profile on whichever message carries it, so a second one simply updates.
+  for (const socket of wsBridges.values()) identifyProfile(socket);
+}).catch(() => { /* storage unavailable — the server treats us as unidentified, as before */ });
+
+/** Tell the server which profile this is. No-op until the id resolves. */
+function identifyProfile(socket: WebSocket): void {
+  if (!cachedProfileId) return;
+  safeWebSocketSend(socket, JSON.stringify({
+    type: "connected",
+    extensionId: chrome.runtime.id,
+    profileId: cachedProfileId,
+    handshakeAck: true,
+    workerGeneration: currentWorkerGeneration,
+  }));
+}
+
 let reconnectDelay = RECONNECT_BASE;
 // Per-port reconnect backoff: a flapping server (accepts, then drops after open) must not
 // produce a fixed-interval connect/close loop. Doubles per consecutive close, resets on open.
@@ -673,11 +845,43 @@ function markPrimaryTab(tabId: number): void {
 function forgetAttachedTab(tabId: number): void {
   attachedTabs.delete(tabId);
   tabDomainState.delete(tabId);
+  clearTabRuntimeState(tabId);
   if (debuggerAttachedTabId === tabId) debuggerAttachedTabId = null;
 }
 
-// Track which frame is "active" for implicit targeting by other MCP tools
-let activeFrameId: string | null = null; // null = main frame
+// Per-tab frame/coverage/header state. Entries are created on demand and dropped by
+// clearTabRuntimeState() on detach or close, so this cannot grow without bound.
+// See ../shared/tab-runtime-state.ts for why it lives outside this file.
+const tabRuntimeStates = createTabRuntimeRegistry();
+
+/**
+ * Serializes input sequences per tab.
+ *
+ * A click is three CDP events with awaits between them, so two concurrent clicks on one tab
+ * interleave into press,press,release,release — which the page sees as a single click, while both
+ * commands report success. Now that an agent can drive several tabs at once it will also fire
+ * several actions at one tab, so losing one silently is not acceptable.
+ *
+ * Keyed by tab on purpose: a global lock would serialize input across tabs and undo the
+ * parallelism this exists alongside. Two tabs still act simultaneously; one tab acts in order.
+ */
+const tabInputLocks = new Map<number, Promise<unknown>>();
+
+function withTabInputLock<T>(tabId: number, fn: () => Promise<T>): Promise<T> {
+  const previous = tabInputLocks.get(tabId) ?? Promise.resolve();
+  // Run after the previous holder settles either way — one failed click must not wedge the tab.
+  const result = previous.then(fn, fn);
+  tabInputLocks.set(tabId, result.catch(() => {}));
+  return result;
+}
+
+const tabRuntime = (tabId: number): TabRuntimeState => tabRuntimeStates.get(tabId);
+const clearTabRuntimeState = (tabId: number): void => {
+  tabRuntimeStates.clear(tabId);
+  tabInputLocks.delete(tabId);
+};
+const anyFramePinned = (): boolean => tabRuntimeStates.anyFramePinned();
+const anyCoverageActive = (): boolean => tabRuntimeStates.anyCoverageActive();
 
 // Build Runtime.evaluate params with optional frame context injection
 function buildEvalParams(
@@ -685,19 +889,25 @@ function buildEvalParams(
   expression: string,
   opts?: { returnByValue?: boolean; awaitPromise?: boolean; useFrameContext?: boolean }
 ): Record<string, unknown> {
+  const activeFrameId = tabRuntime(tabId).activeFrameId;
   const ctxId = activeFrameId ? frameContexts.get(tabId)?.get(activeFrameId) : undefined;
   return buildEvalParamsPure(expression, activeFrameId, ctxId, opts);
 }
 
-// Network capture state
-let networkCapturing = false;
+/**
+ * The tab whose network traffic is being captured, or null.
+ *
+ * Capture stays one-tab-at-a-time: the entry, console, websocket and service-worker buffers it
+ * fills are shared, so a second concurrent capture would interleave two tabs' traffic into one
+ * indistinguishable stream. Partitioning those buffers is a larger change than this one, and a
+ * second capture now fails with an error naming the holder instead of silently clobbering it.
+ *
+ * Holding the *tab id* rather than a boolean is what makes even single-tab capture correct: the
+ * CDP event listener is global, so with a bare flag every attached tab's network events landed in
+ * the buffer. Now events are matched against the capturing tab and the rest are ignored.
+ */
+let capturingTabId: number | null = null;
 let networkCaptureSeq = 0;
-
-// CSS coverage tracking
-let cssCoverageActive = false;
-
-// JS code coverage tracking
-let jsCoverageActive = false;
 const networkEntries: Map<string, NetworkMapEntry> = new Map();
 
 // Per-tab ARIA snapshot ref cache (ref string → backendDOMNodeId)
@@ -731,7 +941,7 @@ interface AgentBrowserSession {
   id: string;
   tabId: number;
   windowId?: number;
-  groupId?: number; // Chrome tabGroups id when this session owns a tab-group fleet
+  groupId?: number; // Back-compat persisted field; logical fleets use NO_GROUP.
   url: string;
   title: string;
   name?: string;
@@ -881,6 +1091,48 @@ async function waitForAgentTabLoad(tabId: number, timeoutMs = 15000): Promise<vo
     const timeoutHandle = setTimeout(finish, timeoutMs);
     chrome.tabs.onUpdated.addListener(listener);
   });
+}
+
+/**
+ * Wait until a just-created explicit target has committed its requested HTTP(S) URL.
+ *
+ * chrome.tabs.create resolves before navigation commits. During that short window `tab.url` is
+ * commonly an empty string while `tab.pendingUrl` already contains the requested page. Treating
+ * the empty URL as a closed/non-debuggable target makes the public browser_wait_for tool fail at
+ * exactly the moment callers need it. This wait is intentionally used by wait_for_selector only:
+ * create_tab({ connect: false }) still returns promptly, while the explicit wait tool absorbs the
+ * creation race within its own caller-supplied timeout.
+ */
+async function waitForExplicitHttpTabCommit(tabId: number, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(timeoutMs, 100);
+
+  while (true) {
+    let tab: chrome.tabs.Tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      throw new Error(`Tab ${tabId} not found — it may have been closed. Use list_tabs to see open tabs.`);
+    }
+
+    if (tab.url?.startsWith("http")) return;
+
+    const pendingUrl = tab.pendingUrl;
+    const pendingHttpNavigation = pendingUrl?.startsWith("http") === true;
+    const currentUrl = tab.url ?? "";
+    if (!pendingHttpNavigation && currentUrl) {
+      throw new Error(`Tab ${tabId} is not an HTTP page (${currentUrl}) — CDP cannot attach to it.`);
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw Object.assign(
+        new Error(`Tab ${tabId} did not commit its HTTP page within ${Date.now() - startedAt}ms`),
+        { cdpError: CDPError.Timeout },
+      );
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+  }
 }
 
 async function refreshAgentSession(session: AgentBrowserSession): Promise<AgentBrowserSession> {
@@ -1316,7 +1568,6 @@ async function captureAgentSessionSnapshot(session: AgentBrowserSession, command
 }
 
 // fw-hardening: store main document response headers for header-based framework detection
-let mainDocResponseHeaders: Record<string, string> = {};
 let networkWriteTimer: ReturnType<typeof setTimeout> | null = null;
 
 // WebSocket monitoring
@@ -1452,6 +1703,16 @@ function autoStopRecording(reason: "max_duration" | "max_interactions" | "tab_cl
       lastAutoStoppedTimer = null;
     }, 5 * 60 * 1000);
     removeRecordingIndicator(session.metadata.tabId);
+    // A resident run must finalize itself; waiting for an MCP caller would recreate the exact
+    // bridge dependency resident collection removes. The completed bundle stays in IndexedDB for
+    // a later robot_training_stop/export call.
+    const residentRun = activeResidentTrainingRun;
+    if (residentRun && residentRun.tabId === session.metadata.tabId) {
+      void stopResidentTraining(
+        { runId: residentRun.runId, fetchBodies: true, closeTab: false },
+        session as RecordingSession,
+      ).catch((error) => console.warn("[Crawlio] Resident training auto-finalize failed:", error));
+    }
     if (__DEV__) console.log(`[Crawlio] Recording auto-stopped: ${reason}, session ${session.id}`);
   }
 }
@@ -1497,6 +1758,901 @@ function removeRecordingIndicator(tabId: number): void {
   } catch { /* tab may be gone */ }
 }
 
+// --- Extension-resident training and monitoring -----------------------------
+//
+// The MCP server is intentionally not authoritative for either lifecycle. It may disappear for
+// minutes, restart, or never reconnect: events and snapshots remain owned by this extension and
+// are retained in bounded IndexedDB stores. Server tools query/export this state when available.
+
+const RESIDENT_TRAINING_EVENT_LIMIT = 600;
+const RESIDENT_TRAINING_EVENT_BYTES = 32 * 1024;
+const RESIDENT_BODY_LIMIT = 100;
+const RESIDENT_MONITOR_ALARM_PREFIX = "crawlio-monitor:";
+const RESIDENT_MONITOR_SNAPSHOT_CHARS = 200_000;
+const RESIDENT_MONITOR_DIFF_CHARS = 200_000;
+const RESIDENT_PRIOR_CONNECTION_PREFIX = "crawlio:residentPriorConnection:";
+
+interface ResidentPriorConnection {
+  tabId: number;
+  url: string;
+  title?: string;
+  favIconUrl?: string;
+  windowId?: number;
+  background?: boolean;
+}
+
+let activeResidentTrainingRun: ResidentTrainingRecord | null = null;
+let residentTrainingWriteTimer: ReturnType<typeof setTimeout> | null = null;
+let residentTrainingFinalization: { runId: string; promise: Promise<Record<string, unknown>> } | null = null;
+let residentObservationRestorePromise: Promise<void> = Promise.resolve();
+const residentMonitorCaptures = new Set<string>();
+
+function newResidentId(prefix: "rt" | "mon"): string {
+  return `${prefix}_${Date.now().toString(36)}_${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+}
+
+function residentPriorConnectionKey(runId: string): string {
+  return `${RESIDENT_PRIOR_CONNECTION_PREFIX}${runId}`;
+}
+
+function parseResidentPriorConnection(value: unknown): ResidentPriorConnection | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.tabId !== "number" || !Number.isInteger(candidate.tabId) || candidate.tabId <= 0) return null;
+  if (typeof candidate.url !== "string" || !/^https?:\/\//i.test(candidate.url)) return null;
+  return {
+    tabId: candidate.tabId,
+    url: candidate.url,
+    title: typeof candidate.title === "string" ? candidate.title : undefined,
+    favIconUrl: typeof candidate.favIconUrl === "string" ? candidate.favIconUrl : undefined,
+    windowId: typeof candidate.windowId === "number" ? candidate.windowId : undefined,
+    background: candidate.background === true,
+  };
+}
+
+/**
+ * Resident training temporarily becomes the primary CDP target, but it must not destroy the tab
+ * the caller had pinned. Keep that transient pointer in session storage (not retained IndexedDB,
+ * where preserving an unrelated browsing URL would be an unnecessary privacy cost).
+ */
+async function rememberResidentPriorConnection(runId: string): Promise<void> {
+  const key = residentPriorConnectionKey(runId);
+  const data = await chrome.storage.session.get("crawlio:connectedTab");
+  const prior = parseResidentPriorConnection(data["crawlio:connectedTab"]);
+  if (prior) await chrome.storage.session.set({ [key]: prior });
+  else await chrome.storage.session.remove(key);
+}
+
+/** Restore the pin before closing the training tab so its onRemoved cleanup cannot clear it. */
+async function restoreResidentPriorConnection(runId: string): Promise<boolean> {
+  const key = residentPriorConnectionKey(runId);
+  const data = await chrome.storage.session.get(key);
+  const prior = parseResidentPriorConnection(data[key]);
+  try {
+    if (!prior) return false;
+    const tab = await chrome.tabs.get(prior.tabId);
+    const knownUrl = tab.url ?? prior.url;
+    if (!knownUrl.startsWith("http") || tab.discarded) return false;
+
+    await chrome.storage.session.set({ "crawlio:connectedTab": {
+      ...prior,
+      tabId: tab.id!,
+      url: knownUrl,
+      title: tab.title || prior.title || "Untitled",
+      favIconUrl: tab.favIconUrl ?? prior.favIconUrl,
+      windowId: tab.windowId,
+    }});
+    const capturing = await startNetworkCapture(tab.id!, { makePrimary: true });
+    if (!capturing) await ensureDebugger(tab.id!, true);
+    await persistState().catch(() => {});
+    writeStatus({ capturing, activeTabId: tab.id! });
+    setDynamicIcon("active", tab.id!);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await chrome.storage.session.remove(key).catch(() => {});
+  }
+}
+
+function residentTrainingView(run: ResidentTrainingRecord): Record<string, unknown> {
+  return {
+    runId: run.runId,
+    targetUrl: sanitizeUrlValue(run.targetUrl),
+    outputDir: run.outputDir,
+    tabId: run.tabId,
+    recordingId: run.recordingId,
+    startedAt: run.startedAt,
+    stoppedAt: run.stoppedAt,
+    updatedAt: run.updatedAt,
+    status: run.status,
+    stateEvents: run.stateLog.length,
+    captureStorageValues: run.captureStorageValues,
+    hasBundle: run.bundle !== undefined,
+    lastError: run.lastError,
+  };
+}
+
+function residentMonitorView(job: ResidentMonitorJob, includeSnapshot = false): Record<string, unknown> {
+  return {
+    ...job,
+    url: sanitizeUrlValue(job.url),
+    lastSnapshot: includeSnapshot ? job.lastSnapshot : undefined,
+  };
+}
+
+function persistResidentTrainingSoon(): void {
+  if (!activeResidentTrainingRun || residentTrainingWriteTimer) return;
+  residentTrainingWriteTimer = setTimeout(() => {
+    residentTrainingWriteTimer = null;
+    if (!activeResidentTrainingRun) return;
+    activeResidentTrainingRun.updatedAt = new Date().toISOString();
+    putResidentTraining(activeResidentTrainingRun)
+      .then(() => pruneResidentStorage())
+      .catch((error) => console.warn("[Crawlio] Resident training persist failed:", error));
+  }, 250);
+}
+
+async function handleResidentTrainingEvent(tabId: number, payload: unknown): Promise<void> {
+  // A binding event can be the event that wakes a suspended MV3 worker. Do not inspect the
+  // in-memory run pointer until persisted recording/resident state has finished rehydrating.
+  await residentObservationRestorePromise;
+  const run = activeResidentTrainingRun;
+  if (!run || run.status !== "recording" || run.tabId !== tabId || typeof payload !== "string") return;
+  if (payload.length > RESIDENT_TRAINING_EVENT_BYTES) return;
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const sanitized = sanitizeValue(parsed);
+    const previous = run.stateLog[run.stateLog.length - 1] as { id?: unknown } | undefined;
+    const previousId = typeof previous?.id === "number" && Number.isFinite(previous.id) ? previous.id : 0;
+    run.stateLog.push({
+      ...((sanitized && typeof sanitized === "object" ? sanitized : {}) as Record<string, unknown>),
+      // These fields are extension authority. A page may call the binding directly, but it cannot
+      // forge ordering or receipt time by putting the same keys in its JSON payload.
+      id: previousId + 1,
+      receivedAt: new Date().toISOString(),
+    });
+    if (run.stateLog.length > RESIDENT_TRAINING_EVENT_LIMIT) {
+      run.stateLog.splice(0, run.stateLog.length - RESIDENT_TRAINING_EVENT_LIMIT);
+    }
+    persistResidentTrainingSoon();
+  } catch {
+    // A page can call the binding itself; malformed/unbounded payloads are untrusted input.
+  }
+}
+
+async function installResidentTrainingMonitor(run: ResidentTrainingRecord): Promise<Record<string, unknown>> {
+  const source = buildResidentTrainingMonitorScript(run.captureStorageValues);
+  // Script registrations and Runtime bindings can outlive a document and, depending on Chrome's
+  // debugger lifecycle, the prior worker instance. Make restoration idempotent before installing
+  // the current registration.
+  if (run.scriptIdentifier) {
+    await sendCDPCommand(
+      { tabId: run.tabId },
+      "Page.removeScriptToEvaluateOnNewDocument",
+      { identifier: run.scriptIdentifier },
+      0,
+    ).catch(() => {});
+  }
+  await sendCDPCommand(
+    { tabId: run.tabId },
+    "Runtime.removeBinding",
+    { name: RESIDENT_TRAINING_BINDING },
+    0,
+  ).catch(() => {});
+  await sendCDPCommand({ tabId: run.tabId }, "Runtime.addBinding", { name: RESIDENT_TRAINING_BINDING }, 0);
+  const installed = await sendCDPCommand<{ identifier?: string }>(
+    { tabId: run.tabId },
+    "Page.addScriptToEvaluateOnNewDocument",
+    { source },
+    0,
+  );
+  if (installed.identifier) run.scriptIdentifier = installed.identifier;
+  const current = await sendCDPCommand<{ result?: { value?: unknown } }>(
+    { tabId: run.tabId },
+    "Runtime.evaluate",
+    { expression: source, returnByValue: true, awaitPromise: true },
+    0,
+  );
+  return {
+    installed: true,
+    survivesNavigation: true,
+    scriptIdentifier: run.scriptIdentifier,
+    currentDocument: current.result?.value ?? null,
+  };
+}
+
+async function removeResidentTrainingMonitor(run: ResidentTrainingRecord): Promise<void> {
+  if (run.scriptIdentifier) {
+    await sendCDPCommand(
+      { tabId: run.tabId },
+      "Page.removeScriptToEvaluateOnNewDocument",
+      { identifier: run.scriptIdentifier },
+      0,
+    ).catch(() => {});
+  }
+  await sendCDPCommand(
+    { tabId: run.tabId },
+    "Runtime.evaluate",
+    { expression: UNINSTALL_RESIDENT_TRAINING_MONITOR_SCRIPT, returnByValue: true },
+    0,
+  ).catch(() => {});
+  await sendCDPCommand(
+    { tabId: run.tabId },
+    "Runtime.removeBinding",
+    { name: RESIDENT_TRAINING_BINDING },
+    0,
+  ).catch(() => {});
+  run.scriptIdentifier = undefined;
+}
+
+async function waitForResidentTab(tabId: number, timeoutMs = 20_000): Promise<void> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "complete") return;
+  } catch {
+    throw new Error(`Tab ${tabId} closed before it loaded`);
+  }
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+    const listener = (updatedId: number, change: chrome.tabs.TabChangeInfo) => {
+      if (updatedId === tabId && change.status === "complete") finish();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    const timer = setTimeout(finish, timeoutMs);
+  });
+}
+
+/** Navigate an existing monitor-owned tab and prove a fresh load completed. */
+async function refreshResidentTab(tabId: number, url: string, timeoutMs = 20_000): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let navigationObserved = false;
+    let reloadFallback: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timeout);
+      if (reloadFallback) clearTimeout(reloadFallback);
+    };
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const listener = (updatedId: number, change: chrome.tabs.TabChangeInfo) => {
+      if (updatedId !== tabId) return;
+      if (change.status === "loading" || typeof change.url === "string") navigationObserved = true;
+      if (change.status === "complete" && navigationObserved) finish();
+    };
+    const timeout = setTimeout(
+      () => finish(new Error(`Monitor tab ${tabId} did not finish loading within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    chrome.tabs.onUpdated.addListener(listener);
+    void chrome.tabs.update(tabId, { url }).catch(finish);
+    // Some Chromium builds treat update({url: currentUrl}) as a no-op. An explicit reload is the
+    // permission-free fallback and guarantees that a periodic monitor samples a new document.
+    reloadFallback = setTimeout(() => {
+      if (!navigationObserved && !settled) void chrome.tabs.reload(tabId).catch(finish);
+    }, 750);
+  });
+}
+
+function validateResidentUrl(value: unknown): string {
+  if (typeof value !== "string" || !value) throw new Error("url is required");
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("url must use http or https");
+  }
+  return url.href;
+}
+
+function validateResidentRunId(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 100 || !/^[a-zA-Z0-9_.-]+$/.test(value)) {
+    throw new Error("runId must be 1-100 letters, numbers, dots, underscores, or hyphens");
+  }
+  return value;
+}
+
+async function startResidentTraining(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await residentObservationRestorePromise;
+  const targetUrl = validateResidentUrl(command.url);
+  const runId = command.runId === undefined ? newResidentId("rt") : validateResidentRunId(command.runId);
+  const existing = await getResidentTraining(runId);
+  if (existing?.status === "recording") {
+    activeResidentTrainingRun = existing;
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      ...residentTrainingView(existing),
+      alreadyActive: true,
+    };
+  }
+  if (activeResidentTrainingRun?.status === "recording") {
+    throw new Error(`Robot training run '${activeResidentTrainingRun.runId}' is already active`);
+  }
+  if (activeRecording) throw new Error("A recording is already active. Stop it before starting robot training.");
+
+  await rememberResidentPriorConnection(runId);
+  if (capturingTabId !== null) await stopNetworkCapture().catch(() => []);
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.create({ url: targetUrl, active: command.active !== false });
+    if (!tab.id) throw new Error("Chrome did not return a tab id for resident training");
+  } catch (error) {
+    await restoreResidentPriorConnection(runId).catch(() => false);
+    throw error;
+  }
+  let createdRun: ResidentTrainingRecord | null = null;
+
+  try {
+    await waitForResidentTab(tab.id);
+    await chrome.storage.session.set({
+      "crawlio:connectedTab": {
+        tabId: tab.id,
+        url: targetUrl,
+        title: tab.title || "Untitled",
+        windowId: tab.windowId,
+        background: command.active === false,
+      },
+    });
+    await startNetworkCapture(tab.id, { makePrimary: true });
+    const recordingResponse = await handleCommandWithRecording({
+      type: "start_recording",
+      id: `resident-start-${runId}`,
+      maxDurationSec: command.maxDurationSec,
+      maxInteractions: command.maxInteractions,
+    }) as { success?: boolean; data?: { sessionId?: string; startedAt?: string }; error?: string };
+    if (!recordingResponse.success || !recordingResponse.data?.sessionId) {
+      throw new Error(recordingResponse.error || "Extension recording did not start");
+    }
+
+    const startedAt = recordingResponse.data.startedAt ?? new Date().toISOString();
+    const run: ResidentTrainingRecord = {
+      runId,
+      targetUrl,
+      outputDir: typeof command.outputDir === "string" && command.outputDir ? command.outputDir : `runs/${runId}`,
+      tabId: tab.id,
+      recordingId: recordingResponse.data.sessionId,
+      startedAt,
+      updatedAt: startedAt,
+      status: "recording",
+      captureStorageValues: command.captureStorageValues === true,
+      stateLog: [],
+    };
+    createdRun = run;
+    activeResidentTrainingRun = run;
+    const monitor = command.injectMonitor === false ? { installed: false } : await installResidentTrainingMonitor(run);
+    await putResidentTraining(run);
+    await persistState();
+    await pruneResidentStorage();
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      ...residentTrainingView(run),
+      monitor,
+    };
+  } catch (error) {
+    if (createdRun) await removeResidentTrainingMonitor(createdRun).catch(() => {});
+    // handleCommandWithRecording mutates the module-level state; make that async side effect
+    // explicit because TypeScript otherwise narrows activeRecording to the pre-call null check.
+    const recordingAtFailure = activeRecording as ActiveRecording | null;
+    if (recordingAtFailure?.tabId === tab.id) {
+      stopRecordingInternal("tab_closed");
+      removeRecordingIndicator(tab.id);
+      teardownInteractionCapture(tab.id);
+    }
+    await stopNetworkCapture().catch(() => []);
+    if (createdRun) {
+      createdRun.status = "error";
+      createdRun.stoppedAt = new Date().toISOString();
+      createdRun.updatedAt = createdRun.stoppedAt;
+      createdRun.lastError = error instanceof Error ? error.message : String(error);
+      await putResidentTraining(createdRun).catch(() => {});
+    }
+    if (activeResidentTrainingRun?.runId === runId) activeResidentTrainingRun = null;
+    await restoreResidentPriorConnection(runId).catch(() => false);
+    await chrome.tabs.remove(tab.id).catch(() => {});
+    await pruneResidentStorage().catch(() => {});
+    throw error;
+  }
+}
+
+const RESIDENT_STATIC_RESOURCE_TYPES = new Set(["Stylesheet", "Image", "Font", "Media", "Script"]);
+const RESIDENT_TELEMETRY_URL = /cdn-cgi\/rum|cloudflareinsights|google-analytics|googletagmanager|doubleclick|facebook\.com\/tr/i;
+
+function residentNetworkEntries(): NetworkEntry[] {
+  return Array.from(networkEntries.values())
+    .filter((entry): entry is NetworkMapEntry & { requestId: string } => !!entry.url && !entry._startTime && !!entry.requestId)
+    .map(sanitizeNetworkEntry);
+}
+
+async function fetchResidentResponseBodies(entries: NetworkEntry[], tabId: number): Promise<Record<string, unknown>> {
+  const bodies: Record<string, unknown> = {};
+  let captured = 0;
+  for (const entry of entries) {
+    if (captured >= RESIDENT_BODY_LIMIT) break;
+    if (!entry.requestId || RESIDENT_STATIC_RESOURCE_TYPES.has(entry.resourceType) || RESIDENT_TELEMETRY_URL.test(entry.url)) continue;
+    try {
+      const result = await sendCDPCommand<{ body?: string; base64Encoded?: boolean }>(
+        { tabId },
+        "Network.getResponseBody",
+        { requestId: entry.requestId },
+        0,
+        10_000,
+      );
+      bodies[entry.requestId] = {
+        url: entry.url,
+        method: entry.method,
+        status: entry.status,
+        mimeType: entry.mimeType,
+        base64Encoded: result.base64Encoded === true,
+        body: sanitizeTextPayload(result.body ?? "", entry.mimeType),
+      };
+    } catch (error) {
+      bodies[entry.requestId] = {
+        url: entry.url,
+        method: entry.method,
+        status: entry.status,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    captured++;
+  }
+  return bodies;
+}
+
+function interruptedRecording(run: ResidentTrainingRecord, reason: RecordingSession["metadata"]["stopReason"]): RecordingSession {
+  const stoppedAt = new Date().toISOString();
+  return {
+    id: run.recordingId ?? run.runId,
+    startedAt: run.startedAt,
+    stoppedAt,
+    duration: Math.max(0, Math.round((Date.parse(stoppedAt) - Date.parse(run.startedAt)) / 1_000)),
+    pages: [],
+    metadata: { tabId: run.tabId, initialUrl: run.targetUrl, stopReason: reason },
+  };
+}
+
+async function residentFinalState(run: ResidentTrainingRecord): Promise<Record<string, unknown>> {
+  let finalMeta: unknown = null;
+  try {
+    const result = await sendCDPCommand<{ result?: { value?: unknown } }>(
+      { tabId: run.tabId },
+      "Runtime.evaluate",
+      {
+        expression: `(() => ({
+          url: location.href,
+          title: document.title,
+          ts: new Date().toISOString(),
+          cookieNames: document.cookie.split(';').map(v => v.split('=')[0].trim()).filter(Boolean),
+          localStorageKeys: Object.keys(localStorage),
+          sessionStorageKeys: Object.keys(sessionStorage)
+        }))()`,
+        returnByValue: true,
+      },
+      0,
+    );
+    finalMeta = sanitizeValue(result.result?.value ?? null);
+  } catch { /* the page may have closed */ }
+  // Resident artifacts keep cookie metadata for replay diagnostics, never cookie values. The
+  // generic cookie collector preserves non-auth preference values for interactive inspection,
+  // but writing those values into a durable training bundle would be an unnecessary privacy cost.
+  const cookies = (await captureCookies(run.tabId, run.targetUrl).catch(() => []))
+    .map((cookie) => ({ ...cookie, value: "[REDACTED]" }));
+  return {
+    consoleLogs: sanitizeValue(consoleLogs),
+    cookies,
+    finalMeta,
+    storageValuesCaptured: run.captureStorageValues,
+    cookieValuesCaptured: false,
+  };
+}
+
+async function stopResidentTrainingInternal(
+  command: Record<string, unknown>,
+  preStoppedRecording?: RecordingSession,
+): Promise<Record<string, unknown>> {
+  const runId = typeof command.runId === "string" ? command.runId : "";
+  if (!runId) throw new Error("runId is required");
+  const run = activeResidentTrainingRun?.runId === runId
+    ? activeResidentTrainingRun
+    : await getResidentTraining(runId);
+  if (!run) throw new Error(`robot training run '${runId}' not found`);
+  if (run.status !== "recording" && run.bundle) {
+    const restoredConnection = await restoreResidentPriorConnection(runId).catch(() => false);
+    if (command.closeTab === true) await chrome.tabs.remove(run.tabId).catch(() => {});
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      run: residentTrainingView(run),
+      stateLog: run.stateLog,
+      ...run.bundle,
+      alreadyStopped: true,
+      restoredConnection,
+    };
+  }
+
+  try {
+    const rawRecording = preStoppedRecording
+      ?? (activeRecording?.tabId === run.tabId
+        ? stopRecordingInternal("manual") as RecordingSession
+        : interruptedRecording(run, "tab_disconnected"));
+    const recording = sanitizeValue(rawRecording) as RecordingSession;
+    removeRecordingIndicator(run.tabId);
+    teardownInteractionCapture(run.tabId);
+
+    const beforeStop = residentNetworkEntries();
+    const bodies = command.fetchBodies === false ? {} : await fetchResidentResponseBodies(beforeStop, run.tabId);
+    const state = await residentFinalState(run);
+    const stoppedNetwork = capturingTabId === run.tabId ? await stopNetworkCapture() : beforeStop;
+    const network = (stoppedNetwork.length ? stoppedNetwork : beforeStop) as NetworkEntry[];
+    await removeResidentTrainingMonitor(run);
+
+    run.status = recording.metadata.stopReason === "tab_closed" || recording.metadata.stopReason === "tab_disconnected"
+      ? "interrupted"
+      : "stopped";
+    run.stoppedAt = recording.stoppedAt ?? new Date().toISOString();
+    run.updatedAt = new Date().toISOString();
+    run.bundle = { recording, network, bodies, state };
+    activeResidentTrainingRun = null;
+    if (residentTrainingWriteTimer) {
+      clearTimeout(residentTrainingWriteTimer);
+      residentTrainingWriteTimer = null;
+    }
+    await putResidentTraining(run);
+    await pruneResidentStorage();
+
+    // Restore the caller's pin while the training tab still exists. If we closed the primary
+    // training tab first, its asynchronous onRemoved cleanup could race and null out the freshly
+    // restored primary pointer.
+    const restoredConnection = await restoreResidentPriorConnection(runId).catch(() => false);
+    if (command.closeTab === true) await chrome.tabs.remove(run.tabId).catch(() => {});
+    if (wsBridges.size === 0) scheduleDebuggerRelease();
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      run: residentTrainingView(run),
+      recording,
+      network,
+      bodies,
+      state,
+      stateLog: run.stateLog,
+      restoredConnection,
+    };
+  } catch (error) {
+    if (capturingTabId === run.tabId) await stopNetworkCapture().catch(() => []);
+    await restoreResidentPriorConnection(runId).catch(() => false);
+    if (command.closeTab === true) await chrome.tabs.remove(run.tabId).catch(() => {});
+    run.status = "error";
+    run.lastError = error instanceof Error ? error.message : String(error);
+    run.updatedAt = new Date().toISOString();
+    activeResidentTrainingRun = null;
+    await putResidentTraining(run).catch(() => {});
+    await pruneResidentStorage().catch(() => {});
+    throw error;
+  }
+}
+
+async function stopResidentTraining(
+  command: Record<string, unknown>,
+  preStoppedRecording?: RecordingSession,
+): Promise<Record<string, unknown>> {
+  const runId = typeof command.runId === "string" ? command.runId : "";
+  if (residentTrainingFinalization?.runId === runId) return residentTrainingFinalization.promise;
+  const promise = stopResidentTrainingInternal(command, preStoppedRecording);
+  residentTrainingFinalization = { runId, promise };
+  try {
+    return await promise;
+  } finally {
+    if (residentTrainingFinalization?.promise === promise) residentTrainingFinalization = null;
+  }
+}
+
+async function residentTrainingStatus(runId?: string): Promise<Record<string, unknown>> {
+  await residentObservationRestorePromise;
+  const runs = (await listResidentTraining())
+    .filter((run) => !runId || run.runId === runId)
+    .map(residentTrainingView);
+  return {
+    resident: true,
+    bridgeRequiredForCollection: false,
+    runs,
+    recording: activeRecording ? {
+      active: true,
+      sessionId: activeRecording.sessionId,
+      pageCount: activeRecording.pages.length,
+      interactionCount: activeRecording.totalInteractions,
+      currentPageUrl: sanitizeUrlValue(activeRecording.currentPageUrl),
+    } : { active: false },
+  };
+}
+
+async function clearResidentTraining(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await residentObservationRestorePromise;
+  const runId = validateResidentRunId(command.runId);
+  if (command.confirm !== true) {
+    throw new Error("confirm must be true to delete a retained robot-training run");
+  }
+  if (residentTrainingFinalization?.runId === runId) {
+    throw new Error(`robot training run '${runId}' is still being finalized; retry after stop completes`);
+  }
+  const run = activeResidentTrainingRun?.runId === runId
+    ? activeResidentTrainingRun
+    : await getResidentTraining(runId);
+  if (!run) throw new Error(`robot training run '${runId}' not found`);
+  if (run.status === "recording") {
+    throw new Error(`robot training run '${runId}' is active; stop it before clearing retained data`);
+  }
+
+  // The extension has no filesystem capability. This removes one exact IndexedDB key plus its
+  // transient session pointer; canonical files under outputDir remain owned by the MCP process.
+  await deleteResidentTraining(runId);
+  await chrome.storage.session.remove(residentPriorConnectionKey(runId));
+  if (activeResidentTrainingRun?.runId === runId) activeResidentTrainingRun = null;
+  await pruneResidentStorage();
+  return {
+    resident: true,
+    bridgeRequiredForCollection: false,
+    cleared: runId,
+    artifactsPreserved: true,
+    outputDir: run.outputDir,
+  };
+}
+
+function monitorAlarmName(monitorId: string): string {
+  return `${RESIDENT_MONITOR_ALARM_PREFIX}${monitorId}`;
+}
+
+function armResidentMonitor(job: ResidentMonitorJob): void {
+  const now = Date.now();
+  const next = now + job.intervalMinutes * 60_000;
+  job.nextRunAt = new Date(next).toISOString();
+  chrome.alarms.create(monitorAlarmName(job.monitorId), {
+    delayInMinutes: job.intervalMinutes,
+    periodInMinutes: job.intervalMinutes,
+  });
+}
+
+async function captureResidentMonitor(
+  job: ResidentMonitorJob,
+  tabWasJustCreated = false,
+): Promise<ResidentMonitorSnapshot> {
+  if (residentMonitorCaptures.has(job.monitorId)) throw new Error(`Monitor '${job.monitorId}' capture already in progress`);
+  residentMonitorCaptures.add(job.monitorId);
+  const originalTabId = job.tabId;
+  const wasAttached = attachedTabs.has(originalTabId);
+  let createdTab = tabWasJustCreated;
+  try {
+    try {
+      await chrome.tabs.get(job.tabId);
+    } catch {
+      const replacement = await chrome.tabs.create({ url: job.url, active: false });
+      if (!replacement.id) throw new Error("Chrome did not return a tab id for monitor");
+      job.tabId = replacement.id;
+      job.ownsTab = true;
+      createdTab = true;
+    }
+    if (createdTab) await waitForResidentTab(job.tabId);
+    else await refreshResidentTab(job.tabId, job.url);
+    await ensureDebugger(job.tabId, false);
+    if (await checkSiteOptOut(job.tabId)) throw new Error(OPT_OUT_ERROR);
+    const result = await generateAriaSnapshot(job.tabId, { compact: true, maxDepth: 20 });
+    const snapshotText = result.snapshot.slice(0, RESIDENT_MONITOR_SNAPSHOT_CHARS);
+    const comparison = job.lastSnapshot
+      ? diffSnapshots(job.lastSnapshot, snapshotText)
+      : { diff: "", additions: 0, removals: 0, unchanged: 0, changed: false };
+    const meta = await sendCDPCommand<{ result?: { value?: { url?: string; title?: string } } }>(
+      { tabId: job.tabId },
+      "Runtime.evaluate",
+      { expression: "({ url: location.href, title: document.title })", returnByValue: true },
+      0,
+    ).catch(() => ({ result: { value: { url: job.url, title: "" } } }));
+    const capturedAt = new Date().toISOString();
+    const record: ResidentMonitorSnapshot = {
+      id: `${job.monitorId}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`,
+      monitorId: job.monitorId,
+      capturedAt,
+      url: sanitizeUrlValue(meta.result?.value?.url ?? job.url),
+      title: meta.result?.value?.title,
+      snapshot: snapshotText,
+      estimatedTokens: result.estimatedTokens,
+      changed: comparison.changed,
+      additions: comparison.additions,
+      removals: comparison.removals,
+      unchanged: comparison.unchanged,
+      diff: comparison.diff.slice(0, RESIDENT_MONITOR_DIFF_CHARS),
+    };
+    job.lastSnapshot = snapshotText;
+    job.lastRunAt = capturedAt;
+    job.updatedAt = capturedAt;
+    job.captureCount++;
+    if (comparison.changed) job.changeCount++;
+    job.lastError = undefined;
+    armResidentMonitor(job);
+    await Promise.all([putMonitorSnapshot(record), putMonitorJob(job)]);
+    await pruneResidentStorage();
+    return record;
+  } catch (error) {
+    job.lastError = error instanceof Error ? error.message : String(error);
+    job.updatedAt = new Date().toISOString();
+    // A transient navigation/CDP failure is evidence about one capture, not a reason to silently
+    // kill a recurring monitor. Keep it active, expose lastError, and schedule the next attempt.
+    if (job.status === "active") armResidentMonitor(job);
+    await putMonitorJob(job).catch(() => {});
+    throw error;
+  } finally {
+    residentMonitorCaptures.delete(job.monitorId);
+    const currentWasAttached = wasAttached && originalTabId === job.tabId;
+    if (!currentWasAttached && attachedTabs.has(job.tabId) && job.tabId !== debuggerAttachedTabId && job.tabId !== capturingTabId) {
+      await chrome.debugger.detach({ tabId: job.tabId }).catch(() => {});
+      forgetAttachedTab(job.tabId);
+    }
+  }
+}
+
+async function startResidentMonitor(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await residentObservationRestorePromise;
+  const url = validateResidentUrl(command.url);
+  const intervalMinutes = Math.min(10_080, Math.max(0.5, Number(command.intervalMinutes) || 5));
+  const monitorId = typeof command.monitorId === "string" && command.monitorId ? command.monitorId : newResidentId("mon");
+  if (await getMonitorJob(monitorId)) throw new Error(`Monitor '${monitorId}' already exists`);
+  const existingMonitors = await listMonitorJobs();
+  if (existingMonitors.filter((job) => job.status === "active" || job.status === "paused").length >= RESIDENT_MONITOR_JOB_LIMIT) {
+    throw new Error(`Resident monitor limit reached (${RESIDENT_MONITOR_JOB_LIMIT}); stop or clear an existing monitor first`);
+  }
+  const tab = await chrome.tabs.create({ url, active: false });
+  if (!tab.id) throw new Error("Chrome did not return a tab id for monitor");
+  const now = new Date().toISOString();
+  const job: ResidentMonitorJob = {
+    monitorId,
+    url,
+    tabId: tab.id,
+    ownsTab: true,
+    label: typeof command.label === "string" ? command.label.slice(0, 120) : undefined,
+    intervalMinutes,
+    createdAt: now,
+    updatedAt: now,
+    status: "active",
+    captureCount: 0,
+    changeCount: 0,
+  };
+  await putMonitorJob(job);
+  try {
+    const baseline = await captureResidentMonitor(job, true);
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      monitor: residentMonitorView(job),
+      baseline,
+    };
+  } catch (error) {
+    await chrome.tabs.remove(tab.id).catch(() => {});
+    await deleteMonitorJob(monitorId).catch(() => {});
+    throw error;
+  }
+}
+
+async function stopResidentMonitor(monitorId: string, closeTab = true): Promise<Record<string, unknown>> {
+  const job = await getMonitorJob(monitorId);
+  if (!job) throw new Error(`Monitor '${monitorId}' not found`);
+  await chrome.alarms.clear(monitorAlarmName(monitorId));
+  job.status = "stopped";
+  job.nextRunAt = undefined;
+  job.updatedAt = new Date().toISOString();
+  await putMonitorJob(job);
+  if (closeTab && job.ownsTab) await chrome.tabs.remove(job.tabId).catch(() => {});
+  await pruneResidentStorage();
+  return {
+    resident: true,
+    bridgeRequiredForCollection: false,
+    monitor: residentMonitorView(job),
+  };
+}
+
+async function handleResidentMonitorCommand(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await residentObservationRestorePromise;
+  const action = typeof command.action === "string" ? command.action : "status";
+  const monitorId = typeof command.monitorId === "string" ? command.monitorId : undefined;
+  if (action === "start") return startResidentMonitor(command);
+  if (action === "status") {
+    const jobs = (await listMonitorJobs())
+      .filter((job) => !monitorId || job.monitorId === monitorId)
+      .map((job) => residentMonitorView(job));
+    return { resident: true, bridgeRequiredForCollection: false, monitors: jobs };
+  }
+  if (action === "results") {
+    if (!monitorId) throw new Error("monitorId is required for results");
+    const limit = Math.min(50, Math.max(1, Number(command.limit) || 10));
+    const snapshots = (await listMonitorSnapshots(monitorId)).slice(0, limit).map((snapshot) => command.includeSnapshot === true
+      ? snapshot
+      : { ...snapshot, snapshot: undefined });
+    const job = await getMonitorJob(monitorId);
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      monitor: job ? residentMonitorView(job, command.includeSnapshot === true) : undefined,
+      snapshots,
+      count: snapshots.length,
+    };
+  }
+  if (action === "stop") {
+    if (!monitorId) throw new Error("monitorId is required for stop");
+    return stopResidentMonitor(monitorId, command.closeTab !== false);
+  }
+  if (action === "clear") {
+    const jobs = monitorId ? [await getMonitorJob(monitorId)].filter(Boolean) as ResidentMonitorJob[] : await listMonitorJobs();
+    for (const job of jobs) {
+      await chrome.alarms.clear(monitorAlarmName(job.monitorId));
+      if (command.closeTab !== false && job.ownsTab) await chrome.tabs.remove(job.tabId).catch(() => {});
+      await deleteMonitorJob(job.monitorId);
+    }
+    await pruneResidentStorage();
+    return {
+      resident: true,
+      bridgeRequiredForCollection: false,
+      cleared: jobs.map((job) => job.monitorId),
+    };
+  }
+  throw new Error(`Unknown monitor action '${action}'`);
+}
+
+async function restoreResidentObservation(): Promise<void> {
+  await swStateRestore;
+  const runs = await listResidentTraining();
+  const activeRun = runs.find((run) => run.status === "recording");
+  if (activeRun) {
+    const recording = activeRecording;
+    const autoStopped = lastAutoStoppedSession as RecordingSession | null;
+    try {
+      if (autoStopped !== null && autoStopped.id === activeRun.recordingId && autoStopped.metadata.tabId === activeRun.tabId) {
+        activeResidentTrainingRun = activeRun;
+        await stopResidentTraining(
+          { runId: activeRun.runId, fetchBodies: true, closeTab: false },
+          autoStopped,
+        );
+      } else if (recording && recording.sessionId === activeRun.recordingId && recording.tabId === activeRun.tabId) {
+        activeResidentTrainingRun = activeRun;
+        await installResidentTrainingMonitor(activeRun).catch((error) => {
+          activeRun.lastError = `monitor restore failed: ${error instanceof Error ? error.message : String(error)}`;
+        });
+        await putResidentTraining(activeRun);
+      } else {
+        activeRun.status = "interrupted";
+        activeRun.stoppedAt = new Date().toISOString();
+        activeRun.updatedAt = activeRun.stoppedAt;
+        activeRun.lastError = "Browser restart cleared the live recording session; retained events remain available";
+        await putResidentTraining(activeRun);
+      }
+    } catch (error) {
+      // One damaged training run must not prevent every recurring monitor from being restored.
+      activeRun.status = "error";
+      activeRun.updatedAt = new Date().toISOString();
+      activeRun.lastError = `resident restore failed: ${error instanceof Error ? error.message : String(error)}`;
+      activeResidentTrainingRun = null;
+      await putResidentTraining(activeRun).catch(() => {});
+    }
+  }
+  await migrateLegacyResidentObservationState({
+    removeLegacyPreference: (key) => chrome.storage.local.remove(key),
+    listMonitors: listMonitorJobs,
+    saveMonitor: putMonitorJob,
+    armMonitor: armResidentMonitor,
+    clearMonitorAlarm: async (monitorId) => { await chrome.alarms.clear(monitorAlarmName(monitorId)); },
+  });
+  await pruneResidentStorage();
+}
+
 // --- CDP Interaction Capture (Phase 1: manual browser events) ---
 const INTERACTION_BINDING_NAME = "__crawlio_interaction";
 const interactionCaptureActive = new Set<number>();
@@ -1528,6 +2684,12 @@ const INTERACTION_CAPTURE_SCRIPT = `(() => {
     return path.join(' > ') || el.tagName.toLowerCase();
   }
 
+  function isSensitiveField(el) {
+    const descriptor = [el.type, el.name, el.id, el.autocomplete, el.getAttribute && el.getAttribute('aria-label')]
+      .filter(Boolean).join(' ');
+    return String(el.type || '').toLowerCase() === 'password' || /pass(?:word)?|secret|token|auth|session|cookie|credit|card|cvv|ssn/i.test(descriptor);
+  }
+
   document.addEventListener('click', function(e) {
     const t = e.target;
     if (!t || t.nodeType !== 1) return;
@@ -1548,7 +2710,7 @@ const INTERACTION_CAPTURE_SCRIPT = `(() => {
       try {
         window.${INTERACTION_BINDING_NAME}(JSON.stringify({
           type: 'user_type', selector: getSelector(t),
-          text: t.value, url: location.href
+          text: isSensitiveField(t) ? '[REDACTED]' : String(t.value).slice(0, 2048), url: location.href
         }));
       } catch {}
     }, 300);
@@ -1568,6 +2730,11 @@ const INTERACTION_CAPTURE_SCRIPT = `(() => {
 async function setupInteractionCapture(tabId: number): Promise<void> {
   if (interactionCaptureActive.has(tabId)) return;
   try {
+    // Runtime bindings outlive individual execution contexts. Remove any binding left by the
+    // previous document before re-adding it, otherwise a navigation can leave the fresh capture
+    // script without a callable binding on Chromium versions that reject duplicate names.
+    await sendCDPCommand({ tabId }, "Runtime.removeBinding", { name: INTERACTION_BINDING_NAME }, 0)
+      .catch(() => {});
     await sendCDPCommand({ tabId }, "Runtime.addBinding", { name: INTERACTION_BINDING_NAME }, 0);
     await sendCDPCommand({ tabId }, "Runtime.evaluate", {
       expression: INTERACTION_CAPTURE_SCRIPT,
@@ -1691,53 +2858,50 @@ function writeStatus(patch: Record<string, any>) {
 }
 
 // --- Permission Broker ---
-const OPTIONAL_PERMISSIONS: chrome.permissions.Permissions = {
-  // nativeMessaging activates the rogue-server defense: it lets the extension be handed
-  // the real bridge token over Chrome's authenticated native channel (connectNative →
-  // set_crawlio_token). WITHOUT it the extension is permanently trust-on-first-use and a rogue
-  // local server can win the bridge election and drive CDP. It is requested through the
-  // permission broker (popup), SEPARATELY from the already-held tabs grant — so denying it never
-  // revokes tabs — and on grant the permissions.onAdded listener connects the token provisioner.
-  permissions: ["tabs", "nativeMessaging"],
-  origins: ["http://127.0.0.1/*"],
-};
-
-async function hasAllPermissions(): Promise<boolean> {
-  return new Promise((resolve) => {
-    chrome.permissions.contains(OPTIONAL_PERMISSIONS, resolve);
-  });
-}
+// The active build's declared optional surface. welcome.html is the only request surface; runtime
+// commands check feature-specific subsets and return an actionable onboarding requirement.
+const REQUIRED_PERMISSIONS = declaredRequiredPermissions();
+const OPTIONAL_PERMISSIONS: chrome.permissions.Permissions = declaredOptionalPermissions();
 
 async function getMissingPermissions(): Promise<chrome.permissions.Permissions> {
-  const has = await hasAllPermissions();
-  if (has) return { permissions: [], origins: [] };
-  const missing: { permissions: string[]; origins: string[] } = { permissions: [], origins: [] };
-  for (const perm of OPTIONAL_PERMISSIONS.permissions || []) {
-    const hasPerm = await new Promise<boolean>((resolve) => {
-      chrome.permissions.contains({ permissions: [perm] }, resolve);
-    });
-    if (!hasPerm) missing.permissions.push(perm);
+  return missingPermissions(OPTIONAL_PERMISSIONS);
+}
+
+/** Keep a bridge request inside the optional surface declared by the active manifest. */
+function requestedPermissionTarget(
+  command: { permissions?: unknown; origins?: unknown },
+): chrome.permissions.Permissions {
+  const declaredPermissions = new Set(OPTIONAL_PERMISSIONS.permissions ?? []);
+  const declaredOrigins = new Set(OPTIONAL_PERMISSIONS.origins ?? []);
+  const explicitPermissions = Array.isArray(command.permissions)
+    ? command.permissions.filter((value): value is string => typeof value === "string" && declaredPermissions.has(value))
+    : [];
+  const explicitOrigins = Array.isArray(command.origins)
+    ? command.origins.filter((value): value is string => typeof value === "string" && declaredOrigins.has(value))
+    : [];
+  // Compatibility default for older servers: functional permission checks historically meant
+  // tabs. Crucially, it no longer expands to nativeMessaging + loopback.
+  if (!Array.isArray(command.permissions) && !Array.isArray(command.origins)) {
+    return { permissions: ["tabs"], origins: [] };
   }
-  for (const origin of OPTIONAL_PERMISSIONS.origins || []) {
-    const hasOrigin = await new Promise<boolean>((resolve) => {
-      chrome.permissions.contains({ origins: [origin] }, resolve);
-    });
-    if (!hasOrigin) missing.origins.push(origin);
-  }
-  return missing;
+  return { permissions: explicitPermissions, origins: explicitOrigins };
+}
+
+async function hasTabMetadataPermission(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    chrome.permissions.contains({ permissions: ["tabs"] }, (granted) => resolve(granted === true));
+  });
 }
 
 async function ensureTabPermission(commandType: string): Promise<void> {
   // Only check for "tabs" permission — connect_tab/disconnect_tab need chrome.tabs API,
   // NOT the http://127.0.0.1/* origin (that's for healthCheck fetch, handled separately)
-  const hasTab = await new Promise<boolean>((resolve) => {
-    chrome.permissions.contains({ permissions: ["tabs"] }, resolve);
-  });
+  const hasTab = await hasTabMetadataPermission();
   if (!hasTab) {
     throw new PermissionError(
-      `Permission required for "${commandType}". Click the Crawlio icon to grant permissions.`,
+      `Permission required for "${commandType}". Complete Crawlio onboarding to grant browser access.`,
       { permissions: ["tabs"], origins: [] },
-      "Click the Crawlio extension icon and grant the requested permissions.",
+      "Open Crawlio's dedicated onboarding page, grant all requested access, then retry.",
     );
   }
 }
@@ -1749,9 +2913,9 @@ async function ensureOptionalPermission(commandType: string, permission: string)
   });
   if (!has) {
     throw new PermissionError(
-      `Permission "${permission}" required for "${commandType}". Click the Crawlio icon to grant permissions.`,
+      `Permission "${permission}" required for "${commandType}". Complete Crawlio onboarding to grant browser access.`,
       { permissions: [permission], origins: [] },
-      "Click the Crawlio extension icon and grant the requested permissions.",
+      "Open Crawlio's dedicated onboarding page, grant all requested access, then retry.",
     );
   }
 }
@@ -1815,11 +2979,6 @@ chrome.permissions.onAdded.addListener((perms) => {
       if (connected) console.log("[Crawlio] Native messaging connected after permission grant");
     });
   }
-  // Clear permission broker badge when tabs permission is granted
-  if (perms.permissions?.includes("tabs")) {
-    chrome.action.setBadgeText({ text: "" });
-    chrome.storage.session.remove("crawlio:pendingPermissions");
-  }
   // Create context menus when contextMenus permission is granted at runtime
   if (perms.permissions?.includes("contextMenus")) {
     setupContextMenus().catch(() => {});
@@ -1835,54 +2994,6 @@ chrome.permissions.onRemoved.addListener((perms) => {
     requestBridgeDiscovery();
   }
 });
-// --- Data Sanitizer ---
-const SENSITIVE_KEY_PATTERNS = /password|token|secret|api[_-]?key|auth(?:orization|_token|_key|_secret)|credential|bearer/i;
-
-const SENSITIVE_VALUE_PATTERNS = [
-  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, // JWT
-  /^[A-Fa-f0-9]{32,}$/, // Hex credential (32+ chars)
-  /^[A-Za-z0-9+/]{40,}={0,2}$/, // Base64 (40+ chars)
-  /^sk-[A-Za-z0-9]{20,}/, // OpenAI key
-  /^ghp_[A-Za-z0-9]{20,}/, // GitHub PAT
-  /^xoxb-[A-Za-z0-9-]+/, // Slack bot token
-  /^AKIA[0-9A-Z]{16}/, // AWS access key ID
-  /^ASIA[0-9A-Z]{16}/, // AWS temporary access key ID
-];
-
-const MAX_STRING_LENGTH = 1000;
-
-function sanitizeValue(value: unknown, depth = 0): unknown {
-  if (depth > 5) return "[depth limit]";
-
-  if (typeof value === "string") {
-    for (const pattern of SENSITIVE_VALUE_PATTERNS) {
-      if (pattern.test(value)) return "[REDACTED]";
-    }
-    if (value.length > MAX_STRING_LENGTH) {
-      return value.slice(0, MAX_STRING_LENGTH) + `... [truncated ${value.length - MAX_STRING_LENGTH} chars]`;
-    }
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(item => sanitizeValue(item, depth + 1));
-  }
-
-  if (value !== null && typeof value === "object") {
-    const sanitized: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value)) {
-      if (SENSITIVE_KEY_PATTERNS.test(key)) {
-        sanitized[key] = "[REDACTED]";
-      } else {
-        sanitized[key] = sanitizeValue(val, depth + 1);
-      }
-    }
-    return sanitized;
-  }
-
-  return value;
-}
-
 // Batched network storage write (500ms debounce) — IDB primary, session storage fallback
 function flushNetworkToStorage() {
   if (networkWriteTimer) clearTimeout(networkWriteTimer);
@@ -1890,11 +3001,7 @@ function flushNetworkToStorage() {
     // Entries keyed by requestId always have it; filter ensures loading finished (_startTime deleted)
     const entries = Array.from(networkEntries.values()).filter(
       (e): e is NetworkMapEntry & { requestId: string } => !!e.url && !e._startTime && !!e.requestId
-    ).map(e => {
-      if (e.requestHeaders) e.requestHeaders = sanitizeValue(e.requestHeaders) as Record<string, string>;
-      if (e.requestBody) e.requestBody = sanitizeValue(e.requestBody) as string;
-      return e;
-    });
+    ).map(sanitizeNetworkEntry);
     try {
       await putNetworkEntries(entries);
     } catch { /* IDB write failed — fall back to session storage */
@@ -1937,8 +3044,58 @@ const MAX_PROBE_RETRIES = 3;
 let wasEverConnected = false;
 let userDisconnected = false;
 
+function retireSupersededWorker(): void {
+  if (workerSuperseded) return;
+  workerSuperseded = true;
+  userDisconnected = true;
+  if (bridgeDiscoveryTimer) { clearTimeout(bridgeDiscoveryTimer); bridgeDiscoveryTimer = null; }
+  if (pendingDisconnectTimer) { clearTimeout(pendingDisconnectTimer); pendingDisconnectTimer = null; }
+  bridgeRetryGate.reset();
+  for (const socket of wsBridges.values()) {
+    intentionalClose.add(socket);
+    try { socket.close(1000, "extension worker superseded"); } catch { /* context is retiring */ }
+  }
+  wsBridges.clear();
+  connectingPorts.clear();
+  activeBridgePort = null;
+  for (const timer of identityTimers.values()) clearTimeout(timer);
+  identityTimers.clear();
+  for (const port of bridgeTrust.keys()) releaseHandshakeWaiters(port);
+  bridgeTrust.clear();
+  disconnectNative();
+  stopKeepalive();
+}
+
+async function claimWorkerGeneration(): Promise<void> {
+  const stored = await chrome.storage.local.get(WORKER_GENERATION_KEY);
+  const observed = parseWorkerGeneration(stored[WORKER_GENERATION_KEY]);
+  if (isNewerWorkerGeneration(observed, currentWorkerGeneration)) {
+    retireSupersededWorker();
+    return;
+  }
+  await chrome.storage.local.set({ [WORKER_GENERATION_KEY]: currentWorkerGeneration });
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes[WORKER_GENERATION_KEY] || workerSuperseded) return;
+  const observed = parseWorkerGeneration(changes[WORKER_GENERATION_KEY].newValue);
+  if (isNewerWorkerGeneration(observed, currentWorkerGeneration)) {
+    retireSupersededWorker();
+    return;
+  }
+  // Two workers can publish in the opposite order. The newer one restores its winning lease;
+  // the older listener sees that value and retires, so the pair converges without a lock.
+  if (isNewerWorkerGeneration(currentWorkerGeneration, observed)) {
+    void chrome.storage.local.set({ [WORKER_GENERATION_KEY]: currentWorkerGeneration });
+  }
+});
+
+void claimWorkerGeneration().catch(() => {
+  // Storage failure removes reload de-duplication, not bridge security. Continue normally.
+});
+
 function requestBridgeDiscovery(): void {
-  if (userDisconnected) return;
+  if (userDisconnected || workerSuperseded) return;
   const delay = bridgeRetryGate.reserve();
   if (delay > 0) {
     if (!bridgeDiscoveryTimer) {
@@ -1982,6 +3139,7 @@ async function probePort(port: number): Promise<{ port: number; lastActivityAt: 
 // --- Native Messaging Transport ---
 
 async function handleIncomingMessage(msg: Record<string, unknown>, source: "native" | "ws"): Promise<object | null> {
+  if (workerSuperseded) return null;
   if (msg.type === "set_crawlio_port") {
     chrome.storage.local.set({ "crawlio:port": msg.port });
     if (__DEV__) console.log(`[Crawlio] Cached Crawlio port: ${msg.port}`);
@@ -2008,6 +3166,7 @@ async function handleIncomingMessage(msg: Record<string, unknown>, source: "nati
         // Without this, a socket that was "active" under TOFU would stay unverified and get
         // its commands refused the instant a token arrives.
         for (const p of [...wsBridges.keys()]) rechallengeBridge(p);
+        updateBridgeStatus(); // token changed: do not report ready until one socket re-verifies
         requestBridgeDiscovery(); // pull in the holder of the new token if not already connected
       }
       if (__DEV__) console.log("[Crawlio] Trusted bridge token provisioned via native channel");
@@ -2083,6 +3242,12 @@ function disconnectNative(): void {
 }
 
 function wireNativePort(port: chrome.runtime.Port): void {
+  // Chrome normally closes stdin when an extension worker is replaced. A live ping lease gives
+  // the native host a second signal, so an orphaned host cannot keep polling bridge files forever
+  // after an unpacked reload.
+  const heartbeat = setInterval(() => {
+    try { port.postMessage({ type: "ping" }); } catch { /* disconnect handler clears the lease */ }
+  }, 5_000);
   port.onMessage.addListener((msg: Record<string, unknown>) => {
     handleIncomingMessage(msg, "native").then((response) => {
       if (response) sendToTransport(response);
@@ -2091,6 +3256,7 @@ function wireNativePort(port: chrome.runtime.Port): void {
     });
   });
   port.onDisconnect.addListener(() => {
+    clearInterval(heartbeat);
     if (!nativeConnection.clearIfCurrent(port)) return;
     const err = chrome.runtime.lastError?.message || "";
     if (err.includes("native messaging host not found")) {
@@ -2102,18 +3268,30 @@ function wireNativePort(port: chrome.runtime.Port): void {
   });
 }
 
+function activeBridgeIsReady(): boolean {
+  if (activeBridgePort === null) return false;
+  const socket = wsBridges.get(activeBridgePort);
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  // TOFU mode has no authenticated verdict to wait for. Once native provisioning exists, the
+  // popup must not turn green for a candidate socket that cannot yet receive trusted commands.
+  return trustedBridgeToken === null || bridgeTrust.get(activeBridgePort)?.verified === true;
+}
+
 function updateBridgeStatus() {
-  // The native port is a token side-channel, not a command transport — only a live WS
-  // bridge counts as "connected".
-  const connected = wsBridges.size > 0;
+  // The native port is only a token side-channel. A WebSocket candidate also does not count until
+  // it is the elected route and, when a trusted token exists, has passed the identity handshake.
+  const connected = activeBridgeIsReady();
   writeStatus({ mcpConnected: connected });
   chrome.storage.session.set({
     "crawlio:bridgeConnected": connected,
-    "crawlio:bridgeCount": wsBridges.size,
+    "crawlio:bridgeCount": connected ? 1 : 0,
+    "crawlio:bridgeCandidateCount": wsBridges.size,
+    "crawlio:bridgePort": connected ? activeBridgePort : null,
   });
 }
 
 function connectToPort(port: number) {
+  if (workerSuperseded) return;
   if (wsBridges.has(port) || connectingPorts.has(port)) return;
   connectingPorts.add(port);
 
@@ -2162,10 +3340,16 @@ function connectToPort(port: number) {
     chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
     persistState().catch(() => {});
     startKeepalive();
+    // On a fresh install the profile id may not have resolved yet. Connecting without it is safe —
+    // an unidentified extension is treated exactly as before and is never refused — and the
+    // resolver re-identifies this socket the moment it lands.
     safeWebSocketSend(socket, JSON.stringify({
-        type: "connected",
-        extensionId: chrome.runtime.id,
-      }));
+      type: "connected",
+      extensionId: chrome.runtime.id,
+      handshakeAck: true,
+      workerGeneration: currentWorkerGeneration,
+      ...(cachedProfileId ? { profileId: cachedProfileId } : {}),
+    }));
 
     // Challenge the server to prove it holds the real bridge token. The verdict
     // gates command execution AND (for a candidate) promotion to the active bridge. With
@@ -2180,21 +3364,12 @@ function connectToPort(port: number) {
     // bridge. Cleared on a verified handshake / onclose.
     if (trustedBridgeToken !== null) armIdentityTimer(port, socket);
 
-    // Permission broker: check once (not per-connection)
-    if (wsBridges.size === 1) {
-      hasAllPermissions().then((granted) => {
-        if (!granted) {
-          getMissingPermissions().then((missing) => {
-            chrome.storage.session.set({ "crawlio:pendingPermissions": missing });
-            chrome.action.setBadgeText({ text: "!" });
-            chrome.action.setBadgeBackgroundColor({ color: "#F97316" });
-          });
-        }
-      });
-    }
+    // Connection never stages or requests permissions. All declared optional capabilities are
+    // reviewed and granted together from the dedicated onboarding page.
   };
 
   socket.onmessage = async (event) => {
+    if (workerSuperseded) return;
     try {
       const msg = JSON.parse(event.data);
       if (!msg || typeof msg !== "object" || !msg.type) return;
@@ -2203,15 +3378,33 @@ function connectToPort(port: number) {
       // dialed, so a proof relayed from a server on another port fails here.
       if (msg.type === HANDSHAKE_MESSAGE_TYPES.handshake) {
         const trust = bridgeTrust.get(port);
-        if (trust && trustedBridgeToken) {
-          trust.verified = await verifyHandshakeProof(trustedBridgeToken, trust.nonce, port, msg.proof);
+        if (!trust) return;
+
+        // The server must not release queued commands merely because it put a proof on the wire.
+        // During rapid bridge replacement our cached token can still name the departing server;
+        // in that case this verdict is false and the socket is replaced after native provisioning
+        // catches up. A nonce-bound acknowledgement lets the server keep those commands QUEUED
+        // instead of transmitting them onto a connection that is about to be refused.
+        const accepted = trustedBridgeToken === null
+          ? true
+          : await verifyHandshakeProof(trustedBridgeToken, trust.nonce, port, msg.proof);
+        trust.verified = accepted && trustedBridgeToken !== null;
+        safeWebSocketSend(socket, JSON.stringify({
+          type: HANDSHAKE_MESSAGE_TYPES.accepted,
+          nonce: trust.nonce,
+          accepted,
+        }));
+
+        if (trustedBridgeToken) {
+          releaseHandshakeWaiters(port); // verdict is in — anything parked can be judged now
           const t = identityTimers.get(port);
           if (t) { clearTimeout(t); identityTimers.delete(port); }
-          if (trust.verified) {
+          if (accepted) {
             // Proven holder of the trusted token. If this is a CANDIDATE (not yet the active
             // bridge), promote it now and close the old incumbent — only a proven
             // token holder can win this cutover.
             if (activeBridgePort !== port) promoteVerifiedBridge(port, socket);
+            else updateBridgeStatus();
           } else {
             console.warn(`[Crawlio] Server on :${port} failed identity handshake — disconnecting (possible rogue server)`);
             intentionalClose.add(socket); // failed proof — drop without a per-port reconnect loop
@@ -2224,20 +3417,49 @@ function connectToPort(port: number) {
       // When a trusted token is provisioned, refuse a server that has not
       // proven its identity. With no provisioning this is trust-on-first-use
       // ("tofu-allow"), i.e. unchanged behavior.
+      //
+      // "Not yet decided" is not the same as "refused". A command can outrun the verdict by a
+      // millisecond — the proof is checked through an `await`, so the handler yields and the next
+      // frame is judged while the answer is still in flight — and a server that releases its queue
+      // before answering the challenge puts one on the wire ahead of the proof outright. Dropping
+      // those is what made the first call after every reconnect time out. Let the verdict land.
+      if (trustedBridgeToken !== null && bridgeTrust.get(port)?.verified !== true) {
+        await awaitHandshakeVerdict(port);
+        if (wsBridges.get(port) !== socket) return; // socket was replaced while we waited
+      }
       const decision = evaluateServerTrust(trustedBridgeToken !== null, bridgeTrust.get(port)?.verified === true);
       if (decision === "refuse") return;
 
+      // Bind this command to the token that authenticated it. If the WebSocket is replaced while
+      // an awaited CDP operation is still running, the response may use the replacement only when
+      // it has independently proved the SAME native-provisioned token. This recovers in-flight
+      // work without replaying a mutating command and without crossing a server handoff.
+      const commandToken = trustedBridgeToken;
       const response = await handleIncomingMessage(msg, "ws");
-      // Route response back through THIS socket (per-connection routing)
-      if (response && socket.readyState === WebSocket.OPEN) {
-        safeWebSocketSend(socket, JSON.stringify(response));
+      if (response) {
+        let responseSocket: WebSocket | undefined = socket.readyState === WebSocket.OPEN
+          ? socket
+          : undefined;
+        if (!responseSocket) {
+          const replacement = wsBridges.get(port);
+          if (replacement && canRerouteBridgeResponse({
+            commandToken,
+            currentToken: trustedBridgeToken,
+            sameActivePort: activeBridgePort === port,
+            replacementOpen: replacement.readyState === WebSocket.OPEN,
+            replacementVerified: bridgeTrust.get(port)?.verified === true,
+          })) {
+            responseSocket = replacement;
+          }
+        }
+        if (responseSocket) safeWebSocketSend(responseSocket, JSON.stringify(response));
       }
     } catch (e) {
       if (__DEV__) console.error("[Crawlio] Command error:", e);
     }
   };
 
-  socket.onclose = () => {
+  socket.onclose = (event) => {
     clearTimeout(handshakeTimer);
     // Only clear per-port bookkeeping if THIS socket is still the one tracked for `port`.
     // closeIncumbent() removes a socket from the map BEFORE closing it, which unblocks a
@@ -2250,16 +3472,21 @@ function connectToPort(port: number) {
       const idTimer = identityTimers.get(port);
       if (idTimer) { clearTimeout(idTimer); identityTimers.delete(port); }
       wsBridges.delete(port);
+      releaseHandshakeWaiters(port); // socket is gone; no verdict is coming
       bridgeTrust.delete(port); // drop handshake state for this port
     }
     // A never-opened socket still owns the connectingPorts slot it reserved at dial time;
     // an opened one released it in onopen, so a present entry belongs to a newer dial.
     if (!wasOpen) connectingPorts.delete(port);
 
-    // If the socket that just died is the ACTIVE bridge, forget the pointer so the next
-    // discovery re-elects — whether the close was planned or not (a failed-identity drop of
-    // the active rogue must not leave activeBridgePort dangling at a dead socket).
-    if (activeBridgePort === port) activeBridgePort = null;
+    // If the TRACKED socket that just died is the active bridge, forget the pointer so the next
+    // discovery re-elects. A zombie onclose from an older same-port socket must not clear the
+    // pointer of the verified replacement that is now stored in wsBridges.
+    if (wasTracked && activeBridgePort === port) activeBridgePort = null;
+
+    // A newer service-worker generation now owns the shared popup/session state. This retired
+    // generation must neither overwrite it nor start another reconnect race.
+    if (workerSuperseded) return;
 
     const wasIntentional = intentionalClose.has(socket);
     if (wasIntentional) intentionalClose.delete(socket);
@@ -2280,10 +3507,10 @@ function connectToPort(port: number) {
     chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 
     // Delay bridgeConnected:false — suppress popup flicker during reconnection
-    if (wsBridges.size === 0 && !pendingDisconnectTimer) {
+    if (!activeBridgeIsReady() && !pendingDisconnectTimer) {
       pendingDisconnectTimer = setTimeout(() => {
         pendingDisconnectTimer = null;
-        if (wsBridges.size === 0) {
+        if (!activeBridgeIsReady()) {
           chrome.storage.session.set({ "crawlio:bridgeConnected": false });
         }
       }, 5000);
@@ -2296,10 +3523,14 @@ function connectToPort(port: number) {
     // Only retry this port if it was a genuine disconnect (was open).
     // Failed connection attempts are handled by the alarm-based discovery.
     if (wasOpen) {
-      const retryDelay = portRetryDelays.get(port) ?? RECONNECT_BASE;
-      portRetryDelays.set(port, Math.min(retryDelay * 2, RECONNECT_CAP));
+      // The server saw a newer generation of this same profile and released the stale incumbent.
+      // Retry promptly so the new worker wins before the retired worker's normal backoff fires.
+      const generationTakeover = event.code === WS_CLOSE_NEWER_GENERATION_RETRY;
+      const retryDelay = generationTakeover ? 100 : (portRetryDelays.get(port) ?? RECONNECT_BASE);
+      if (generationTakeover) portRetryDelays.delete(port);
+      else portRetryDelays.set(port, Math.min(retryDelay * 2, RECONNECT_CAP));
       setTimeout(() => {
-        if (!userDisconnected) {
+        if (!userDisconnected && !workerSuperseded) {
           probePort(port).then(probe => { if (probe) connectToPort(port); });
         }
       }, retryDelay);
@@ -2310,6 +3541,7 @@ function connectToPort(port: number) {
 }
 
 async function discoverAndConnectAll() {
+  if (workerSuperseded) return;
   // Ensure reconnect alarm exists so we always retry, even if this probe fails
   chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 
@@ -2358,6 +3590,9 @@ function armIdentityTimer(port: number, socket: WebSocket): void {
     if (bridgeTrust.get(port)?.verified !== true) {
       intentionalClose.add(socket);
       closeFailedHandshake(socket, "identity-unverified");
+      // The verdict is in, and it is "no". Wake anything parked so it refuses now rather than
+      // sitting out its own timer against a socket that is already gone.
+      releaseHandshakeWaiters(port);
     }
   }, WS_HANDSHAKE_TIMEOUT));
 }
@@ -2373,6 +3608,11 @@ function closeIncumbent(previousPort: number, keep: WebSocket): void {
     wsBridges.delete(previousPort);
     const t = identityTimers.get(previousPort);
     if (t) { clearTimeout(t); identityTimers.delete(previousPort); }
+    // Wake anything parked on this port's verdict BEFORE dropping the state that would deliver
+    // it. onclose cannot cover this: wsBridges.delete above makes its `wasTracked` guard false,
+    // so a parked command would otherwise sit out the full handshake window before discovering
+    // that the socket it was waiting on is long gone.
+    releaseHandshakeWaiters(previousPort);
     bridgeTrust.delete(previousPort);
     try { old.close(1000, "rebridge"); } catch { /* already closing */ }
   }
@@ -2426,7 +3666,7 @@ function connectPlannedBridges(live: BridgeProbe[]): void {
 // token is held with a verified incumbent it connects to NOTHING (a forged-activity rogue
 // can't trigger a cutover).
 async function rescanForNewBridges(): Promise<void> {
-  if (userDisconnected || wsBridges.size === 0) return;
+  if (userDisconnected || workerSuperseded || wsBridges.size === 0) return;
   const probePromises: Promise<{ port: number; lastActivityAt: number } | null>[] = [];
   for (let port = WS_PORT_START; port <= WS_PORT_END; port++) {
     probePromises.push(probePort(port));
@@ -2460,10 +3700,11 @@ async function getConnectedTab(): Promise<chrome.tabs.Tab> {
   if (conn?.tabId) {
     try {
       const tab = await chrome.tabs.get(conn.tabId);
-      if (tab.url?.startsWith("http") && !tab.discarded) {
+      const knownUrl = tab.url ?? conn.url;
+      if (knownUrl?.startsWith("http") && !tab.discarded) {
         // Ensure debugger is attached (may have been lost on SW restart)
         await ensureDebugger(tab.id!, true);
-        return tab;
+        return { ...tab, url: knownUrl, title: tab.title ?? conn.title };
       }
     } catch {
       // Tab closed or invalid — fall through to auto-connect
@@ -2494,12 +3735,52 @@ async function getConnectedTab(): Promise<chrome.tabs.Tab> {
   return activeTab;
 }
 
+/**
+ * Resolve which tab a command acts on.
+ *
+ * Commands may carry an explicit `tabId` to target any attached tab; without one the behaviour
+ * is exactly getConnectedTab() — the pinned tab, or a lazy auto-connect. That default is what
+ * makes this safe to route every handler through: omitting `tabId` is byte-for-byte the
+ * previous behaviour, so a handler that is never updated simply keeps working.
+ *
+ * Targeting deliberately does NOT move the pin. ensureDebugger's `makePrimary` is left false, so
+ * driving a second tab never changes which tab the user's own `connect_tab` points at — an agent
+ * working three tabs in parallel must not silently reassign the one a human is watching.
+ */
+async function resolveTargetTab(command: { tabId?: unknown }): Promise<chrome.tabs.Tab> {
+  const explicit = command?.tabId;
+  if (typeof explicit !== "number" || !Number.isInteger(explicit) || explicit < 0) {
+    return getConnectedTab();
+  }
+
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.get(explicit);
+  } catch {
+    throw new Error(`Tab ${explicit} not found — it may have been closed. Use list_tabs to see open tabs.`);
+  }
+  if (!tab.url?.startsWith("http")) {
+    throw new Error(`Tab ${explicit} is not an HTTP page (${tab.url ?? "unknown"}) — CDP cannot attach to it.`);
+  }
+  if (tab.discarded) {
+    throw new Error(`Tab ${explicit} is discarded — activate it once so Chrome restores its process.`);
+  }
+
+  await ensureTabPermission("target_tab");
+  await ensureDebugger(explicit, false);
+  return tab;
+}
+
 // SW-resilient debugger tab resolution.
 // Many CDP tools need `debuggerAttachedTabId` but this in-memory variable is lost when
 // the MV3 service worker goes dormant. This helper auto-recovers from session storage
 // and re-attaches the debugger, so tools work across SW restarts.
 // Falls back to lazy auto-connect if no persisted connection exists.
-async function requireDebuggerTab(): Promise<number> {
+async function requireDebuggerTab(command?: { tabId?: unknown }): Promise<number> {
+  // An explicit tabId means the caller named a tab, so the recovery dance below — which is all
+  // about rediscovering the *pinned* tab after the service worker slept — does not apply.
+  if (typeof command?.tabId === "number") return (await resolveTargetTab(command)).id!;
+
   // Fast path — debugger still attached in this SW lifecycle
   if (debuggerAttachedTabId !== null) return debuggerAttachedTabId;
 
@@ -2509,7 +3790,10 @@ async function requireDebuggerTab(): Promise<number> {
   if (conn?.tabId) {
     try {
       const tab = await chrome.tabs.get(conn.tabId);
-      if (tab.url?.startsWith("http") && !tab.discarded) {
+      // Without the optional tabs grant Chrome redacts title/url even for a tab Crawlio created.
+      // The persisted URL is extension-owned evidence and keeps that owned tab recoverable.
+      const knownUrl = tab.url ?? conn.url;
+      if (knownUrl?.startsWith("http") && !tab.discarded) {
         await ensureDebugger(conn.tabId, true);
         if (__DEV__) console.log(`[Crawlio] requireDebuggerTab: recovered debugger for tab ${conn.tabId}`);
         return conn.tabId;
@@ -2545,9 +3829,17 @@ async function enableBackgroundInput(tabId: number): Promise<void> {
 async function ensureTabFocused(tabId: number): Promise<void> {
   try {
     const stored = (await chrome.storage.session.get("crawlio:connectedTab"))["crawlio:connectedTab"] as { tabId?: number; background?: boolean } | undefined;
-    if (stored?.tabId === tabId && stored.background === true) {
+    // Activate ONLY the tab the user pinned, and only if they pinned it in the foreground.
+    //
+    // Anything else is a tab a command named with an explicit tabId, and activating it is wrong
+    // twice over. It steals focus the user never asked to give up — the same reason targeting does
+    // not move the pin — and a window holds one active tab, so two tabs driven at once fight over
+    // it and Chrome drops input to whichever loses. That showed up as a click on one tab simply
+    // vanishing: two concurrent clicks across two tabs, and only the last-activated tab counted.
+    const isPinnedForegroundTab = stored?.tabId === tabId && stored.background !== true;
+    if (!isPinnedForegroundTab) {
       await enableBackgroundInput(tabId);
-      return; // background connect — no focus-steal
+      return;
     }
     const tab = await chrome.tabs.get(tabId);
     if (tab.windowId !== undefined) {
@@ -2674,7 +3966,9 @@ async function releaseAllDebuggers(reason: string): Promise<void> {
     }
   }
   persistAgentSessions().catch(() => {});
-  networkCapturing = false;
+  capturingTabId = null;
+  tabRuntimeStates.clearAll();
+  tabInputLocks.clear();
   connectionStartTime = null;
   lastCommandTime = null;
   stopIdleReleaseAlarm();
@@ -2748,7 +4042,9 @@ async function idleReleaseDebuggers(): Promise<void> {
   stealthScriptId = null;
   frameworkHookScriptId = null;
   currentSecurityState = null;
-  networkCapturing = false;
+  capturingTabId = null;
+  tabRuntimeStates.clearAll();
+  tabInputLocks.clear();
   await chrome.storage.session.set({ [IDLE_RELEASE_KEY]: { tabs: released, at: Date.now() } });
   // Snapshot immediately: the periodic persist still claims a live attachment, and a
   // service-worker restart inside that window would restore it and bring the banner back
@@ -2813,8 +4109,8 @@ async function maybeIdleRelease(): Promise<void> {
     recording: activeRecording !== null,
     pendingDialog: pendingDialog !== null || pendingFileChooser !== null,
     interceptRuleCount: interceptRules.size,
-    coverageActive: cssCoverageActive || jsCoverageActive,
-    framePinned: activeFrameId !== null,
+    coverageActive: anyCoverageActive(),
+    framePinned: anyFramePinned(),
     commandsInFlight: cdpCommandsInFlight,
   });
   if (decision.action === "release") await idleReleaseDebuggers();
@@ -2828,7 +4124,7 @@ async function maybeIdleRelease(): Promise<void> {
 const PENDING_UPDATE_KEY = "crawlio:pendingUpdateVersion";
 
 function isExtensionIdle(): boolean {
-  return getActiveAgentSessionCount() === 0 && !activeRecording && !networkCapturing && attachedTabs.size === 0;
+  return getActiveAgentSessionCount() === 0 && !activeRecording && capturingTabId === null && attachedTabs.size === 0;
 }
 
 // Apply a deferred extension update only when no automation is in flight.
@@ -2889,23 +4185,46 @@ async function waitForStableDOM(tabId: number, minStableMs = 1000, maxWaitMs = 3
 }
 
 // Adaptive screenshot with quality cascade
-const MAX_BASE64_CHARS = 1398100; // 1.4MB 
+const MAX_BASE64_CHARS = 1398100; // 1.4MB
 
-async function takeScreenshotHardened(tabId: number): Promise<string> {
-  // Fast path: if target tab is active, use captureVisibleTab (no debugger needed)
+interface ScreenshotCaptureOptions {
+  fullPage?: boolean;
+  selector?: string;
+  format?: "png" | "jpeg";
+  quality?: number;
+}
+
+interface ScreenshotCaptureResult {
+  data: string;
+  mimeType: "image/png" | "image/jpeg";
+  format: "png" | "jpeg";
+}
+
+async function captureScreenshotHardened(
+  tabId: number,
+  options: ScreenshotCaptureOptions = {},
+): Promise<ScreenshotCaptureResult> {
+  const requestedFormat = options.format ?? "jpeg";
+  const requestedQuality = Math.max(10, Math.min(100, Math.round(options.quality ?? 85)));
+
+  // Fast path: a plain viewport capture of the active tab does not need CDP. Selector/full-page
+  // captures need a page-coordinate clip and therefore take the CDP path below.
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (tab.active && tab.windowId) {
+    if (!options.fullPage && !options.selector && tab.active && tab.windowId) {
       const [activeInWindow] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
       if (activeInWindow?.id === tabId) {
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-          format: "jpeg",
-          quality: 85,
-        });
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, requestedFormat === "png"
+          ? { format: "png" }
+          : { format: "jpeg", quality: requestedQuality });
         // captureVisibleTab returns data URL — extract base64
         const base64 = dataUrl.replace(/^data:image\/[^;]+;base64,/, "");
         if (base64.length <= MAX_BASE64_CHARS) {
-          return base64;
+          return {
+            data: base64,
+            mimeType: requestedFormat === "png" ? "image/png" : "image/jpeg",
+            format: requestedFormat,
+          };
         }
         // Too large — fall through to CDP path with quality cascade
       }
@@ -2915,48 +4234,99 @@ async function takeScreenshotHardened(tabId: number): Promise<string> {
     // Fall through to CDP path
   }
 
-  // CDP fallback: quality cascade for background tabs or oversized captures
+  // CDP fallback: supports background, selector and full-page capture.
   await ensureDebugger(tabId);
 
-  // Get viewport clip from cssVisualViewport
   let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined;
-  try {
-    const metrics = await sendCDPCommand<any>({ tabId }, "Page.getLayoutMetrics", {}, 1);
-    const vp = metrics?.cssVisualViewport;
-    if (vp && vp.clientWidth > 0 && vp.clientHeight > 0) {
-      clip = { x: vp.pageX || 0, y: vp.pageY || 0, width: vp.clientWidth, height: vp.clientHeight, scale: 1 };
+  if (options.selector) {
+    const result = await sendCDPCommand<{
+      result?: { value?: { x: number; y: number; width: number; height: number } | null };
+      exceptionDetails?: { text?: string };
+    }>(
+      { tabId },
+      "Runtime.evaluate",
+      buildEvalParams(tabId, `(() => {
+        const element = document.querySelector(${JSON.stringify(options.selector)});
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        return { x: rect.left + scrollX, y: rect.top + scrollY, width: rect.width, height: rect.height };
+      })()`),
+      0,
+      5_000,
+    );
+    const box = result.result?.value;
+    if (!box || box.width <= 0 || box.height <= 0) {
+      throw new Error(`Screenshot selector not found or not visible: ${options.selector}`);
     }
-  } catch { /* proceed without clip */ }
-
-  // Quality cascade: 85% → 10%, step down 5%
-  for (let quality = 85; quality >= 10; quality -= 5) {
+    clip = { ...box, scale: 1 };
+  } else {
     try {
-      const result = await sendCDPCommand<{ data: string }>(
-        { tabId },
-        "Page.captureScreenshot",
-        {
-          format: "jpeg",
-          quality,
-          ...(clip ? { clip, captureBeyondViewport: false } : {}),
-        },
-        1
-      );
-      if (result.data.length <= MAX_BASE64_CHARS) {
-        return result.data;
+      const metrics = await sendCDPCommand<{
+        cssVisualViewport?: { pageX?: number; pageY?: number; clientWidth?: number; clientHeight?: number };
+        cssContentSize?: { x?: number; y?: number; width?: number; height?: number };
+      }>({ tabId }, "Page.getLayoutMetrics", {}, 1);
+      if (options.fullPage) {
+        const size = metrics.cssContentSize;
+        if (size && (size.width ?? 0) > 0 && (size.height ?? 0) > 0) {
+          clip = { x: size.x ?? 0, y: size.y ?? 0, width: size.width ?? 0, height: size.height ?? 0, scale: 1 };
+        }
+      } else {
+        const vp = metrics.cssVisualViewport;
+        if (vp && (vp.clientWidth ?? 0) > 0 && (vp.clientHeight ?? 0) > 0) {
+          clip = {
+            x: vp.pageX ?? 0,
+            y: vp.pageY ?? 0,
+            width: vp.clientWidth ?? 0,
+            height: vp.clientHeight ?? 0,
+            scale: 1,
+          };
+        }
       }
+    } catch { /* Page.captureScreenshot can proceed without a clip */ }
+  }
+
+  const capture = async (format: "png" | "jpeg", quality?: number): Promise<string> => {
+    const result = await sendCDPCommand<{ data: string }>(
+      { tabId },
+      "Page.captureScreenshot",
+      {
+        format,
+        ...(format === "jpeg" ? { quality } : {}),
+        ...(clip ? { clip, captureBeyondViewport: options.fullPage === true || !!options.selector } : {}),
+      },
+      1,
+    );
+    return result.data;
+  };
+
+  if (requestedFormat === "png") {
+    try {
+      const data = await capture("png");
+      if (data.length <= MAX_BASE64_CHARS) return { data, mimeType: "image/png", format: "png" };
     } catch {
-      break; // CDP error, return whatever we have
+      // JPEG cascade below is the bounded fallback for an oversized/unsupported PNG.
     }
   }
 
-  // Final attempt at minimum quality without clip
-  const result = await sendCDPCommand<{ data: string }>(
-    { tabId },
-    "Page.captureScreenshot",
-    { format: "jpeg", quality: 10 },
-    1
-  );
-  return result.data;
+  // Quality cascade preserves the requested clip; only encoding quality changes.
+  for (let quality = requestedQuality; quality >= 10; quality -= 5) {
+    try {
+      const data = await capture("jpeg", quality);
+      if (data.length <= MAX_BASE64_CHARS) {
+        return { data, mimeType: "image/jpeg", format: "jpeg" };
+      }
+    } catch {
+      break;
+    }
+  }
+
+  const data = await capture("jpeg", 10);
+  return { data, mimeType: "image/jpeg", format: "jpeg" };
+}
+
+/** Back-compat helper for internal artifacts that only store base64. */
+async function takeScreenshotHardened(tabId: number): Promise<string> {
+  return (await captureScreenshotHardened(tabId)).data;
 }
 
 // Zoom factor from visualViewport for coordinate correction
@@ -3020,6 +4390,84 @@ interface MouseOptions {
   modifiers?: number;
 }
 
+interface CDPDragDataItem {
+  mimeType: string;
+  data: string;
+  title?: string;
+  baseURL?: string;
+}
+
+interface CDPDragData {
+  items: CDPDragDataItem[];
+  files?: string[];
+  dragOperationsMask: number;
+}
+
+function asCDPDragData(value: unknown): CDPDragData | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  if (!Array.isArray(candidate.items) || typeof candidate.dragOperationsMask !== "number") return null;
+  const items: CDPDragDataItem[] = [];
+  for (const raw of candidate.items) {
+    if (!raw || typeof raw !== "object") return null;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.mimeType !== "string" || typeof item.data !== "string") return null;
+    items.push({
+      mimeType: item.mimeType,
+      data: item.data,
+      ...(typeof item.title === "string" ? { title: item.title } : {}),
+      ...(typeof item.baseURL === "string" ? { baseURL: item.baseURL } : {}),
+    });
+  }
+  const files = Array.isArray(candidate.files)
+    ? candidate.files.filter((file): file is string => typeof file === "string")
+    : undefined;
+  return { items, ...(files ? { files } : {}), dragOperationsMask: candidate.dragOperationsMask };
+}
+
+/**
+ * Capture Chromium's real HTML5 DataTransfer payload while a held mouse move starts a drag.
+ *
+ * Plain mouse packets are timing-sensitive in background tabs: Blink can acknowledge every
+ * packet without promoting the gesture to a native drag, so callers see success but no drop.
+ * CDP's drag interception hands us the exact payload created by the page's dragstart handler;
+ * the caller can then drive dragEnter/dragOver/drop deterministically. Older Chromium builds that
+ * do not expose the experimental interception command return null and keep the mouse fallback.
+ */
+async function captureNativeDragData(
+  tabId: number,
+  trigger: () => Promise<void>,
+): Promise<CDPDragData | null> {
+  let resolveDrag: (data: CDPDragData | null) => void = () => {};
+  const intercepted = new Promise<CDPDragData | null>((resolve) => { resolveDrag = resolve; });
+  const listener = (source: chrome.debugger.Debuggee, method: string, params?: object) => {
+    if (source.tabId !== tabId || method !== "Input.dragIntercepted") return;
+    const data = asCDPDragData((params as { data?: unknown } | undefined)?.data);
+    if (data) resolveDrag(data);
+  };
+
+  chrome.debugger.onEvent.addListener(listener);
+  let interceptionEnabled = false;
+  try {
+    try {
+      await sendCDPCommand({ tabId }, "Input.setInterceptDrags", { enabled: true }, 0, 2000);
+      interceptionEnabled = true;
+    } catch { /* experimental command unavailable — use the mouse fallback */ }
+
+    await trigger();
+    if (!interceptionEnabled) return null;
+    return await Promise.race([
+      intercepted,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 750)),
+    ]);
+  } finally {
+    chrome.debugger.onEvent.removeListener(listener);
+    if (interceptionEnabled) {
+      await sendCDPCommand({ tabId }, "Input.setInterceptDrags", { enabled: false }, 0, 2000).catch(() => {});
+    }
+  }
+}
+
 function buildModifiers(opts: { ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean }): number {
   return (opts.alt ? 1 : 0) | (opts.ctrl ? 2 : 0) | (opts.meta ? 4 : 0) | (opts.shift ? 8 : 0);
 }
@@ -3057,15 +4505,18 @@ async function dispatchClick(tabId: number, x: number, y: number, options: Mouse
   const zx = Math.round(x * zoom);
   const zy = Math.round(y * zoom);
   await ensureDebugger(tabId);
-  await sendCDPCommand({ tabId }, "Input.dispatchMouseEvent", {
-    type: "mouseMoved", x: zx, y: zy, button: "none", clickCount: 0, modifiers: effectiveMods,
-  }, 0);
-  await sendCDPCommand({ tabId }, "Input.dispatchMouseEvent", {
-    type: "mousePressed", x: zx, y: zy, button, clickCount, modifiers: effectiveMods,
-  }, 0);
-  await sendCDPCommand({ tabId }, "Input.dispatchMouseEvent", {
-    type: "mouseReleased", x: zx, y: zy, button, clickCount, modifiers: effectiveMods,
-  }, 0);
+  // The press/release pair has to reach the page uninterrupted — see withTabInputLock.
+  return withTabInputLock(tabId, async () => {
+    await sendCDPCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: zx, y: zy, button: "none", clickCount: 0, modifiers: effectiveMods,
+    }, 0);
+    await sendCDPCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x: zx, y: zy, button, clickCount, modifiers: effectiveMods,
+    }, 0);
+    await sendCDPCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: zx, y: zy, button, clickCount, modifiers: effectiveMods,
+    }, 0);
+  });
 }
 
 // Default: atomic Input.insertText — no double-character bug on SPAs.
@@ -3300,7 +4751,7 @@ async function waitForSelector(
 // --- CDP Element Visibility Pipeline (AH-4) ---
 
 // Resolve CSS selector to CDP remote object ID
-// Uses activeFrameId's contextId when set for implicit frame targeting
+// Uses the target tab's activeFrameId's contextId when set for implicit frame targeting
 // Parse text selector syntax: "text=Continue" or "button >> text=Continue"
 function resolveTextSelector(selector: string): string {
   // ">> text=X" suffix: "button >> text=Continue" → find button containing text
@@ -3734,7 +5185,7 @@ async function handleCommandWithRecording(command: any): Promise<any> {
         }
         return { type: "response", id, success: false, error: "Recording already active. Stop the current recording first." };
       }
-      const tabId = await requireDebuggerTab();
+      const tabId = await requireDebuggerTab(command);
       let tabUrl = "";
       let tabTitle = "";
       try {
@@ -3746,7 +5197,7 @@ async function handleCommandWithRecording(command: any): Promise<any> {
       }
 
       // Ensure network capture is active
-      if (!networkCapturing) {
+      if (capturingTabId === null) {
         await startNetworkCapture(tabId);
       }
 
@@ -3814,7 +5265,7 @@ async function handleCommandWithRecording(command: any): Promise<any> {
         durationSec: Math.round((now - startMs) / 1000),
         pageCount: activeRecording.pages.length,
         interactionCount: activeRecording.totalInteractions,
-        currentPageUrl: activeRecording.currentPageUrl,
+        currentPageUrl: sanitizeUrlValue(activeRecording.currentPageUrl),
       }};
     }
   }
@@ -3905,58 +5356,89 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "pong", id };
 
       case "check_permissions": {
-        // Per-FEATURE permission broker: check EXACTLY the permissions the calling tool declares
-        // it needs — never the whole OPTIONAL_PERMISSIONS set. `nativeMessaging` is optional
-        // because only the native-messaging transport needs it, so users who never use that
-        // transport are never asked for it. It must NEVER be part of a functional tool gate:
-        // bundling it via hasAllPermissions() made every browser tool (browser_snapshot /
-        // browser_wait_for / switch_tab …) intermittently demand a permission it does not use.
-        // Default to ["tabs"] for the current CDP browser primitives when the caller doesn't specify;
-        // future skills pass their own (e.g. clipboardRead) — the extension acquires exactly what's needed.
-        const requested = (Array.isArray(command.permissions) && command.permissions.length > 0)
-          ? (command.permissions as string[])
-          : ["tabs"];
+        // Check exactly the permissions the calling tool declares it needs. The complete optional
+        // surface is granted during onboarding, but feature-specific checks keep runtime failures
+        // precise if a capability is later revoked. This command never opens a Chrome prompt.
+        const target = requestedPermissionTarget(command);
+        const requested = target.permissions ?? [];
         const permissions: Record<string, boolean> = {};
-        const missingPerms: string[] = [];
+        const missing = await missingPermissions(target);
         for (const p of requested) {
-          const ok = await new Promise<boolean>((resolve) => {
-            chrome.permissions.contains({ permissions: [p] }, (g) => resolve(g === true));
-          });
-          permissions[p] = ok;
-          if (!ok) missingPerms.push(p);
+          permissions[p] = !(missing.permissions ?? []).includes(p);
         }
         return { type: "response", id, success: true, data: {
-          granted: missingPerms.length === 0,
+          granted: isComplete(missing),
           permissions,
-          missing: { permissions: missingPerms, origins: [] },
-          required: ["debugger", "storage"],
+          missing,
+          required: REQUIRED_PERMISSIONS,
           optional: OPTIONAL_PERMISSIONS.permissions || [],
           optionalOrigins: OPTIONAL_PERMISSIONS.origins || [],
         }};
       }
 
       case "request_permissions": {
-        const reqGranted = await hasAllPermissions();
-        if (reqGranted) {
+        const target = requestedPermissionTarget(command);
+        const reqMissing = await missingPermissions(target);
+        if (isComplete(reqMissing)) {
           return { type: "response", id, success: true, data: { granted: true, missing: { permissions: [], origins: [] } } };
         }
-        const reqMissing = await getMissingPermissions();
-        await chrome.storage.session.set({ "crawlio:pendingPermissions": reqMissing });
         return { type: "response", id, success: true, data: {
           granted: false,
           missing: reqMissing,
-          instruction: "Click the Crawlio extension icon and grant the requested permissions.",
+          onboardingRequired: true,
+          onboardingUrl: chrome.runtime.getURL("welcome.html"),
+          instruction: "Open Crawlio's dedicated onboarding page, grant all requested access, then retry.",
         }};
       }
 
+      case "robot_training_start":
+      case "recording_start": {
+        const data = await startResidentTraining({
+          ...command,
+          runId: command.runId ?? command.bundleID,
+        });
+        return { type: "response", id, success: true, data };
+      }
+
+      case "robot_training_status":
+      case "recording_status": {
+        const data = await residentTrainingStatus(
+          typeof (command.runId ?? command.bundleID) === "string" ? String(command.runId ?? command.bundleID) : undefined,
+        );
+        return { type: "response", id, success: true, data };
+      }
+
+      case "robot_training_stop":
+      case "recording_stop": {
+        const data = await stopResidentTraining({
+          ...command,
+          runId: command.runId ?? command.bundleID,
+        });
+        return { type: "response", id, success: true, data };
+      }
+
+      case "robot_training_clear":
+      case "recording_clear": {
+        const data = await clearResidentTraining({
+          ...command,
+          runId: command.runId ?? command.bundleID,
+        });
+        return { type: "response", id, success: true, data };
+      }
+
+      case "monitor_page": {
+        const data = await handleResidentMonitorCommand(command);
+        return { type: "response", id, success: true, data };
+      }
+
       case "connect_tab": {
-        await ensureTabPermission(type);
         const targetUrl = command.url as string | undefined;
         const targetTabId = command.tabId as number | undefined;
         const background = command.background === true;
         let tab: chrome.tabs.Tab;
 
         if (targetTabId) {
+          await ensureTabPermission(type);
           try { tab = await chrome.tabs.get(targetTabId); }
           catch { throw new Error(`Tab ${targetTabId} not found`); }
           if (!tab.url?.startsWith("http")) throw new Error(`Tab is not HTTP: ${tab.url}`);
@@ -3965,7 +5447,11 @@ async function handleCommand(command: any): Promise<any> {
           // Convert exact URL to Chrome match pattern for tabs.query
           const parsedUrl = new URL(targetUrl);
           const matchPattern = `${parsedUrl.protocol}//${parsedUrl.host}/*`;
-          const existing = await chrome.tabs.query({ url: matchPattern });
+          // `tabs` only buys metadata/discovery. With no grant, an explicit URL remains fully
+          // usable: create a fresh owned tab instead of prompting merely to deduplicate it.
+          const existing = await hasTabMetadataPermission()
+            ? await chrome.tabs.query({ url: matchPattern })
+            : [];
           // Prefer tab with exact URL match, fall back to first tab on host
           const exactMatch = existing.find(t => {
             if (!t.url) return false;
@@ -3995,15 +5481,29 @@ async function handleCommand(command: any): Promise<any> {
             tab = await chrome.tabs.get(tab.id!);
           }
         } else {
+          await ensureTabPermission(type);
           tab = await getActiveTab();
         }
 
+        // A missing `tabs` grant redacts tab.url/title from chrome.tabs.get(). Crawlio still knows
+        // the explicit URL it was asked to open, so persist that authority instead of turning the
+        // owned tab into an empty-URL connection that the next command mistakes for stale state.
+        const connectedUrl = tab.url || targetUrl || "";
         await chrome.storage.session.set({ "crawlio:connectedTab": {
-          tabId: tab.id!, url: tab.url || "", title: tab.title || "Untitled",
+          tabId: tab.id!, url: connectedUrl, title: tab.title || "Untitled",
           favIconUrl: tab.favIconUrl, windowId: tab.windowId, background,
         }});
 
-        await startNetworkCapture(tab.id!);
+          // A capture already running on another tab makes startNetworkCapture refuse BEFORE it
+          // attaches, which used to leave the connection half-made: crawlio:connectedTab pointed
+          // here while the debugger pointer stayed on the previous tab, so commands split across
+          // two pages. Connecting is the point of this command; capture is a side benefit.
+        // A connection is the primary capture target. Leaving an existing capture on the prior
+        // tab made this command attach the new debugger while Network/Log continued observing the
+        // old page; repeated connects then spent their MCP deadline initializing split state.
+        if (capturingTabId !== null && capturingTabId !== tab.id) await stopNetworkCapture();
+        const capturing = await startNetworkCapture(tab.id!);
+        if (!capturing) await ensureDebugger(tab.id!, true);
         // The connection is already live at this point; a session-storage failure only
         // costs state across a service-worker restart and must not fail the command.
         await persistState().catch(() => {});
@@ -4012,8 +5512,8 @@ async function handleCommand(command: any): Promise<any> {
 
         const domainResult = tabDomainState.get(tab.id!) ?? null;
         return { type: "response", id, success: true, data: {
-          action: "connect_tab", tabId: tab.id, url: tab.url, title: tab.title,
-          windowId: tab.windowId, capturing: true, domainState: domainResult,
+          action: "connect_tab", tabId: tab.id, url: connectedUrl, title: tab.title,
+          windowId: tab.windowId, capturing, domainState: domainResult,
         }};
       }
 
@@ -4021,6 +5521,11 @@ async function handleCommand(command: any): Promise<any> {
         const data = await chrome.storage.session.get("crawlio:connectedTab");
         const conn = data["crawlio:connectedTab"];
         const detachTabId = (conn?.tabId && debuggerAttachedTabId === conn.tabId) ? conn.tabId : null;
+        // Drop the connection's per-tab state whether or not the debugger pointer still
+        // agreed with it. Gating this on detachTabId let a pinned frame or a coverage flag
+        // survive a disconnect and then hold idle release open forever.
+        if (conn?.tabId) clearTabRuntimeState(conn.tabId);
+        if (detachTabId !== null && detachTabId !== conn?.tabId) clearTabRuntimeState(detachTabId);
         if (detachTabId !== null) {
           try { await chrome.debugger.detach({ tabId: detachTabId }); } catch { /* may already be detached */ }
           // Explicit cleanup — onDetach may not fire since we clear debuggerAttachedTabId
@@ -4034,17 +5539,13 @@ async function handleCommand(command: any): Promise<any> {
         stopIdleReleaseAlarm();
         chrome.storage.session.remove(IDLE_RELEASE_KEY);
         debuggerAttachedTabId = null;
-        activeFrameId = null;
         stealthScriptId = null;
         frameworkHookScriptId = null;
         currentSecurityState = null;
         connectionStartTime = null;
         lastCommandTime = null;
-        networkCapturing = false;
-        cssCoverageActive = false;
-        jsCoverageActive = false;
+        capturingTabId = null;
         consoleLogs = [];
-        mainDocResponseHeaders = {};
         networkEntries.clear();
         wsConnections.clear();
         swRegistrations.clear();
@@ -4150,7 +5651,8 @@ async function handleCommand(command: any): Promise<any> {
           connected: !!conn?.tabId,
           connectedTab: conn || null,
           mcpConnected: wsBridges.size > 0, // native is a token side-channel, not a transport
-          capturing: networkCapturing,
+          capturing: capturingTabId !== null,
+          captureTabId: capturingTabId,
           debuggerAttached: debuggerAttachedTabId !== null,
           debuggerTabId: debuggerAttachedTabId,
           lastCaptureAt: status.lastCaptureAt || null,
@@ -4158,7 +5660,7 @@ async function handleCommand(command: any): Promise<any> {
           connectionAge: connectionStartTime !== null ? now - connectionStartTime : null,
           lastCommandAge: lastCommandTime !== null ? now - lastCommandTime : null,
           pendingCaptures: {
-            network: networkCapturing,
+            network: capturingTabId !== null,
             console: consoleLogs.length > 0,
           },
         }};
@@ -4166,7 +5668,6 @@ async function handleCommand(command: any): Promise<any> {
 
       // Force reconnect — detach and reattach debugger, re-enable all CDP domains
       case "reconnect_tab": {
-        await ensureTabPermission(type);
         const connData = await chrome.storage.session.get("crawlio:connectedTab");
         const conn = connData["crawlio:connectedTab"];
         if (!conn?.tabId) throw new Error("No tab connected — use connect_tab first");
@@ -4188,15 +5689,12 @@ async function handleCommand(command: any): Promise<any> {
         interceptRules.delete(tabId);
         tabDomainState.delete(tabId);
         // Full state reset matching disconnect_tab
-        activeFrameId = null;
+        clearTabRuntimeState(tabId);
         stealthScriptId = null;
         frameworkHookScriptId = null;
         currentSecurityState = null;
-        networkCapturing = false;
-        cssCoverageActive = false;
-        jsCoverageActive = false;
+        capturingTabId = null;
         consoleLogs = [];
-        mainDocResponseHeaders = {};
         networkEntries.clear();
         wsConnections.clear();
         swRegistrations.clear();
@@ -4265,16 +5763,23 @@ async function handleCommand(command: any): Promise<any> {
           for (const d of domainResult.optional) { if (d.success) enabledDomains.add(d.domain.replace(".enable", "")); }
         }
         // Network capture enables additional domains
-        if (networkCapturing) {
+        if (capturingTabId !== null) {
           enabledDomains.add("Network");
           enabledDomains.add("Log");
         }
 
-        type ToolStatus = "available" | "fallback" | "unavailable";
-        const tools: { name: string; status: ToolStatus; note?: string }[] = [];
+        const capsMissing = await getMissingPermissions();
+        const grantedOptionalPermissions = new Set(
+          (OPTIONAL_PERMISSIONS.permissions ?? []).filter((permission) =>
+            !capsMissing.permissions?.includes(permission)),
+        );
+        const tools: { name: string; status: BrowserCapabilityStatus; note?: string }[] = [];
 
-        const addTool = (name: string, status: ToolStatus, note?: string) => {
-          tools.push(note ? { name, status, note } : { name, status });
+        const addTool = (name: string, status: BrowserCapabilityStatus, note?: string) => {
+          tools.push(applyCapabilityPermissions(
+            note ? { name, status, note } : { name, status },
+            grantedOptionalPermissions,
+          ));
         };
 
         if (!isConnected) {
@@ -4283,7 +5788,9 @@ async function handleCommand(command: any): Promise<any> {
             "agent_session_create", "agent_session_list", "agent_session_status", "agent_session_close",
             "agent_session_snapshot", "agent_session_action", "agent_session_batch", "agent_session_artifacts",
             "agent_session_create_tab", "agent_session_claim_tab", "agent_session_name", "agent_session_finalize",
-            "get_user_tabs", "get_user_history", "get_downloads",
+            "get_user_tabs",
+            "robot_training_start", "robot_training_status", "robot_training_stop", "robot_training_clear",
+            "recording_start", "recording_status", "recording_stop", "recording_clear", "monitor_page",
             "extract_site", "get_crawl_status", "get_enrichment", "get_crawled_urls", "enrich_url"];
           for (const name of alwaysAvailable) addTool(name, "available");
           // Everything else unavailable
@@ -4311,14 +5818,19 @@ async function handleCommand(command: any): Promise<any> {
           addTool("disconnect_tab", "available");
           addTool("reconnect_tab", "available");
           addTool("list_tabs", "available");
+          addTool("get_user_tabs", "available");
           addTool("get_connection_status", "available");
           addTool("get_capabilities", "available");
+          for (const name of ["robot_training_start", "robot_training_status", "robot_training_stop", "robot_training_clear",
+            "recording_start", "recording_status", "recording_stop", "recording_clear", "monitor_page"]) {
+            addTool(name, "available", "Extension-resident; collection continues without MCP");
+          }
           for (const name of ["agent_session_create", "agent_session_list", "agent_session_status", "agent_session_close",
             "agent_session_snapshot", "agent_session_action", "agent_session_batch", "agent_session_artifacts"]) {
             addTool(name, "available", "Uses agent-owned tabs and semantic DOM actions without foreground activation");
           }
           for (const name of ["agent_session_create_tab", "agent_session_claim_tab", "agent_session_name", "agent_session_finalize"]) {
-            addTool(name, "available", "Session tab-fleet management (spawn + CDP-drive background tabs via tabs+debugger); the Chrome tab-group chip is best-effort when the optional tabGroups permission is granted");
+            addTool(name, "available", "Logical session-fleet management: spawn and CDP-drive owned background tabs without a tabGroups grant");
           }
 
           // Page/Runtime required — most tools depend on these
@@ -4403,13 +5915,24 @@ async function handleCommand(command: any): Promise<any> {
           // not change between rebuilds within a release.
           extensionVersion: chrome.runtime.getManifest().version,
           buildId: __BUILD_ID__,
+          // Which optional permissions are actually held. Nothing outside the extension could
+          // see this: check_permissions is reachable only on the server's own bridge and is
+          // denied in the execute sandbox, so diagnosing "did the grant land?" meant inferring
+          // it from side effects like whether a native-host process had spawned. Reporting it
+          // here makes a partial grant visible in one call instead of a guess.
+          permissions: {
+            granted: (OPTIONAL_PERMISSIONS.permissions ?? []).filter((p) => !capsMissing.permissions?.includes(p)),
+            missing: capsMissing.permissions ?? [],
+            originsGranted: (OPTIONAL_PERMISSIONS.origins ?? []).filter((o) => !capsMissing.origins?.includes(o)),
+            originsMissing: capsMissing.origins ?? [],
+          },
           connected: isConnected,
           tools,
         }};
       }
 
       case "agent_session_create": {
-        await ensureTabPermission(type);
+        if (typeof command.tabId === "number") await ensureTabPermission(type);
         const data = await createAgentSession(command);
         return { type: "response", id, success: true, data };
       }
@@ -4519,7 +6042,6 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "agent_session_create_tab": {
-        await ensureTabPermission(type);
         const session = await getAgentSession(String(command.sessionId));
         const rawUrl = typeof command.url === "string" && command.url ? command.url : "about:blank";
         const tab = await chrome.tabs.create({ url: rawUrl, active: command.active === true, windowId: session.windowId });
@@ -4556,7 +6078,6 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "agent_session_name": {
-        await ensureTabPermission(type);
         const session = await getAgentSession(String(command.sessionId), false);
         const name = typeof command.name === "string" ? command.name.trim() : "";
         if (!name) throw new Error("name is required");
@@ -4571,7 +6092,6 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "agent_session_finalize": {
-        await ensureTabPermission(type);
         const session = await getAgentSession(String(command.sessionId), false);
         const keepRaw: unknown[] = Array.isArray(command.keep) ? command.keep : [];
         const keep = keepRaw.map((entry: unknown) => {
@@ -4589,7 +6109,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "get_active_tab": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         return {
           type: "response", id, success: true,
           data: { url: tab.url, title: tab.title, tabId: tab.id },
@@ -4597,12 +6117,12 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "detect_framework": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
         }
         await CDP_YIELD();
-        const result = await cdpExecuteFunction<FrameworkDetection>(tab.id!, detectFrameworkInPage, [mainDocResponseHeaders]);
+        const result = await cdpExecuteFunction<FrameworkDetection>(tab.id!, detectFrameworkInPage, [tabRuntime(tab.id!).mainDocResponseHeaders]);
         if (result && result.framework !== "Unknown" && tab.url) {
           dispatchFrameworkTelemetry(tab.url, result);
         }
@@ -4610,7 +6130,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "get_dom_snapshot": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
         }
@@ -4625,9 +6145,20 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "start_network_capture": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
+        }
+        // Capture runs on one tab at a time — its entry, console and websocket buffers are shared,
+        // so a second capture would interleave two tabs into one indistinguishable stream. Say so
+        // rather than reporting "started": the caller would otherwise sit waiting for traffic that
+        // is being recorded against a different tab.
+        if (capturingTabId !== null && capturingTabId !== tab.id) {
+          return {
+            type: "response", id, success: false,
+            error: `Network capture is already running on tab ${capturingTabId}. Stop it with stop_network_capture before capturing tab ${tab.id}.`,
+            problem: "invalid_param",
+          };
         }
         await startNetworkCapture(tab.id!);
         return { type: "response", id, success: true, data: "started" };
@@ -4640,7 +6171,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // WebSocket monitoring — list connections
       case "get_websocket_connections": {
-        await requireDebuggerTab();
+        await requireDebuggerTab(command);
         const statusFilter = command.status as string | undefined;
         const connections = Array.from(wsConnections.values())
           .filter(ws => !statusFilter || ws.status === statusFilter)
@@ -4659,7 +6190,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // WebSocket monitoring — get messages
       case "get_websocket_messages": {
-        await requireDebuggerTab();
+        await requireDebuggerTab(command);
         const limit = (command.limit as number) ?? 50;
         let messages: Array<WebSocketMessage & { requestId?: string; url?: string }> = [];
 
@@ -4689,7 +6220,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // 3 error paths: not found, evicted (0xc8 flag), no data
       case "get_response_body": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         let targetRequestId = command.requestId as string | undefined;
@@ -4738,7 +6269,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "replay_request": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         const targetUrl = command.url as string | undefined;
@@ -4834,7 +6365,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Our improvement: fallback to document.cookie via Runtime.evaluate
       case "get_cookies": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (!tab.url || !tab.url.startsWith("http")) {
           return { type: "response", id, success: true, data: [] };
         }
@@ -4885,7 +6416,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "set_cookie": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const cookieParams: Record<string, unknown> = {
           name: command.name,
@@ -4910,7 +6441,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "delete_cookies": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const deleteParams: Record<string, unknown> = { name: command.name };
         if (command.domain) deleteParams.domain = command.domain;
@@ -4935,7 +6466,7 @@ async function handleCommand(command: any): Promise<any> {
         // "connect to tab A, export bank.com's httpOnly cookies". Now: require an http(s)
         // connected tab, and honor a caller `domain` ONLY when it is the SAME registrable
         // site as that tab. No all-domains path remains.
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (!tab.url || !/^https?:/i.test(tab.url)) {
           throw new Error("export_session_raw requires an http(s) connected tab");
         }
@@ -4969,7 +6500,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Our improvement: fallback to Runtime.evaluate when DOMStorage.enable failed
       case "get_storage": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (!tab.url || !tab.url.startsWith("http")) {
           return { type: "response", id, success: true, data: { items: {}, count: 0 } };
         }
@@ -5027,7 +6558,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "set_storage": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (!tab.url || !tab.url.startsWith("http")) {
           throw new Error("Cannot access storage on non-HTTP pages");
         }
@@ -5062,7 +6593,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "clear_storage": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (!tab.url || !tab.url.startsWith("http")) {
           throw new Error("Cannot access storage on non-HTTP pages");
         }
@@ -5098,7 +6629,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // IndexedDB operations
       case "get_databases": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const origin = command.origin ?? getSecurityOrigin(tab.url ?? "");
 
@@ -5146,7 +6677,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "query_object_store": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const origin = getSecurityOrigin(tab.url ?? "");
         const limit = Math.min(command.limit ?? 25, 100);
@@ -5210,7 +6741,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "clear_database": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const origin = getSecurityOrigin(tab.url ?? "");
 
@@ -5269,7 +6800,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Dialog handling
       case "handle_dialog": {
-        const targetTabId = await requireDebuggerTab();
+        const targetTabId = await requireDebuggerTab(command);
         if (!pendingDialog) {
           throw new Error("No pending dialog");
         }
@@ -5291,13 +6822,18 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "take_screenshot": {
-        const tab = await getConnectedTab();
-        const data = await takeScreenshotHardened(tab.id!);
-        return { type: "response", id, success: true, data: { data } };
+        const tab = await resolveTargetTab(command);
+        const capture = await captureScreenshotHardened(tab.id!, {
+          fullPage: command.fullPage === true,
+          selector: typeof command.selector === "string" ? command.selector : undefined,
+          format: command.format === "png" ? "png" : "jpeg",
+          quality: typeof command.quality === "number" ? command.quality : undefined,
+        });
+        return { type: "response", id, success: true, data: capture };
       }
 
       case "capture_page": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
         }
@@ -5313,10 +6849,10 @@ async function handleCommand(command: any): Promise<any> {
         // Parallel enrichment: framework detection, DOM snapshot, cookies run concurrently
         const [fwResult, domResult, cookies] = await Promise.all([
           (async () => {
-            let fw = await cdpExecuteFunction<FrameworkDetection>(tab.id!, detectFrameworkInPage, [mainDocResponseHeaders]);
+            let fw = await cdpExecuteFunction<FrameworkDetection>(tab.id!, detectFrameworkInPage, [tabRuntime(tab.id!).mainDocResponseHeaders]);
             if (!fw || fw.framework === "Unknown") {
               await new Promise(r => setTimeout(r, 300));
-              const retry = await cdpExecuteFunction<FrameworkDetection>(tab.id!, detectFrameworkInPage, [mainDocResponseHeaders]);
+              const retry = await cdpExecuteFunction<FrameworkDetection>(tab.id!, detectFrameworkInPage, [tabRuntime(tab.id!).mainDocResponseHeaders]);
               if (retry && retry.framework !== "Unknown") fw = retry;
             }
             return fw;
@@ -5378,7 +6914,7 @@ async function handleCommand(command: any): Promise<any> {
           return { type: "response", id, success: false, error: "Missing expression" };
         }
         if (expression.length > MAX_EVAL_EXPRESSION_LENGTH) throw new Error(`expression too long (max ${MAX_EVAL_EXPRESSION_LENGTH} chars)`);
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const result = await sendCDPCommand<{
           result: { value?: unknown; type?: string; description?: string };
@@ -5411,7 +6947,7 @@ async function handleCommand(command: any): Promise<any> {
           }
         }
         // Use connected tab so navigate + capture target the same tab
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         try {
           await ensureDebugger(tab.id!);
           // Stop pending load if active
@@ -5430,17 +6966,28 @@ async function handleCommand(command: any): Promise<any> {
           }
         }
         const updated = await chrome.tabs.get(tab.id!);
-        // Refresh stored connectedTab so get_connection_status returns current URL/favicon
-        await chrome.storage.session.set({ "crawlio:connectedTab": {
-          tabId: updated.id!, url: updated.url || "", title: updated.title || "Untitled",
-          favIconUrl: updated.favIconUrl, windowId: updated.windowId,
-        }});
+        // Refresh metadata only when navigating the pinned connection. Preserve `background`:
+        // dropping it here turns the next synthetic key/mouse command into a foreground action
+        // and steals the user's Chrome focus. An explicitly targeted secondary tab must not move
+        // the pin either.
+        const navConnectionData = await chrome.storage.session.get("crawlio:connectedTab");
+        const navConnection = navConnectionData["crawlio:connectedTab"];
+        const navigatedUrl = updated.url || rawUrl;
+        if (navConnection?.tabId === updated.id) {
+          await chrome.storage.session.set({ "crawlio:connectedTab": {
+            ...navConnection,
+            tabId: updated.id!, url: navigatedUrl, title: updated.title || navConnection.title || "Untitled",
+            favIconUrl: updated.favIconUrl, windowId: updated.windowId,
+          }});
+        }
         // Auto-snapshot after navigation
         let snapshot: string | undefined;
-        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
+        // Navigation is the primary action. Keep its optional convenience snapshot bounded so a
+        // slow AX tree cannot consume the entire MCP navigation deadline.
+        try { snapshot = (await generateAriaSnapshot(tab.id!, {}, 5000)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
-          data: { action: "navigate", url: updated.url, title: updated.title, snapshot },
+          data: { action: "navigate", url: navigatedUrl, title: updated.title, snapshot },
         };
       }
 
@@ -5455,7 +7002,7 @@ async function handleCommand(command: any): Promise<any> {
         const button = (command.button as "left" | "right" | "middle") || undefined;
         const mods = command.modifiers as { ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean } | undefined;
         const clickMods = mods ? buildModifiers(mods) : 0;
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
 
         let x: number, y: number;
@@ -5498,7 +7045,7 @@ async function handleCommand(command: any): Promise<any> {
         const typeModBits = typeMods ? buildModifiers(typeMods) : 0;
         if (!selector && !ref) throw new Error("selector or ref is required");
         if (text === undefined || text === null) throw new Error("text is required");
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
 
         if (ref) {
@@ -5536,7 +7083,7 @@ async function handleCommand(command: any): Promise<any> {
         if (!key) throw new Error("key is required");
         const keyMods = command.modifiers as { ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean } | undefined;
         const keyModBits = keyMods ? buildModifiers(keyMods) : 0;
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
         await dispatchKey(tab.id!, key, keyModBits);
         await waitForStableDOM(tab.id!);
@@ -5554,7 +7101,7 @@ async function handleCommand(command: any): Promise<any> {
         if (!selector && !ref) throw new Error("selector or ref is required");
         const hoverMods = command.modifiers as { ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean } | undefined;
         const hoverModBits = hoverMods ? buildModifiers(hoverMods) : 0;
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
         const zoom = await getZoomFactor(tab.id!);
 
@@ -5588,7 +7135,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "browser_scroll": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         const deltaX = (command.deltaX as number) ?? 0;
         const deltaY = (command.deltaY as number) ?? 0;
         const selector = command.selector as string | undefined;
@@ -5668,7 +7215,7 @@ async function handleCommand(command: any): Promise<any> {
         const selector = command.selector as string | undefined;
         const ref = command.ref as string | undefined;
         if (!selector && !ref) throw new Error("selector or ref is required");
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
         const dblZoom = await getZoomFactor(tab.id!);
 
@@ -5676,18 +7223,21 @@ async function handleCommand(command: any): Promise<any> {
           const zx = Math.round(cx * dblZoom);
           const zy = Math.round(cy * dblZoom);
           await ensureDebugger(tab.id!);
-          await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-            type: "mousePressed", x: zx, y: zy, button: "left", clickCount: 1,
-          }, 0);
-          await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-            type: "mouseReleased", x: zx, y: zy, button: "left", clickCount: 1,
-          }, 0);
-          await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-            type: "mousePressed", x: zx, y: zy, button: "left", clickCount: 2,
-          }, 0);
-          await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-            type: "mouseReleased", x: zx, y: zy, button: "left", clickCount: 2,
-          }, 0);
+          // Four events that only mean "double click" in sequence — see withTabInputLock.
+          return withTabInputLock(tab.id!, async () => {
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+              type: "mousePressed", x: zx, y: zy, button: "left", clickCount: 1,
+            }, 0);
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+              type: "mouseReleased", x: zx, y: zy, button: "left", clickCount: 1,
+            }, 0);
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+              type: "mousePressed", x: zx, y: zy, button: "left", clickCount: 2,
+            }, 0);
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+              type: "mouseReleased", x: zx, y: zy, button: "left", clickCount: 2,
+            }, 0);
+          });
         }
 
         let x: number, y: number;
@@ -5715,29 +7265,39 @@ async function handleCommand(command: any): Promise<any> {
         if (!from && !refFrom) throw new Error("from selector or refFrom is required");
         if (!to && !refTo) throw new Error("to selector or refTo is required");
         const steps = (command.steps as number) ?? 10;
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
         const dragZoom = await getZoomFactor(tab.id!);
 
         // Resolve start coordinates
         let fx: number, fy: number;
+        let fromObjectId: string | undefined;
         if (refFrom) {
           ({ x: fx, y: fy } = await resolveAriaRef(tab.id!, refFrom));
         } else {
           const fromPrepared = await prepareElementForInteraction(tab.id!, from!);
+          fromObjectId = fromPrepared.objectId;
           fx = fromPrepared.x;
           fy = fromPrepared.y;
         }
 
         // Resolve end coordinates
         let tx: number, ty: number;
+        let toObjectId: string | undefined;
         if (refTo) {
           ({ x: tx, y: ty } = await resolveAriaRef(tab.id!, refTo));
         } else {
           const toPrepared = await prepareElementForInteraction(tab.id!, to!);
+          toObjectId = toPrepared.objectId;
           tx = toPrepared.x;
           ty = toPrepared.y;
         }
+
+        // Preparing the destination may scroll the document after the source coordinates were
+        // measured. Re-read both boxes in the final viewport so the press cannot land on the
+        // source's old position while every CDP packet still reports success.
+        if (fromObjectId) ({ x: fx, y: fy } = await getElementCenter(tab.id!, fromObjectId));
+        if (toObjectId) ({ x: tx, y: ty } = await getElementCenter(tab.id!, toObjectId));
 
         await ensureDebugger(tab.id!);
         const zfx = Math.round(fx * dragZoom);
@@ -5745,22 +7305,68 @@ async function handleCommand(command: any): Promise<any> {
         const ztx = Math.round(tx * dragZoom);
         const zty = Math.round(ty * dragZoom);
 
-        await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-          type: "mousePressed", x: zfx, y: zfy, button: "left", clickCount: 1,
-        }, 0);
-
-        for (let i = 1; i <= steps; i++) {
-          const ratio = i / steps;
-          const mx = Math.round(zfx + (ztx - zfx) * ratio);
-          const my = Math.round(zfy + (zty - zfy) * ratio);
+        // The whole gesture holds the button down; another action landing between the press and
+        // the release would release it early and drop the payload. See withTabInputLock.
+        await withTabInputLock(tab.id!, async () => {
+          // Give Chrome a rendered mouse-over frame before pressing, then yield between held moves.
+          // Back-to-back CDP packets can finish before Blink promotes the gesture to HTML5 drag
+          // state, making the command report success without a dragstart/drop pair.
+          const waitForDragFrame = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
           await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-            type: "mouseMoved", x: mx, y: my, button: "left",
+            type: "mouseMoved", x: zfx, y: zfy, button: "none", buttons: 0,
           }, 0);
-        }
+          await waitForDragFrame();
 
-        await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
-          type: "mouseReleased", x: ztx, y: zty, button: "left", clickCount: 1,
-        }, 0);
+          await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+            type: "mousePressed", x: zfx, y: zfy, button: "left", buttons: 1, clickCount: 1, force: 0.5,
+          }, 0);
+          await waitForDragFrame();
+
+          const pointAt = (step: number) => {
+            const ratio = step / steps;
+            return {
+              x: Math.round(zfx + (ztx - zfx) * ratio),
+              y: Math.round(zfy + (zty - zfy) * ratio),
+            };
+          };
+          const first = pointAt(1);
+          const dragData = await captureNativeDragData(tab.id!, async () => {
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+              type: "mouseMoved", x: first.x, y: first.y, button: "left", buttons: 1, force: 0.5,
+            }, 0);
+            await waitForDragFrame();
+          });
+
+          if (dragData) {
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchDragEvent", {
+              type: "dragEnter", x: first.x, y: first.y, data: dragData, modifiers: 0,
+            }, 0);
+            for (let i = 2; i <= steps; i++) {
+              const point = pointAt(i);
+              await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchDragEvent", {
+                type: "dragOver", x: point.x, y: point.y, data: dragData, modifiers: 0,
+              }, 0);
+              await waitForDragFrame();
+            }
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchDragEvent", {
+              type: "drop", x: ztx, y: zty, data: dragData, modifiers: 0,
+            }, 0);
+            return;
+          }
+
+          // Compatibility fallback for Chromium builds without drag interception support.
+          for (let i = 2; i <= steps; i++) {
+            const { x: mx, y: my } = pointAt(i);
+            await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+              type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1, force: 0.5,
+            }, 0);
+            await waitForDragFrame();
+          }
+
+          await sendCDPCommand({ tabId: tab.id! }, "Input.dispatchMouseEvent", {
+            type: "mouseReleased", x: ztx, y: zty, button: "left", buttons: 0, clickCount: 1,
+          }, 0);
+        });
 
         await waitForStableDOM(tab.id!);
         return {
@@ -5775,7 +7381,7 @@ async function handleCommand(command: any): Promise<any> {
         if (!selector) throw new Error("selector is required");
         if (!files || !Array.isArray(files) || files.length === 0) throw new Error("files array is required and must not be empty");
 
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         // Resolve element via existing pattern (returns objectId)
@@ -5816,7 +7422,7 @@ async function handleCommand(command: any): Promise<any> {
         const value = command.value as string;
         if (!selector && !ref) throw new Error("selector or ref is required");
         if (value === undefined || value === null) throw new Error("value is required");
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
 
         let result: any;
@@ -5882,7 +7488,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "browser_intercept": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         const tabId = tab.id!;
         const action = command.action as string;
 
@@ -5905,13 +7511,19 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "wait_for_selector": {
-        const wfsTabId = await requireDebuggerTab();
         const selector = command.selector as string;
         if (!selector) throw new Error("selector is required");
+        const requestedTimeout = Math.max((command.timeout as number) || 30000, 100);
+        const waitStartedAt = Date.now();
+        if (typeof command.tabId === "number") {
+          await waitForExplicitHttpTabCommit(command.tabId, requestedTimeout);
+        }
+        const wfsTabId = await requireDebuggerTab(command);
+        const remainingTimeout = Math.max(100, requestedTimeout - (Date.now() - waitStartedAt));
         const result = await waitForSelector(wfsTabId, {
           selector,
           state: (command.state as WaitState) || undefined,
-          timeout: (command.timeout as number) || undefined,
+          timeout: remainingTimeout,
         });
         return {
           type: "response", id, success: result.found,
@@ -5922,7 +7534,7 @@ async function handleCommand(command: any): Promise<any> {
       // --- Frame execution context tools ---
 
       case "get_frame_tree": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         await populateFrameTree(tab.id!);
         const map = frameTrees.get(tab.id!);
@@ -5936,14 +7548,14 @@ async function handleCommand(command: any): Promise<any> {
           name: f.name,
           securityOrigin: f.securityOrigin,
           contextId: frameContexts.get(tab.id!)?.get(f.id) ?? null,
-          isActive: f.id === activeFrameId,
+          isActive: f.id === tabRuntime(tab.id!).activeFrameId,
         }));
 
-        return { type: "response", id, success: true, data: { action: "get_frame_tree", frames, activeFrameId } };
+        return { type: "response", id, success: true, data: { action: "get_frame_tree", frames, activeFrameId: tabRuntime(tab.id!).activeFrameId } };
       }
 
       case "switch_to_frame": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         const frameId = command.frameId as string;
         if (!frameId) throw new Error("frameId is required");
 
@@ -5959,7 +7571,7 @@ async function handleCommand(command: any): Promise<any> {
           throw new Error(`No execution context for frame ${frameId} — frame may not have loaded yet`);
         }
 
-        activeFrameId = frameId;
+        tabRuntime(tab.id!).activeFrameId = frameId;
         const frame = frameMap.get(frameId)!;
         return { type: "response", id, success: true, data: {
           action: "switch_to_frame", frameId, url: frame.url, name: frame.name, contextId: ctxId,
@@ -5967,14 +7579,14 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "switch_to_main_frame": {
-        activeFrameId = null;
+        const tab = await resolveTargetTab(command);
+        tabRuntime(tab.id!).activeFrameId = null;
         return { type: "response", id, success: true, data: { action: "switch_to_main_frame", activeFrameId: null } };
       }
 
       // --- Tab management ---
 
       case "create_tab": {
-        await ensureTabPermission(type);
         const createUrl = command.url as string | undefined;
         if (!createUrl || typeof createUrl !== "string") {
           throw new Error("url is required");
@@ -6011,8 +7623,10 @@ async function handleCommand(command: any): Promise<any> {
           await chrome.storage.session.set({ "crawlio:connectedTab": {
             tabId: freshTab.id!, url: freshTab.url || "", title: freshTab.title || "Untitled",
             favIconUrl: freshTab.favIconUrl, windowId: freshTab.windowId,
+            background: command.active === false,
           }});
-          await startNetworkCapture(freshTab.id!);
+          const capturingNew = await startNetworkCapture(freshTab.id!);
+          if (!capturingNew) await ensureDebugger(freshTab.id!, true);
           await persistState().catch(() => {});
           handleCommand({ type: "capture_page", id: "auto-connect" }).catch(() => {});
           setDynamicIcon("active", freshTab.id!);
@@ -6022,7 +7636,7 @@ async function handleCommand(command: any): Promise<any> {
             tabId: freshTab.id,
             url: freshTab.url ?? freshTab.pendingUrl ?? createUrl,
             title: freshTab.title ?? "",
-            connected: true,
+            connected: true, capturing: capturingNew,
             domainState: domainResult,
           }};
         }
@@ -6036,27 +7650,25 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "close_tab": {
-        await ensureTabPermission(type);
         const closeTabId = command.tabId;
         if (typeof closeTabId !== "number" || !Number.isInteger(closeTabId) || closeTabId <= 0) {
           throw new Error("tabId must be a positive integer");
         }
         // If this is the connected tab, disconnect first
+        // A closing tab loses its state whether or not it was the primary one; a non-primary
+        // tab that dies holding coverage would otherwise hold idle release open forever.
+        clearTabRuntimeState(closeTabId);
         if (closeTabId === debuggerAttachedTabId) {
           try { await chrome.debugger.detach({ tabId: closeTabId }); } catch { /* already detached */ }
           attachedTabs.delete(closeTabId);
           debuggerAttachedTabId = null;
-          activeFrameId = null;
           stealthScriptId = null;
           frameworkHookScriptId = null;
           currentSecurityState = null;
           connectionStartTime = null;
           lastCommandTime = null;
-          networkCapturing = false;
-          cssCoverageActive = false;
-          jsCoverageActive = false;
+          capturingTabId = null;
           consoleLogs = [];
-          mainDocResponseHeaders = {};
           networkEntries.clear();
           wsConnections.clear();
           swRegistrations.clear();
@@ -6085,7 +7697,6 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "switch_tab": {
-        await ensureTabPermission(type);
         const switchTabId = command.tabId;
         if (typeof switchTabId !== "number" || !Number.isInteger(switchTabId) || switchTabId <= 0) {
           throw new Error("tabId must be a positive integer");
@@ -6102,7 +7713,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Viewport & device emulation
       case "set_viewport": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         await sendCDPCommand(
           { tabId: tab.id! },
@@ -6123,7 +7734,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "set_user_agent": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         await sendCDPCommand(
           { tabId: tab.id! },
@@ -6134,7 +7745,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "emulate_device": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const profile = DEVICE_PROFILES[command.device];
         if (!profile) {
@@ -6171,7 +7782,7 @@ async function handleCommand(command: any): Promise<any> {
       // Geolocation emulation
       // Emulation.clearGeolocationOverride
       case "set_geolocation": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         // If no coordinates provided, clear the override
@@ -6231,7 +7842,7 @@ async function handleCommand(command: any): Promise<any> {
       // PDF generation
       // Error strings: "No web contents to print", "Printing is not available", "Printing failed"
       case "print_to_pdf": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         const PAPER_SIZES: Record<string, { width: number; height: number }> = {
@@ -6282,7 +7893,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Accessibility tree
       case "get_accessibility_tree": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         const maxDepth = Math.min(Math.max((command.depth as number) ?? 10, 1), 50);
@@ -6307,7 +7918,8 @@ async function handleCommand(command: any): Promise<any> {
           );
         } else {
           const axTreeParams: Record<string, unknown> = { depth: maxDepth };
-          if (activeFrameId) axTreeParams.frameId = activeFrameId;
+          const axFrameId = tabRuntime(tab.id!).activeFrameId;
+            if (axFrameId) axTreeParams.frameId = axFrameId;
           result = await sendCDPCommand(
             { tabId: tab.id! }, "Accessibility.getFullAXTree",
             axTreeParams
@@ -6326,7 +7938,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Performance metrics
       case "get_performance_metrics": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         // CDP Performance.getMetrics — returns {metrics: [{name, value}, ...]}
@@ -6470,7 +8082,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "emulate_network": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
 
         // No args = clear throttling
         if (!command.preset && command.downloadKbps === undefined && command.uploadKbps === undefined && command.latencyMs === undefined) {
@@ -6496,25 +8108,25 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "set_cache_disabled": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         await sendCDPCommand({ tabId: tabId }, "Network.setCacheDisabled", { cacheDisabled: !!command.disabled });
         return { type: "response", id, success: true, data: { cacheDisabled: !!command.disabled } };
       }
 
       case "set_extra_headers": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const headers = command.headers as Record<string, string> ?? {};
         await sendCDPCommand({ tabId: tabId }, "Network.setExtraHTTPHeaders", { headers });
         return { type: "response", id, success: true, data: { headerCount: Object.keys(headers).length } };
       }
 
       case "get_security_state": {
-        await requireDebuggerTab();
+        await requireDebuggerTab(command);
         return { type: "response", id, success: true, data: currentSecurityState ?? { securityState: "unknown", updatedAt: new Date().toISOString() } };
       }
 
       case "ignore_certificate_errors": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         try {
           await sendCDPCommand({ tabId: tabId }, "Security.setIgnoreCertificateErrors", { ignore: !!command.ignore });
           return { type: "response", id, success: true, data: { ignoringCertErrors: !!command.ignore } };
@@ -6525,7 +8137,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Service worker control
       case "list_service_workers": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const registrations = Array.from(swRegistrations.values()).filter(r => !r.isDeleted);
         // If CDP ServiceWorker domain failed, fall back to JS API
         if (registrations.length === 0) {
@@ -6551,7 +8163,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "stop_service_worker": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         try {
           if (command.registrationId) {
             const reg = swRegistrations.get(command.registrationId as string);
@@ -6579,7 +8191,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "bypass_service_worker": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const bypass = !!command.enabled;
         await sendCDPCommand({ tabId: tabId }, "Network.setBypassServiceWorker", { bypass });
         try {
@@ -6594,7 +8206,7 @@ async function handleCommand(command: any): Promise<any> {
       // DOM.removeAttribute, DOM.removeNode) ---
 
       case "set_outer_html": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const html = command.html as string;
         if (!command.dangerous && /<script|<iframe|on[a-z]+\s*=/i.test(html)) {
           return { type: "response", id, success: false, error: "HTML contains potentially dangerous content (<script>, <iframe>, or event handlers). Set dangerous: true to allow." };
@@ -6605,21 +8217,21 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "set_attribute": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const nodeId = await resolveNodeId(tabId, command.selector as string);
         await sendCDPCommand({ tabId: tabId }, "DOM.setAttributeValue", { nodeId, name: command.name as string, value: command.value as string });
         return { type: "response", id, success: true, data: { action: "set_attribute", selector: command.selector, name: command.name } };
       }
 
       case "remove_attribute": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const nodeId = await resolveNodeId(tabId, command.selector as string);
         await sendCDPCommand({ tabId: tabId }, "DOM.removeAttribute", { nodeId, name: command.name as string });
         return { type: "response", id, success: true, data: { action: "remove_attribute", selector: command.selector, name: command.name } };
       }
 
       case "remove_node": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const nodeId = await resolveNodeId(tabId, command.selector as string);
         await sendCDPCommand({ tabId: tabId }, "DOM.removeNode", { nodeId });
         return { type: "response", id, success: true, data: { action: "remove_node", selector: command.selector } };
@@ -6628,11 +8240,11 @@ async function handleCommand(command: any): Promise<any> {
       // --- CSS Coverage & Pseudo-State ---
 
       case "start_css_coverage": {
-        const tabId = await requireDebuggerTab();
-        if (cssCoverageActive) return { type: "response", id, success: false, error: "CSS coverage already active" };
+        const tabId = await requireDebuggerTab(command);
+        if (tabRuntime(tabId).cssCoverageActive) return { type: "response", id, success: false, error: "CSS coverage already active" };
         try {
           await sendCDPCommand({ tabId: tabId }, "CSS.startRuleUsageTracking", {});
-          cssCoverageActive = true;
+          tabRuntime(tabId).cssCoverageActive = true;
           return { type: "response", id, success: true, data: { action: "start_css_coverage" } };
         } catch {
           return { type: "response", id, success: false, error: "CSS domain unavailable via chrome.debugger — CSS coverage tracking is not supported from extensions" };
@@ -6640,18 +8252,18 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "stop_css_coverage": {
-        const tabId = await requireDebuggerTab();
-        if (!cssCoverageActive) return { type: "response", id, success: false, error: "CSS coverage not active" };
+        const tabId = await requireDebuggerTab(command);
+        if (!tabRuntime(tabId).cssCoverageActive) return { type: "response", id, success: false, error: "CSS coverage not active" };
         let coverageResult: { ruleUsage: Array<{ styleSheetId: string; startOffset: number; endOffset: number; used: boolean }> } = { ruleUsage: [] };
         try {
           coverageResult = await sendCDPCommand<typeof coverageResult>(
             { tabId: tabId }, "CSS.stopRuleUsageTracking", {}
           );
         } catch {
-          cssCoverageActive = false;
+          tabRuntime(tabId).cssCoverageActive = false;
           return { type: "response", id, success: false, error: "CSS domain unavailable via chrome.debugger — cannot retrieve coverage results" };
         }
-        cssCoverageActive = false;
+        tabRuntime(tabId).cssCoverageActive = false;
         const rawRules = coverageResult.ruleUsage ?? [];
         // Summarize per-stylesheet (match JS coverage pattern)
         const sheetMap = new Map<string, { totalBytes: number; usedBytes: number }>();
@@ -6685,19 +8297,19 @@ async function handleCommand(command: any): Promise<any> {
       // --- JS Code Coverage ---
 
       case "start_js_coverage": {
-        const tabId = await requireDebuggerTab();
-        if (jsCoverageActive) return { type: "response", id, success: false, error: "JS coverage already active" };
+        const tabId = await requireDebuggerTab(command);
+        if (tabRuntime(tabId).jsCoverageActive) return { type: "response", id, success: false, error: "JS coverage already active" };
         await sendCDPCommand({ tabId: tabId }, "Profiler.startPreciseCoverage", {
           callCount: true,
           detailed: !!(command as any).detailed,
         });
-        jsCoverageActive = true;
+        tabRuntime(tabId).jsCoverageActive = true;
         return { type: "response", id, success: true, data: { action: "start_js_coverage", detailed: !!(command as any).detailed } };
       }
 
       case "stop_js_coverage": {
-        const tabId = await requireDebuggerTab();
-        if (!jsCoverageActive) return { type: "response", id, success: false, error: "JS coverage not active" };
+        const tabId = await requireDebuggerTab(command);
+        if (!tabRuntime(tabId).jsCoverageActive) return { type: "response", id, success: false, error: "JS coverage not active" };
         let jsCovResult: { result: Array<{ scriptId: string; url: string; functions: Array<{ functionName: string; ranges: Array<{ startOffset: number; endOffset: number; count: number }>; isBlockCoverage: boolean }> }> } = { result: [] };
         try {
           jsCovResult = await sendCDPCommand<typeof jsCovResult>(
@@ -6705,7 +8317,7 @@ async function handleCommand(command: any): Promise<any> {
           );
           await sendCDPCommand({ tabId: tabId }, "Profiler.stopPreciseCoverage", {});
         } finally {
-          jsCoverageActive = false;
+          tabRuntime(tabId).jsCoverageActive = false;
         }
         // Summarize per-script coverage (raw data can be very large)
         const scripts = (jsCovResult.result ?? []).map((script) => {
@@ -6742,7 +8354,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "get_computed_style": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const selector = command.selector as string;
         const filterProps = Array.isArray(command.properties) && command.properties.length > 0
           ? (command.properties as string[]).map(p => p.toLowerCase()) : null;
@@ -6783,7 +8395,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "detect_fonts": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const fontSelectors = Array.isArray(command.selectors) && command.selectors.length > 0
           ? (command.selectors as string[]) : ["body", "h1", "h2", "h3", "p", "a", "button", "input", "span"];
         const selectorsJson = JSON.stringify(fontSelectors);
@@ -6903,7 +8515,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "force_pseudo_state": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         try {
           const pseudoNodeId = await resolveNodeId(tabId, command.selector as string);
           await sendCDPCommand({ tabId: tabId }, "CSS.forcePseudoState", {
@@ -6919,7 +8531,7 @@ async function handleCommand(command: any): Promise<any> {
       // --- Target & Session Management ---
 
       case "get_targets": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const gtResult = await sendCDPCommand<{ targetInfos: any[] }>({ tabId: tabId }, "Target.getTargets", {});
         let targets = (gtResult.targetInfos ?? []).map((t: any) => ({
           targetId: t.targetId,
@@ -6936,7 +8548,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "attach_to_target": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         const atResult = await sendCDPCommand<{ sessionId: string }>({ tabId: tabId }, "Target.attachToTarget", {
           targetId: command.targetId,
           flatten: true,
@@ -6953,7 +8565,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "create_browser_context": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
 
         if (command.dispose) {
           await sendCDPCommand({ tabId: tabId }, "Target.disposeBrowserContext", {
@@ -6973,7 +8585,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Memory & Heap Analysis
       case "get_dom_counters": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         try {
           const counters = await sendCDPCommand<{ documents: number; nodes: number; jsEventListeners: number }>(
             { tabId: tabId }, "Memory.getDOMCounters", {}
@@ -7002,7 +8614,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Force GC
       case "force_gc": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
 
         try {
           // HeapProfiler.collectGarbage — V8-level GC
@@ -7030,7 +8642,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Heap Snapshot
       case "take_heap_snapshot": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
 
         const chunks: string[] = [];
         const HEAP_SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024; // 50MB
@@ -7098,7 +8710,7 @@ async function handleCommand(command: any): Promise<any> {
 
       // Overlay & Visual Debug
       case "highlight_element": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
 
         if (!command.selector) {
           // Clear highlight — try Overlay first, fall back to removing injected div
@@ -7157,7 +8769,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "show_layout_shifts": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         try {
           await sendCDPCommand({ tabId: tabId }, "Overlay.enable", {});
           await sendCDPCommand({ tabId: tabId }, "Overlay.setShowLayoutShiftRegions", { result: command.enabled });
@@ -7168,7 +8780,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "show_paint_rects": {
-        const tabId = await requireDebuggerTab();
+        const tabId = await requireDebuggerTab(command);
         try {
           await sendCDPCommand({ tabId: tabId }, "Overlay.enable", {});
           await sendCDPCommand({ tabId: tabId }, "Overlay.setShowPaintRects", { result: command.enabled });
@@ -7181,7 +8793,7 @@ async function handleCommand(command: any): Promise<any> {
       case "browser_fill_form": {
         const fields = command.fields as Array<{ ref: string; type?: string; value: string }>;
         if (!fields || !Array.isArray(fields) || fields.length === 0) throw new Error("fields array is required");
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureTabFocused(tab.id!);
         const results: Array<{ ref: string; status: string }> = [];
 
@@ -7231,7 +8843,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "browser_snapshot": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
         }
@@ -7247,7 +8859,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "diff_snapshot": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
         }
@@ -7379,7 +8991,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "inspect_datalayer": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
@@ -7395,7 +9007,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "inject_serp_overlay": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR, problem: "opt_out" };
@@ -7413,7 +9025,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "clear_serp_overlay": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
         const result = await cdpExecuteFunction<{ cleared: boolean; reason?: string }>(
           tab.id!, removeSerpOverlay, []
@@ -7450,7 +9062,7 @@ async function handleCommand(command: any): Promise<any> {
       }
 
       case "compare_raw_rendered": {
-        const tab = await getConnectedTab();
+        const tab = await resolveTargetTab(command);
         await ensureDebugger(tab.id!);
 
         // 1. Find the main document request in networkEntries
@@ -7633,9 +9245,13 @@ async function handleCommand(command: any): Promise<any> {
     const msg = e instanceof Error ? e.message : String(e);
     const response: Record<string, unknown> = { type: "response", id, success: false, error: msg };
     if (e instanceof PermissionError) {
+      // Code-mode bridge commands bypass the MCP server's full-mode preflight, so preserve the
+      // same structured onboarding requirement here without staging UI or requesting a grant.
       response.permission_required = true;
       response.missing = e.missing;
       response.suggestion = e.suggestion;
+      response.onboarding_required = true;
+      response.onboarding_url = chrome.runtime.getURL("welcome.html");
       response.problem = "permission_denied";
     } else {
       response.problem = classifyProblem(e, msg);
@@ -7831,7 +9447,11 @@ async function findCursorInteractiveElements(tabId: number): Promise<Array<{ sel
   }
 }
 
-async function generateAriaSnapshot(tabId: number, options: SnapshotOptions = {}): Promise<{ snapshot: string; estimatedTokens: number }> {
+async function generateAriaSnapshot(
+  tabId: number,
+  options: SnapshotOptions = {},
+  treeCommandTimeoutMs = 15000,
+): Promise<{ snapshot: string; estimatedTokens: number }> {
   await ensureDebugger(tabId);
 
   await sendCDPCommand({ tabId }, "Accessibility.enable", {}, 0, 3000);
@@ -7856,14 +9476,15 @@ async function generateAriaSnapshot(tabId: number, options: SnapshotOptions = {}
     );
     const partialResult = await sendCDPCommand<{ nodes: Array<any> }>(
       { tabId }, "Accessibility.getPartialAXTree",
-      { backendNodeId: descResult.node.backendNodeId, fetchRelatives: true }, 0, 15000
+      { backendNodeId: descResult.node.backendNodeId, fetchRelatives: true }, 0, treeCommandTimeoutMs
     );
     nodes = partialResult.nodes;
   } else {
     const axParams: Record<string, unknown> = { depth: 50 };
-    if (activeFrameId) axParams.frameId = activeFrameId;
+    const ariaFrameId = tabRuntime(tabId).activeFrameId;
+    if (ariaFrameId) axParams.frameId = ariaFrameId;
     const result = await sendCDPCommand<{ nodes: Array<any> }>(
-      { tabId }, "Accessibility.getFullAXTree", axParams, 0, 15000
+      { tabId }, "Accessibility.getFullAXTree", axParams, 0, treeCommandTimeoutMs
     );
     nodes = result.nodes;
   }
@@ -8384,16 +10005,23 @@ async function ensureDebugger(tabId: number, makePrimary = false): Promise<Domai
 
   // Optional domains — log failure, continue
   const optionalDomains = ["DOMStorage.enable", "Performance.enable"];
-  for (const domain of optionalDomains) {
+  const optionalResults = await Promise.all(optionalDomains.map(async (domain) => {
     try {
-      await sendCDPCommand({ tabId }, domain, domain === "Performance.enable" ? { timeDomain: "timeTicks" } : {}, 0);
-      result.optional.push({ domain, success: true });
+      await sendCDPCommand(
+        { tabId },
+        domain,
+        domain === "Performance.enable" ? { timeDomain: "timeTicks" } : {},
+        0,
+        3000,
+      );
+      return { domain, success: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      result.optional.push({ domain, success: false, error: msg });
       if (__DEV__) console.warn(`[Crawlio] Optional domain ${domain} failed:`, msg);
+      return { domain, success: false, error: msg };
     }
-  }
+  }));
+  result.optional.push(...optionalResults);
 
   tabDomainState.set(tabId, mergeDomainState(tabDomainState.get(tabId), result));
 
@@ -8424,12 +10052,12 @@ async function disableInterception(tabId: number): Promise<void> {
 // tab's injected scripts were NOT reinstalled.
 async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: boolean; makePrimary?: boolean } = {}): Promise<boolean> {
   // Double-start guard — reject if already capturing
-  if (networkCapturing) {
-    if (__DEV__) console.log("[Crawlio] Network capture already active, skipping start");
+  if (capturingTabId !== null) {
+    if (__DEV__) console.log(`[Crawlio] Network capture already active on tab ${capturingTabId}, skipping start`);
     return false;
   }
   // Claim synchronously BEFORE any await to prevent double-start race
-  networkCapturing = true;
+  capturingTabId = tabId;
 
   try {
     // Network capture is normally the foreground/primary tab. An idle resume passes false
@@ -8439,7 +10067,7 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
 
   // Initialize capture state BEFORE Network.enable so events are not dropped.
   // as soon as Network.enable returns. The global chrome.debugger.onEvent listener
-  // (registered at module scope) checks networkCapturing before processing.
+  // (registered at module scope) matches events against capturingTabId before processing.
   // Resuming after an idle release keeps the history captured before the detach.
   if (!opts.preserveBuffers) {
     networkEntries.clear();
@@ -8448,12 +10076,17 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
     consoleLogs = [];
     consoleWriteIndex = 0;
     networkCaptureSeq = 0;
+    // IDB is the restart journal for the current live capture, not a cross-session archive.
+    // Await the clear before enabling Network so the first new event cannot be erased by it.
+    await clearLiveCaptureStreams().catch((error) => {
+      console.warn("[Crawlio] Could not reset live capture journal; restart recovery may be incomplete:", error);
+    });
   }
-  mainDocResponseHeaders = {};
+  tabRuntime(tabId).mainDocResponseHeaders = {};
 
   // --- Required domains: must succeed for capture to work ---
   // init order: Page.enable → Network.enable → Runtime.enable
-  // If any required enable fails, reset networkCapturing to avoid stuck state.
+  // If any required enable fails, release capturingTabId to avoid stuck state.
   const captureDomainResult: DomainEnableResult = { required: [], optional: [], allRequiredOk: true };
   const captureRequiredDomains = ["Page.enable", "Network.enable", "Runtime.enable", "Log.enable"];
   try {
@@ -8466,7 +10099,7 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
       }
     }
   } catch (err) {
-    networkCapturing = false;
+    capturingTabId = null;
     captureDomainResult.allRequiredOk = false;
     const msg = err instanceof Error ? err.message : String(err);
     captureDomainResult.required.push({ domain: captureRequiredDomains[captureDomainResult.required.length], success: false, error: msg });
@@ -8485,16 +10118,17 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
     ["IndexedDB", "IndexedDB.enable", {}],
     ["Profiler", "Profiler.enable", {}],
   ];
-  for (const [label, command, cmdParams] of optionalDomains) {
+  const captureOptionalResults = await Promise.all(optionalDomains.map(async ([label, command, cmdParams]) => {
     try {
-      await sendCDPCommand({ tabId }, command, cmdParams, 0);
-      captureDomainResult.optional.push({ domain: command, success: true });
+      await sendCDPCommand({ tabId }, command, cmdParams, 0, 3000);
+      return { domain: command, success: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      captureDomainResult.optional.push({ domain: command, success: false, error: msg });
       if (__DEV__) console.warn(`[Crawlio] Optional domain ${label} failed:`, err);
+      return { domain: command, success: false, error: msg };
     }
-  }
+  }));
+  captureDomainResult.optional.push(...captureOptionalResults);
   tabDomainState.set(tabId, mergeDomainState(tabDomainState.get(tabId), captureDomainResult));
 
   // Web Vitals injection — PerformanceObserver for LCP/CLS/FID (JS-level, not CDP)
@@ -8517,7 +10151,7 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
     if (entry) window.__crawlioPerf.fid = entry.processingStart - entry.startTime;
   }).observe({ type: "first-input", buffered: true });
 })()`,
-    }, 0);
+    }, 0, 3000);
   } catch (err) {
     if (__DEV__) console.warn("[Crawlio] Web Vitals injection failed:", err);
   }
@@ -8527,13 +10161,13 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
     try {
       const stealthResult = await sendCDPCommand<{ identifier: string }>({ tabId }, "Page.addScriptToEvaluateOnNewDocument", {
         source: STEALTH_SCRIPT,
-      }, 0);
+      }, 0, 3000);
       stealthScriptId = stealthResult?.identifier ?? null;
       // Inject immediately for current page (addScriptToEvaluateOnNewDocument only affects future navigations)
       await sendCDPCommand({ tabId }, "Runtime.evaluate", {
         expression: STEALTH_SCRIPT,
         returnByValue: true,
-      }, 0);
+      }, 0, 3000);
     } catch (err) {
       if (__DEV__) console.warn("[Crawlio] Stealth injection failed:", err);
     }
@@ -8544,7 +10178,7 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
     try {
       const hookResult = await sendCDPCommand<{ identifier: string }>(
         { tabId }, "Page.addScriptToEvaluateOnNewDocument",
-        { source: FRAMEWORK_HOOK_SCRIPT }, 0
+        { source: FRAMEWORK_HOOK_SCRIPT }, 0, 3000
       );
       frameworkHookScriptId = hookResult.identifier;
     } catch { /* non-fatal */ }
@@ -8560,34 +10194,39 @@ async function startNetworkCapture(tabId: number, opts: { preserveBuffers?: bool
   writeStatus({ capturing: true, activeTabId: tabId });
   return true;
   } catch (err) {
-    networkCapturing = false; // release on failure
+    capturingTabId = null; // release on failure
     throw err;
   }
 }
 
 async function stopNetworkCapture(): Promise<any[]> {
-  if (!networkCapturing) {
+  if (capturingTabId === null) {
     if (__DEV__) console.log("[Crawlio] Network capture not active, returning empty");
     return [];
   }
 
-  networkCapturing = false;
-  cssCoverageActive = false;
-  jsCoverageActive = false;
-  mainDocResponseHeaders = {};
+  const stoppedTabId = capturingTabId;
+  capturingTabId = null;
+  // Reset what the capture owned, and nothing else. Clearing the whole tab record here would also
+  // drop activeFrameId, un-pinning a frame the caller chose — stopping a capture is not a reason
+  // to change where subsequent evaluations run.
+  const stopped = tabRuntime(stoppedTabId);
+  stopped.cssCoverageActive = false;
+  stopped.jsCoverageActive = false;
+  stopped.mainDocResponseHeaders = {};
   const entries = Array.from(networkEntries.values()).filter(
     (e): e is NetworkMapEntry & { requestId: string } => !!e.url && !!e.requestId
-  ).map(e => {
-    if (e.requestHeaders) e.requestHeaders = sanitizeValue(e.requestHeaders) as Record<string, string>;
-    if (e.requestBody) e.requestBody = sanitizeValue(e.requestBody) as string;
-    return e;
-  });
+  ).map(sanitizeNetworkEntry);
 
-  if (debuggerAttachedTabId !== null) {
+  // Disable the domains on the tab whose capture is being stopped — not on whichever tab happens
+  // to be primary. The idle-release resume path starts capture without promoting, so the two can
+  // differ, and tearing down Runtime on the wrong tab leaves its frame contexts stale and makes a
+  // later switch_to_frame fail with no visible cause.
+  if (attachedTabs.has(stoppedTabId)) {
     try {
-      await sendCDPCommand({ tabId: debuggerAttachedTabId }, "Network.disable", {}, 0);
-      await sendCDPCommand({ tabId: debuggerAttachedTabId }, "Runtime.disable", {}, 0);
-      await sendCDPCommand({ tabId: debuggerAttachedTabId }, "Log.disable", {}, 0);
+      await sendCDPCommand({ tabId: stoppedTabId }, "Network.disable", {}, 0, 3000);
+      await sendCDPCommand({ tabId: stoppedTabId }, "Runtime.disable", {}, 0, 3000);
+      await sendCDPCommand({ tabId: stoppedTabId }, "Log.disable", {}, 0, 3000);
     } catch { /* domains may already be disabled or detached */ }
   }
 
@@ -8636,7 +10275,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       const map = frameTrees.get(tabId);
       if (map) {
         // Clear activeFrameId if detached frame is the active one
-        if (activeFrameId === frameId) activeFrameId = null;
+        if (tabRuntime(tabId).activeFrameId === frameId) tabRuntime(tabId).activeFrameId = null;
         // Remove frame and all descendants
         const removeRecursive = (fid: string) => {
           const frame = map.get(fid);
@@ -8647,7 +10286,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
           // Also remove context mapping
           frameContexts.get(tabId)?.delete(fid);
           // Clear activeFrameId if a descendant was active
-          if (activeFrameId === fid) activeFrameId = null;
+          if (tabRuntime(tabId).activeFrameId === fid) tabRuntime(tabId).activeFrameId = null;
         };
         // Unlink from parent
         const frame = map.get(frameId);
@@ -8707,7 +10346,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
           if (cid === ctxId) {
             ctxMap.delete(fid);
             // fix: clear activeFrameId if destroyed context was the active frame's
-            if (activeFrameId === fid) activeFrameId = null;
+            if (tabRuntime(tabId).activeFrameId === fid) tabRuntime(tabId).activeFrameId = null;
             break;
           }
         }
@@ -8719,12 +10358,17 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       const tabId = source.tabId!;
       frameContexts.get(tabId)?.clear();
       // fix: all contexts destroyed — activeFrameId is now invalid
-      if (tabId === debuggerAttachedTabId) activeFrameId = null;
+      tabRuntime(tabId).activeFrameId = null;
       break;
     }
 
     // User interaction capture via CDP binding
     case "Runtime.bindingCalled": {
+      if (params.name === RESIDENT_TRAINING_BINDING) {
+        const tabId = source.tabId;
+        if (typeof tabId === "number") await handleResidentTrainingEvent(tabId, params.payload);
+        break;
+      }
       if (params.name !== INTERACTION_BINDING_NAME) break;
       if (!activeRecording) break;
       const tabId = source.tabId!;
@@ -8823,9 +10467,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
     }
 
     case "Network.requestWillBeSent": {
-      if (!networkCapturing) return;
-      // Scope to connected tab only
-      if (source.tabId !== debuggerAttachedTabId) return;
+      if (source.tabId !== capturingTabId) return;
       // Filter chrome-extension:// requests (extension noise)
       if (params.request?.url?.startsWith("chrome-extension://")) return;
       const { requestId, request, timestamp, initiator } = params;
@@ -8854,7 +10496,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.responseReceived": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const { requestId, response } = params;
       const entry = networkEntries.get(requestId);
       if (entry) {
@@ -8863,12 +10505,12 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       }
       // fw-hardening: capture main document headers for framework detection
       if (params.type === "Document") {
-        mainDocResponseHeaders = response.headers || {};
+        tabRuntime(source.tabId!).mainDocResponseHeaders = response.headers || {};
       }
       break;
     }
     case "Network.loadingFinished": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const { requestId, timestamp, encodedDataLength } = params;
       const entry = networkEntries.get(requestId);
       if (entry) {
@@ -8880,7 +10522,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.dataReceived": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const { requestId, dataLength } = params;
       const entry = networkEntries.get(requestId);
       if (entry) {
@@ -8889,7 +10531,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.loadingFailed": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const { requestId } = params;
       const entry = networkEntries.get(requestId);
       if (entry) {
@@ -8902,7 +10544,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
 
     // --- WebSocket monitoring ---
     case "Network.webSocketCreated": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const { requestId, url, initiator } = params;
       // FIFO eviction on connection count
       if (wsConnections.size >= WS_MAX_CONNECTIONS) {
@@ -8928,13 +10570,13 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.webSocketHandshakeResponseReceived": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const ws = wsConnections.get(params.requestId);
       if (ws) ws.status = "open";
       break;
     }
     case "Network.webSocketFrameSent": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const wsSent = wsConnections.get(params.requestId);
       if (wsSent) {
         if (wsSent.messages.length >= WS_MAX_MESSAGES_PER_CONNECTION) wsSent.messages.shift();
@@ -8948,7 +10590,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.webSocketFrameReceived": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const wsRecv = wsConnections.get(params.requestId);
       if (wsRecv) {
         if (wsRecv.messages.length >= WS_MAX_MESSAGES_PER_CONNECTION) wsRecv.messages.shift();
@@ -8962,7 +10604,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.webSocketFrameError": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const wsErr = wsConnections.get(params.requestId);
       if (wsErr) {
         wsErr.status = "error";
@@ -8971,7 +10613,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
       break;
     }
     case "Network.webSocketClosed": {
-      if (!networkCapturing) return;
+      if (source.tabId !== capturingTabId) return;
       const wsClosed = wsConnections.get(params.requestId);
       if (wsClosed) {
         wsClosed.status = "closed";
@@ -9071,7 +10713,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
         url: entry.url,
         lineNumber: entry.lineNumber,
       });
-      if (networkCapturing) flushConsoleToStorage();
+      if (capturingTabId !== null) flushConsoleToStorage();
       break;
     }
     case "Runtime.consoleAPICalled": {
@@ -9093,7 +10735,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
         url: stackTrace?.callFrames?.[0]?.url,
         lineNumber: stackTrace?.callFrames?.[0]?.lineNumber,
       });
-      if (networkCapturing) flushConsoleToStorage();
+      if (capturingTabId !== null) flushConsoleToStorage();
       break;
     }
 
@@ -9167,6 +10809,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     attachedTabs.delete(source.tabId);
     tabDomainState.delete(source.tabId);
     agentCursorInjectedTabs.delete(source.tabId); // re-inject on next attach
+    clearTabRuntimeState(source.tabId);
   }
   if (source.tabId === debuggerAttachedTabId) {
     // Stop recording BEFORE clearing state — recording needs networkEntries/consoleLogs for finalization
@@ -9184,17 +10827,13 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     pendingFileChooser = null;
     if (dialogAutoTimeout) { clearTimeout(dialogAutoTimeout); dialogAutoTimeout = null; }
     debuggerAttachedTabId = null;
-    activeFrameId = null;
     stealthScriptId = null;
     frameworkHookScriptId = null;
     currentSecurityState = null;
     connectionStartTime = null;
     lastCommandTime = null;
-    networkCapturing = false;
-    cssCoverageActive = false;
-    jsCoverageActive = false;
+    capturingTabId = null;
     consoleLogs = [];
-    mainDocResponseHeaders = {};
     networkEntries.clear();
     wsConnections.clear();
     swRegistrations.clear();
@@ -9234,19 +10873,24 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     requestBridgeDiscovery();
   }
 
-  // Recording: detect page transition + re-inject indicators/capture
-  if (activeRecording && activeRecording.tabId === tabId
-      && url && url !== activeRecording.currentPageUrl) {
-    startNewRecordingPage(url, tab.title);
+  // Recording: detect page transition + re-inject indicators/capture. `browser_navigate` may have
+  // already advanced currentPageUrl before this load-complete event, so reinjection cannot live
+  // inside the URL-changed branch. The old placement left manual interactions uncaptured after an
+  // MCP-driven navigation because the per-tab installed flag survived the document that owned it.
+  if (activeRecording && activeRecording.tabId === tabId) {
+    if (url && url !== activeRecording.currentPageUrl) startNewRecordingPage(url, tab.title);
     showRecordingIndicator(tabId);
+    interactionCaptureActive.delete(tabId);
     setupInteractionCapture(tabId).catch(() => {});
   }
 
   // Refresh connectedTab storage so get_connection_status returns current URL/favicon
   if (debuggerAttachedTabId === tabId) {
     const connData = await chrome.storage.session.get("crawlio:connectedTab");
-    if (connData["crawlio:connectedTab"]?.tabId === tabId) {
+    const conn = connData["crawlio:connectedTab"];
+    if (conn?.tabId === tabId) {
       await chrome.storage.session.set({ "crawlio:connectedTab": {
+        ...conn,
         tabId: tab.id!, url: tab.url || "", title: tab.title || "Untitled",
         favIconUrl: tab.favIconUrl, windowId: tab.windowId,
       }});
@@ -9254,7 +10898,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 
   // Clear IDB on navigation only when actively capturing — avoids wiping data for idle connections
-  if (debuggerAttachedTabId === tabId && networkCapturing) {
+  if (capturingTabId === tabId) {
     clearAll().catch(() => setTimeout(() => clearAll().catch(() => {}), 500));
   }
 
@@ -9263,7 +10907,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     let framework: any = null;
     if (debuggerAttachedTabId === tabId) {
       try {
-        framework = await cdpExecuteFunction<FrameworkDetection>(tabId, detectFrameworkInPage, [mainDocResponseHeaders]);
+        framework = await cdpExecuteFunction<FrameworkDetection>(tabId, detectFrameworkInPage, [tabRuntime(tabId).mainDocResponseHeaders]);
       } catch { /* best effort */ }
     }
 
@@ -9387,6 +11031,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const data = await chrome.storage.session.get("crawlio:connectedTab");
       const conn = data["crawlio:connectedTab"];
+      if (conn?.tabId) clearTabRuntimeState(conn.tabId);
       if (conn?.tabId && debuggerAttachedTabId === conn.tabId) {
         // Explicit cleanup — onDetach won't fire correctly since we clear debuggerAttachedTabId
         frameTrees.delete(conn.tabId);
@@ -9399,17 +11044,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (dialogAutoTimeout) { clearTimeout(dialogAutoTimeout); dialogAutoTimeout = null; }
         try { await chrome.debugger.detach({ tabId: conn.tabId }); } catch { /* may already be detached */ }
         debuggerAttachedTabId = null;
-        activeFrameId = null;
         stealthScriptId = null;
         frameworkHookScriptId = null;
         currentSecurityState = null;
         connectionStartTime = null;
         lastCommandTime = null;
-        networkCapturing = false;
-        cssCoverageActive = false;
-        jsCoverageActive = false;
+        capturingTabId = null;
         consoleLogs = [];
-        mainDocResponseHeaders = {};
         networkEntries.clear();
         wsConnections.clear();
         swRegistrations.clear();
@@ -9510,14 +11151,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       activeBridgePort = null;     // no elected bridge while user-disconnected
       for (const t of identityTimers.values()) clearTimeout(t);
       identityTimers.clear();      // drop pending identity-handshake deadlines
+      // Same reason as closeIncumbent: wsBridges was cleared above, so onclose will not release
+      // these. A user-initiated disconnect must not leave a command waiting on a verdict that is
+      // never coming.
+      for (const p of bridgeTrust.keys()) releaseHandshakeWaiters(p);
       bridgeTrust.clear();         // drop per-port handshake state
       // intentionalClose is a WeakSet keyed by the now-closed sockets — it GCs itself.
 
       // Disconnect native port
       disconnectNative();
 
+      // A resident training run owns its debugger independently of the bridge. Disconnecting MCP
+      // must not destroy the observation the extension promised to continue; explicit MCP
+      // training_stop is the lifecycle control for that data collection.
+      const preserveResidentTraining = activeResidentTrainingRun?.status === "recording";
+      if (!preserveResidentTraining) {
+        tabRuntimeStates.clearAll();
+        tabInputLocks.clear();
+      }
+
       // Detach debugger if attached
-      if (debuggerAttachedTabId) {
+      if (debuggerAttachedTabId && !preserveResidentTraining) {
         const tabId = debuggerAttachedTabId;
         attachedTabs.delete(tabId);
         frameTrees.delete(tabId);
@@ -9530,17 +11184,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (dialogAutoTimeout) { clearTimeout(dialogAutoTimeout); dialogAutoTimeout = null; }
         try { await chrome.debugger.detach({ tabId }); } catch { /* may already be detached */ }
         debuggerAttachedTabId = null;
-        activeFrameId = null;
         stealthScriptId = null;
         frameworkHookScriptId = null;
         currentSecurityState = null;
         connectionStartTime = null;
         lastCommandTime = null;
-        networkCapturing = false;
-        cssCoverageActive = false;
-        jsCoverageActive = false;
+        capturingTabId = null;
         consoleLogs = [];
-        mainDocResponseHeaders = {};
         networkEntries.clear();
         wsConnections.clear();
         swRegistrations.clear();
@@ -9552,10 +11202,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         setTooltip(tabId, "Crawlio");
       }
 
-      await chrome.storage.session.remove("crawlio:connectedTab");
+      if (!preserveResidentTraining) await chrome.storage.session.remove("crawlio:connectedTab");
       await chrome.storage.session.set({ "crawlio:bridgeConnected": false, "crawlio:bridgeCount": 0 });
-      writeStatus({ mcpConnected: false, capturing: false, activeTabId: null });
-      stopKeepalive();
+      writeStatus({
+        mcpConnected: false,
+        capturing: preserveResidentTraining && capturingTabId !== null,
+        activeTabId: preserveResidentTraining ? debuggerAttachedTabId : null,
+      });
+      if (!shouldStayAlive()) stopKeepalive();
       sendResponse({ ok: true });
     })();
     return true;
@@ -9596,6 +11250,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // Alarm-based reconnect safety-net — survives SW restart when setTimeout timers are lost
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (workerSuperseded) return;
+  if (alarm.name.startsWith(RESIDENT_MONITOR_ALARM_PREFIX)) {
+    const monitorId = alarm.name.slice(RESIDENT_MONITOR_ALARM_PREFIX.length);
+    void (async () => {
+      await residentObservationRestorePromise;
+      const job = await getMonitorJob(monitorId);
+      if (!job || job.status !== "active") return;
+      await captureResidentMonitor(job);
+    })().catch((error) => {
+      if (__DEV__) console.warn(`[Crawlio] Resident monitor ${monitorId} failed:`, error);
+    });
+    return;
+  }
   if (alarm.name === IDLE_RELEASE_ALARM) {
     maybeIdleRelease().catch((e) => { if (__DEV__) console.warn("[Crawlio] Idle release check failed:", e); });
     return;
@@ -9616,13 +11283,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // Auto-connect on browser startup (Chrome profile opened)
 chrome.runtime.onStartup.addListener(() => {
-  if (!userDisconnected) {
+  if (!userDisconnected && !workerSuperseded) {
     requestBridgeDiscovery();
   }
 });
 
 // Start connection (probe-first, no ERR_CONNECTION_REFUSED)
 requestBridgeDiscovery();
+residentObservationRestorePromise = restoreResidentObservation().catch((error) => {
+  console.warn("[Crawlio] Resident observation restore failed:", error);
+});
 
 // H11: Migrate all tabId-keyed state when Chrome replaces a tab (prerender/instant navigation)
 chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
@@ -9659,6 +11329,7 @@ chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
   } else {
     attachedTabs.delete(removedTabId);
     tabDomainState.delete(removedTabId);
+    clearTabRuntimeState(removedTabId);
   }
 
   // Debugger attachment is lost on tab replacement
@@ -9667,17 +11338,13 @@ chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
     pendingFileChooser = null;
     if (dialogAutoTimeout) { clearTimeout(dialogAutoTimeout); dialogAutoTimeout = null; }
     debuggerAttachedTabId = null;
-    activeFrameId = null;
     stealthScriptId = null;
     frameworkHookScriptId = null;
     currentSecurityState = null;
     connectionStartTime = null;
     lastCommandTime = null;
-    networkCapturing = false;
-    cssCoverageActive = false;
-    jsCoverageActive = false;
+    capturingTabId = null;
     consoleLogs = [];
-    mainDocResponseHeaders = {};
     networkEntries.clear();
     wsConnections.clear();
     swRegistrations.clear();
@@ -9717,6 +11384,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   tabDomainState.delete(tabId);
   tabKeyboardState.delete(tabId);
   tabAriaState.delete(tabId);
+  clearTabRuntimeState(tabId);
   for (const session of agentSessions.values()) {
     if (session.tabId === tabId && session.status !== "closed") {
       session.status = "closed";
@@ -9745,18 +11413,14 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     if (consoleWriteTimer) { clearTimeout(consoleWriteTimer); consoleWriteTimer = null; }
     try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
     debuggerAttachedTabId = null;
-    activeFrameId = null;
     stealthScriptId = null;
     frameworkHookScriptId = null;
     currentSecurityState = null;
     connectionStartTime = null;
     lastCommandTime = null;
-    networkCapturing = false;
-    cssCoverageActive = false;
-    jsCoverageActive = false;
+    capturingTabId = null;
     consoleLogs = [];
     consoleWriteIndex = 0;
-    mainDocResponseHeaders = {};
     networkEntries.clear();
     wsConnections.clear();
     swRegistrations.clear();
@@ -9787,7 +11451,8 @@ chrome.commands.onCommand.addListener(async (command) => {
           tabId: tab.id, url: tab.url || "", title: tab.title || "Untitled",
           favIconUrl: tab.favIconUrl, windowId: tab.windowId,
         }});
-        await startNetworkCapture(tab.id);
+        const capturingShortcut = await startNetworkCapture(tab.id);
+        if (!capturingShortcut) await ensureDebugger(tab.id, true);
         await persistState().catch(() => {});
         setDynamicIcon("active", tab.id);
         if (__DEV__) console.log(`[Crawlio] Keyboard shortcut: connected to tab ${tab.id}`);

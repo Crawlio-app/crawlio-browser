@@ -14,8 +14,8 @@ describe("describeSurface", () => {
   it("reports the tool surface a client actually receives", async () => {
     const s = await describeSurface();
 
-    expect(s.full).toHaveLength(145);
-    expect(s.code).toHaveLength(6);
+    expect(s.full).toHaveLength(150);
+    expect(s.code).toHaveLength(7);
   });
 
   it("exposes exactly the code-mode tools, with connect_tab shared with full mode", async () => {
@@ -23,7 +23,7 @@ describe("describeSurface", () => {
     const code = s.code.map((t) => t.name).sort();
 
     expect(code).toEqual(
-      ["cancel_job", "connect_tab", "execute", "get_job_result", "list_jobs", "search"]
+      ["cancel_job", "connect_tab", "execute", "get_job_result", "list_jobs", "observe", "search"]
     );
 
     // connect_tab is the one tool present in both modes: code mode still needs a way to attach.
@@ -34,10 +34,30 @@ describe("describeSurface", () => {
   it("indexes every full-mode tool plus the Crawlio HTTP endpoints for search", async () => {
     const s = await describeSurface();
 
-    expect(s.catalog.browser).toBe(145);
-    expect(s.catalog.crawlioHttp).toBe(33);
-    expect(s.catalog.total).toBe(178);
+    expect(s.catalog.browser).toBe(150);
+    expect(s.catalog.crawlioHttp).toBe(32);
+    expect(s.catalog.total).toBe(182);
     expect(s.catalog.total).toBe(s.catalog.browser + s.catalog.crawlioHttp);
+  });
+
+  it("names every catalog entry exactly once", () => {
+    // `get_crawl_status` was registered twice — as an MCP tool and as a Crawlio HTTP entry
+    // documenting a `?since=N` the tool's empty inputSchema could not pass. `search` returned one
+    // capability under two descriptions, and the advertised size exceeded the number of distinct
+    // things. Resolved by giving the tool that parameter; this keeps it resolved.
+    return describeSurface().then((s) => {
+      expect(s.catalog.names).toHaveLength(s.catalog.total);
+      expect(new Set(s.catalog.names).size).toBe(s.catalog.total);
+    });
+  });
+
+  it("can be asked which tools exist, not just how many", () => {
+    // Skill prose is checked against this list, so it has to carry both substrates: a checker
+    // that knew only the MCP tools would flag every crawlio.api() command as nonexistent.
+    return describeSurface().then((s) => {
+      expect(s.catalog.names).toContain("browser_click");   // browser, via bridge.send
+      expect(s.catalog.names).toContain("start_crawl");     // Crawlio HTTP, via crawlio.api
+    });
   });
 
   it("describes the smart object at its maximum extent", async () => {

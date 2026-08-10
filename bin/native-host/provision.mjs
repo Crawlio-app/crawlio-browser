@@ -64,6 +64,11 @@ export function decodeNativeMessages(buffer) {
   return { messages, rest: buffer.subarray(offset) };
 }
 
+/** Whether Chrome has stopped renewing this native-host process's liveness lease. */
+export function isNativeHostLeaseExpired(lastPingAt, now = Date.now(), timeoutMs = 15_000) {
+  return !Number.isFinite(lastPingAt) || lastPingAt <= 0 || now - lastPingAt > timeoutMs;
+}
+
 /** ESRCH => dead; EPERM => alive but not ours; no throw => alive. */
 export function defaultIsPidAlive(pid) {
   try {

@@ -43,6 +43,13 @@ describe("egress audit — the declared surface is complete and honest", () => {
     const unsolicited = DECLARED_EGRESS.filter((e) => e.klass === "unsolicited").map((e) => e.host);
     expect(unsolicited).toEqual(["worker.crawlio.app"]);
   });
+
+  it("declares that ControlServer requests carry a local capability without leaving loopback", () => {
+    const control = DECLARED_EGRESS.find((e) => e.host.includes("Crawlio.app control server"));
+    expect(control?.klass).toBe("local");
+    expect(control?.carries).toMatch(/local-user MCP capability/i);
+    expect(control?.carries).toMatch(/nothing leaves/i);
+  });
 });
 
 describe("egress audit — declaration matches what we actually ship", () => {
@@ -53,6 +60,7 @@ describe("egress audit — declaration matches what we actually ship", () => {
   const manifest = readJsonFile<{
     permissions?: string[];
     host_permissions?: string[];
+    optional_permissions?: string[];
     optional_host_permissions?: string[];
   }>(manifestPath);
 
@@ -77,6 +85,12 @@ describe("egress audit — declaration matches what we actually ship", () => {
   it("declared optional host access matches", () => {
     expect([...DECLARED_EXTENSION_SURFACE.optional_host_permissions].sort()).toEqual(
       [...(manifest?.optional_host_permissions ?? [])].sort(),
+    );
+  });
+
+  it("declared optional permissions match", () => {
+    expect([...DECLARED_EXTENSION_SURFACE.optional_permissions].sort()).toEqual(
+      [...(manifest?.optional_permissions ?? [])].sort(),
     );
   });
 });

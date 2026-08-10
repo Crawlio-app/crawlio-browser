@@ -22,7 +22,7 @@ Deep-dive investigation of a single website. Produces structured findings across
 ### 1. Connect
 
 ```
-connect_tab({ url: "https://target.com" })
+connect_tab({ url: "https://target.com", background: true })
 ```
 
 ### 2. Acquire + Normalize
@@ -53,7 +53,7 @@ smart.finding({
 if (tracking.pixels?.length) {
   smart.finding({
     claim: `${tracking.pixels.length} tracking pixels detected`,
-    evidence: tracking.pixels.map(p => `${p.vendor}: ${p.hitType || 'pageview'}`),
+    evidence: tracking.pixels.map(p => `${p.vendor}/${p.pixelId}: ${p.eventCount} fires (${p.uniqueEventNames.join(', ')})`),
     sourceUrl: page.capture.url, confidence: "high",
     method: "parseTrackingPixels", dimension: "tracking"
   });
@@ -62,7 +62,7 @@ if (tracking.pixels?.length) {
 if (validation.issues?.length) {
   smart.finding({
     claim: `${validation.issues.length} tracking validation issues`,
-    evidence: validation.issues.map(i => `${i.param}: ${i.message}`),
+    evidence: validation.issues.map(i => `${i.parameter || i.code}: ${i.message}`),
     sourceUrl: page.capture.url, confidence: "medium",
     method: "validateTracking", dimension: "tracking"
   });
@@ -79,9 +79,13 @@ if (page.performance) {
 }
 
 if (page.security) {
+  const protocol = page.security.certificate?.protocol || "unknown";
   smart.finding({
-    claim: `Security: ${page.security.protocol || 'unknown'} protocol`,
-    evidence: Object.entries(page.security.headers || {}).map(([k, v]) => `${k}: ${v}`),
+    claim: `Security state: ${page.security.securityState || 'unknown'} (${protocol})`,
+    evidence: [
+      `mixedContent: ${Boolean(page.security.mixedContent)}`,
+      `certificate issuer: ${page.security.certificate?.issuer || 'unavailable'}`
+    ],
     sourceUrl: page.capture.url, confidence: "high",
     method: "extractPage", dimension: "security"
   });

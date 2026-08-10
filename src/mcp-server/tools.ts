@@ -9,6 +9,7 @@ import { promisify } from "util";
 import type { WebSocketBridge } from "./websocket-bridge.js";
 import type { CrawlioClient } from "./crawlio-client.js";
 import { TIMEOUTS } from "../shared/constants.js";
+import { describePermissions } from "../shared/permission-labels.js";
 import { MAX_EVAL_EXPRESSION_LENGTH, isProblemCode, type ProblemCode } from "../shared/protocol.js";
 import type { PageCapture, FrameworkDetection, NetworkEntry, ConsoleEntry, CookieEntry, RecordingSession } from "../shared/types.js";
 import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, Observation, DimensionSlot, ComparableMetric, ComparisonScaffold, MethodTrace, StepTrace, ConfidenceLevel, AccessibilitySummary, MobileReadiness, TableCandidate, TableExtraction, NetworkIdleResult, DataExtraction, PageSections, TrackingParseResult, TrackingValidationResult, SnapshotDiffResult, DataLayerState, DuplicateCluster } from "../shared/evidence-types.js";
@@ -25,11 +26,14 @@ import { collectSignals, buildJSGlobalsCheckExpr, META_TAG_EXTRACTION_EXPR } fro
 import type { TechnographicResult } from "../shared/evidence-types.js";
 import type { SeoAuditResult } from "../shared/seo-types.js";
 import { fetchCruxMetrics } from "./crux-client.js";
-import { robotTrainingArtifacts, robotTrainingStart, robotTrainingStatus, robotTrainingStop } from "./robot-training.js";
+import { robotTrainingArtifacts, robotTrainingClear, robotTrainingStart, robotTrainingStatus, robotTrainingStop } from "./robot-training.js";
 import { semanticClassify, semanticFind } from "./semantic-grounding.js";
 import { executeSandboxedCode } from "./execute-sandbox.js";
 import { checkActionPolicy, type ActionPolicy } from "./action-policy.js";
 import type { PolicyEnforcedSender } from "./policy-sender.js";
+import { TAB_ID_SCHEMA } from "../shared/tab-scoped-commands.js";
+import { currentTargetTab } from "./target-tab.js";
+import { appendPhaseReport, type JobProgress } from "../shared/job-progress.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -131,27 +135,36 @@ interface PermissionCheckResult {
   missing?: { permissions?: string[]; origins?: string[] };
 }
 
+/**
+ * Optional grants are feature requirements, not a tax on every full-mode call.
+ *
+ * The old server gate checked `tabs` before almost every browser tool, so a CDP-only capture was
+ * refused despite the already-required debugger permission being sufficient. Commands not listed
+ * here run and let the extension's concrete call site report any exact optional grant it needs.
+ */
+export const TOOL_OPTIONAL_PERMISSION_REQUIREMENTS: Readonly<Record<string, {
+  permissions?: string[];
+  origins?: string[];
+}>> = Object.freeze({
+  list_tabs: { permissions: ["tabs"] },
+  get_user_tabs: { permissions: ["tabs"] },
+  agent_session_claim_tab: { permissions: ["tabs"] },
+});
+
 export async function ensurePermission(
   bridge: WebSocketBridge,
   toolName: string
 ): Promise<{ allowed: boolean; error?: string }> {
+  const target = TOOL_OPTIONAL_PERMISSION_REQUIREMENTS[toolName];
+  if (!target) return { allowed: true };
   try {
-    // check_permissions is handled by the extension but not in the ServerCommand union —
-    // assertion required until protocol.ts adds the variant
     const result = await bridge.send(
-      { type: "check_permissions" } as unknown as Parameters<typeof bridge.send>[0],
+      { type: "check_permissions", ...target },
       5000
     ) as PermissionCheckResult;
     if (result?.granted) {
       return { allowed: true };
     }
-    // Fallback: trigger the popup badge "!" via request_permissions so the user can grant it
-    try {
-      await bridge.send(
-        { type: "request_permissions" } as unknown as Parameters<typeof bridge.send>[0],
-        3000
-      );
-    } catch { /* best-effort — denial error text still returned */ }
     return { allowed: false, error: formatPermissionDenial(result?.missing, toolName) };
   } catch {
     return { allowed: false, error: "Permission check unavailable — extension may be disconnected. Reconnect and try again." };
@@ -162,15 +175,16 @@ export function formatPermissionDenial(
   missing: { permissions?: string[]; origins?: string[] } | undefined,
   toolName: string
 ): string {
-  const parts: string[] = [];
-  if (missing?.permissions?.length) parts.push(`permissions: ${missing.permissions.join(", ")}`);
-  if (missing?.origins?.length) parts.push(`origins: ${missing.origins.join(", ")}`);
-  const detail = parts.length ? ` (${parts.join("; ")})` : "";
+  // Describe the grant in words the user can act on. Runtime tools never stage extension UI or
+  // open Chrome's prompt; welcome.html is the only optional-permission acquisition surface.
+  const wanted = describePermissions(missing);
+  const detail = wanted.length ? `\n\nIt needs to:\n${wanted.map((w) => `  - ${w}`).join("\n")}` : "";
   return (
-    `Permission required for "${toolName}"${detail}.\n` +
-    `Click the Crawlio extension icon and grant the requested permissions.\n\n` +
-    `IMPORTANT: Do not attempt workarounds. Do not try alternative approaches to bypass this permission requirement. ` +
-    `The user must grant permissions through the Crawlio popup.`
+    `"${toolName}" needs a browser permission that has not been granted yet.${detail}\n\n` +
+    `Tell the user to open Crawlio's dedicated onboarding page, review and grant all requested ` +
+    `browser access there, then retry this tool.\n\n` +
+    `IMPORTANT: Do not attempt workarounds or alternative approaches to bypass this. ` +
+    `Only the user can grant it through onboarding. Retry the tool after they confirm.`
   );
 }
 
@@ -189,7 +203,9 @@ const EXECUTE_SANDBOX_ASYNC_MS = (() => {
 export const TOOL_TIMEOUTS: Record<string, number> = {
   ...PICKER_TOOL_TIMEOUTS,
   execute: EXECUTE_SANDBOX_ASYNC_MS + 5000, // was unset → hit the 30s default while the sandbox allowed 120s
-  connect_tab: 30000, // was 15000 — cold-start CDP capture-init can exceed 15s on heavy pages
+  // A takeover may stop the prior capture before attaching/enabling the new tab. Each phase has
+  // bounded CDP deadlines, but their composed lifecycle can legitimately exceed 30s.
+  connect_tab: 60000,
   disconnect_tab: 5000,
   list_tabs: 5000,
   get_connection_status: 5000,
@@ -197,7 +213,8 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   get_capabilities: 5000,
   semantic_find: 15000,
   semantic_classify: 10000,
-  agent_session_create: 20000,
+  // Session creation composes background tab load, debugger/domain setup, and a ready-state wait.
+  agent_session_create: 60000,
   agent_session_list: 5000,
   agent_session_status: 10000,
   agent_session_close: 5000,
@@ -205,7 +222,7 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   agent_session_action: 20000,
   agent_session_batch: 60000,
   agent_session_artifacts: 10000,
-  agent_session_create_tab: 20000,
+  agent_session_create_tab: 60000,
   agent_session_claim_tab: 10000,
   agent_session_name: 5000,
   agent_session_finalize: 10000,
@@ -213,10 +230,13 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   robot_training_start: 20000,
   robot_training_status: 10000,
   robot_training_stop: 90000,
+  robot_training_clear: 10000,
   robot_training_artifacts: 10000,
+  monitor_page: 60000,
   recording_start: 20000,
   recording_status: 10000,
   recording_stop: 90000,
+  recording_clear: 10000,
   recording_artifacts: 10000,
   recording_capture_bundle: 120000,
   recording_validate_bundle: 10000,
@@ -233,8 +253,12 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   get_enrichment: 5000,
   get_crawled_urls: 10000,
   enrich_url: 120000,
-  browser_navigate: 30000,
-  browser_click: 10000,
+  // Navigation can spend 15s loading and then capture an optional accessibility snapshot.
+  // The bridge budget must cover the complete command, not only Page.navigate itself.
+  browser_navigate: 40000,
+  // A click includes element preparation plus the extension's bounded DOM-stability wait.
+  // Leave enough room for both phases when Chrome is busy during a reload handoff.
+  browser_click: 15000,
   browser_type: 10000,
   browser_press_key: 5000,
   browser_hover: 10000,
@@ -455,8 +479,15 @@ export async function saveArtifactToDisk(
   return { path: outPath, bytes: size };
 }
 
-/** Cache for buildSmartObject — keyed by page URL to avoid redundant detect_framework calls */
-let smartObjectCache: { url: string; smart: Record<string, unknown> } | null = null;
+/**
+ * Cache for buildSmartObject, avoiding a redundant detect_framework per execute call.
+ *
+ * Keyed by tab as well as URL. URL alone was enough when one tab could be driven; with several,
+ * two tabs sitting on the same URL can still be different pages — a logged-in and a logged-out
+ * view of the same route detect differently — and the second would silently inherit the first's
+ * framework helpers.
+ */
+let smartObjectCache: { tabId: number | null; url: string; smart: Record<string, unknown> } | null = null;
 
 /**
  * Module-level findings accumulator — persists across smart object rebuilds within a session.
@@ -492,6 +523,8 @@ interface JobRecord {
   console?: string[];
   error?: string;
   controller?: AbortController;
+  /** Phases the job reported via reportPhase(); see ../shared/job-progress.ts. */
+  progress?: JobProgress;
 }
 const jobRegistry = new Map<string, JobRecord>();
 const JOB_TTL_MS = 10 * 60_000; // drop finished jobs 10 min after they settle
@@ -619,8 +652,13 @@ export async function pollActionability(
       const check = await checkActionability(bridge, selector);
       if (check.actionable) return;
       lastReason = check.reason ?? "unknown";
-    } catch {
-      lastReason = "bridge communication failure";
+    } catch (err) {
+      // Some failures are about the target, not the transport, and retrying cannot fix them: a
+      // tabId naming a closed tab spent the whole budget and then reported "bridge communication
+      // failure", which sends the reader after the wrong problem entirely. Surface those as-is.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/not found|not an HTTP page|discarded|not connected|permission/i.test(message)) throw err;
+      lastReason = `bridge communication failure (${message})`;
     }
     attempt++;
   }
@@ -685,11 +723,11 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     // --- AI orchestration tools ---
     {
       name: "connect_tab",
-      description: "Pin a specific browser tab for all subsequent commands. Optional — without this, tools auto-connect to the active tab. Three modes: (1) provide a URL to find or create a tab, (2) provide a tabId to connect to a specific tab, (3) no args to pin the active tab. Starts CDP capture automatically. Pass background:true to connect + drive the tab WITHOUT stealing the user's active tab/window focus.",
+      description: "Pin a browser tab for subsequent commands and start CDP capture. Three modes: (1) provide a URL: with the optional tabs grant Crawlio reuses a match, otherwise it creates a fresh owned tab; (2) provide a tabId to adopt a specific existing tab (tabs grant required); (3) no args to discover and pin the active tab (tabs grant required). Pass background:true to avoid stealing the user's active tab/window focus.",
       inputSchema: {
         type: "object",
         properties: {
-          url: { type: "string", description: "URL to navigate to — finds existing tab or creates new one" },
+          url: { type: "string", description: "URL to open — reuses a match when tab metadata is granted, otherwise creates a fresh owned tab" },
           tabId: { type: "number", description: "Specific tab ID to connect to (use list_tabs to discover IDs)" },
           background: { type: "boolean", description: "Connect + drive the tab without activating it or focusing its window (no focus-steal). The tab opens/loads in the background; input and screenshots use CDP so they work without foreground focus." },
         },
@@ -743,6 +781,50 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
     {
+      name: "list_profiles",
+      description:
+        "List the Chrome profiles that have connected to this server, marking which one currently holds the browser connection. A profile appears once its extension has connected at least once — Chrome gives an extension no way to see other profiles, so a profile that has never connected is invisible here.",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => {
+        const { connected, preferred, seen } = bridge.listProfiles();
+        return toolSuccess({
+          connected,
+          preferred,
+          profiles: seen.map((p) => ({ ...p, active: p.profileId === connected })),
+          hint:
+            seen.length === 0
+              ? "No profile has identified itself yet. Open Chrome with the Crawlio extension enabled."
+              : "Use switch_profile({profileId}) to move the connection to another profile.",
+        });
+      },
+    },
+    {
+      name: "switch_profile",
+      description:
+        "Move the browser connection to another Chrome profile. One profile is driven at a time; this chooses which. The current profile's extension is released and reconnects in the background, so switching back is immediate. Pass no profileId to clear the preference and accept whichever profile connects first.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          profileId: {
+            type: "string",
+            description: "Profile id from list_profiles. Omit to clear the preference.",
+          },
+        },
+      },
+      handler: async (args) => {
+        const { profileId } = z.object({ profileId: z.string().optional() }).parse(args);
+        const result = bridge.switchProfile(profileId ?? null);
+        if (!result.switched) return toolError(result.reason ?? "Could not switch profile");
+        if (!profileId) return toolSuccess({ preferred: null, note: "Cleared — the next profile to connect is accepted." });
+        return toolSuccess({
+          preferred: profileId,
+          // The socket has only just been closed; the extension reconnects on its own backoff, so
+          // reporting "connected" here would be a claim about something that has not happened yet.
+          note: "Switching. The profile's extension reconnects within a few seconds — call get_connection_status to confirm before driving it.",
+        });
+      },
+    },
+    {
       name: "get_connection_status",
       description: "Get current connection state: whether a tab is connected, CDP debugger attached, MCP server connected, and capture status. Use to check if connect_tab is needed.",
       inputSchema: { type: "object", properties: {} },
@@ -762,7 +844,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "get_capabilities",
-      description: "List all tools and their current status based on CDP connection state. Shows which tools are available, which use fallbacks, and which are unavailable. Use to understand what you can do before calling tools.",
+      description: "Report browser-bridge command availability for the current tab, CDP domains, and optional permissions. Shows which commands are available, use a fallback, or are unavailable.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const data = await bridge.send({ type: "get_capabilities" }, TOOL_TIMEOUTS.get_capabilities);
@@ -1030,7 +1112,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "agent_session_create_tab",
-      description: "Open a new tab inside an agent session's tab group, turning the session into a fleet of tabs. The tab is created in the background and CDP-attached without disturbing the foreground connected tab. Requires the tabs permission; the Chrome tab-group chip is best-effort (shown only when the optional tabGroups permission is granted).",
+      description: "Open a new agent-owned tab inside a logical session fleet. The tab is created in the background and CDP-attached without disturbing the foreground connected tab. No optional permission is required.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1052,7 +1134,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "agent_session_claim_tab",
-      description: "Adopt an existing user tab into an agent session's tab group so the agent can drive it. Rejects non-HTTP tabs and tabs already owned by another session. Requires the tabs permission; the Chrome tab-group chip is best-effort (shown only when the optional tabGroups permission is granted).",
+      description: "Adopt an existing user tab into a logical agent session fleet so the agent can drive it. Rejects non-HTTP tabs and tabs already owned by another session. Requires tabs because it reads user-tab metadata.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1072,12 +1154,12 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "agent_session_name",
-      description: "Set the title of an agent session's tab group (the label shown on the Chrome tab-group chip). Requires the tabs permission; the Chrome tab-group chip is best-effort (shown only when the optional tabGroups permission is granted).",
+      description: "Set the title of an agent's logical session fleet. The name is retained in extension session state; Crawlio does not request Chrome's tabGroups permission.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Agent session id" },
-          name: { type: "string", description: "Tab-group title" },
+          name: { type: "string", description: "Logical session-fleet title" },
         },
         required: ["sessionId", "name"],
       },
@@ -1092,7 +1174,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "agent_session_finalize",
-      description: "End an agent session by disposing of its tabs. keep[].status 'handoff' returns a tab to the user; 'deliverable' moves it into a dedicated '✅ Crawlio' group. Tabs the agent created and did not keep are closed; adopted user tabs are released (never closed). Requires the tabs permission; the Chrome tab-group chip is best-effort (shown only when the optional tabGroups permission is granted).",
+      description: "End an agent session by disposing of its tabs. keep[].status labels retained tabs as handoff or deliverable in the result. Agent-created tabs not kept are closed; adopted user tabs are released and never closed. No optional permission is required for already-owned tab IDs.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1134,8 +1216,40 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
     {
+      name: "monitor_page",
+      description: "Manage extension-resident page monitoring. start creates an extension-owned background tab, captures a compact ARIA baseline, and schedules Chrome-alarm recaptures that continue with no MCP server connected. status/results query retained local data; stop ends collection; clear deletes a monitor and its snapshots. Data is bounded and managed through these explicit lifecycle actions; no additional Chrome permission is required.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["start", "status", "results", "stop", "clear"] },
+          monitorId: { type: "string", description: "Monitor id (required for results/stop; optional filter for status/clear)" },
+          url: { type: "string", description: "HTTP/HTTPS page to monitor (required for start)" },
+          label: { type: "string", description: "Optional human label" },
+          intervalMinutes: { type: "number", description: "Recapture interval, 0.5-10080 minutes (default 5)" },
+          limit: { type: "number", description: "Recent result count, 1-50 (default 10)" },
+          includeSnapshot: { type: "boolean", description: "Include full retained snapshots in results (default false)" },
+          closeTab: { type: "boolean", description: "Close the monitor-owned tab on stop/clear (default true)" },
+        },
+        required: ["action"],
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const parsed = z.object({
+          action: z.enum(["start", "status", "results", "stop", "clear"]),
+          monitorId: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.:-]+$/).optional(),
+          url: urlSchema.optional(),
+          label: z.string().max(120).optional(),
+          intervalMinutes: z.number().min(0.5).max(10_080).optional(),
+          limit: z.number().int().min(1).max(50).optional(),
+          includeSnapshot: z.boolean().optional(),
+          closeTab: z.boolean().optional(),
+        }).parse(args);
+        const data = await bridge.send({ type: "monitor_page", ...parsed } as BridgeCommand, TOOL_TIMEOUTS.monitor_page);
+        return toolSuccess(data);
+      },
+    },
+    {
       name: "robot_training_start",
-      description: "Start a native robot-training capture run. Opens a fresh connected Chrome tab, starts CDP network capture and session recording, injects the event-driven state monitor, and writes a manifest into a run directory. Use this before a human-guided demonstration that will later be replayed by agents or synthesized into an API contract.",
+      description: "Start an extension-resident robot-training run. Chrome owns the event monitor, recording state, and bounded IndexedDB retention, so collection continues while MCP is disconnected or restarted. The server writes an initial manifest and later materializes the resident capture as a canonical bundle.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1146,6 +1260,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
           maxInteractions: { type: "number", description: "Recording auto-stop interaction count (1-500)" },
           active: { type: "boolean", description: "Open the training tab in the foreground for manual demonstration (default: true)" },
           injectMonitor: { type: "boolean", description: "Inject the event-driven DOM/storage monitor (default: true)" },
+          captureStorageValues: { type: "boolean", description: "Retain non-sensitive local/session-storage values (default false; keys are always retained, passwords/tokens remain redacted)" },
         },
         required: ["url"],
       },
@@ -1158,6 +1273,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
           maxInteractions: z.number().min(1).max(500).optional(),
           active: z.boolean().default(true),
           injectMonitor: z.boolean().default(true),
+          captureStorageValues: z.boolean().default(false),
         });
         const parsed = schema.parse(args);
         const data = await robotTrainingStart(bridge, parsed);
@@ -1166,7 +1282,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "robot_training_status",
-      description: "Report active robot-training runs and the underlying browser recording status. Use while the human is demonstrating a flow or before stopping a run.",
+      description: "Query extension-owned robot-training runs and recording state. Status survives MCP server restarts and reports whether a retained bundle is available.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1183,7 +1299,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "robot_training_stop",
-      description: "Stop a robot-training run and persist the full capture bundle: raw-dump.json, recording.json, network.json, bodies.json, state-log.json, state.json, flows.jsonl, and manifest.json. Response bodies are fetched before network capture is stopped so the run can be synthesized into OpenAPI or replay code.",
+      description: "Stop an extension-resident robot-training run, fetch its bounded/redacted export, and materialize the complete 13-file RecordingBundle: manifest/raw dump, recording, network, bodies, state log/state, flows, causal graph/markdown, recipe, registry, and a captured-endpoint OpenAPI draft that requires validation. The extension fetches response bodies before its Network domain is stopped.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1201,6 +1317,25 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         }).parse(args);
         const data = await robotTrainingStop(bridge, parsed);
         return toolSuccess(data);
+      },
+    },
+    {
+      name: "robot_training_clear",
+      description: "Delete one stopped/interrupted/error robot-training record from the extension's bounded IndexedDB retention. Requires explicit confirmation and never deletes canonical artifact files. Active runs must be stopped first.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runId: { type: "string", description: "Exact retained run id to delete" },
+          confirm: { type: "boolean", description: "Must be true to confirm permanent deletion of the extension-retained record" },
+        },
+        required: ["runId", "confirm"],
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const parsed = z.object({
+          runId: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.-]+$/),
+          confirm: z.literal(true),
+        }).parse(args);
+        return toolSuccess(await robotTrainingClear(bridge, parsed));
       },
     },
     {
@@ -1223,7 +1358,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "recording_start",
-      description: "Start a canonical RecordingBundle v1 capture. Opens a fresh connected Chrome tab, starts CDP network capture, starts session recording, injects the event-driven state monitor, and writes manifest.json.",
+      description: "Start an extension-resident canonical RecordingBundle v1 capture. Collection and bounded retention continue without an MCP process; this compatibility tool writes manifest.json and later materializes the resident export.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1234,6 +1369,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
           maxInteractions: { type: "number", description: "Recording auto-stop interaction count (1-500)" },
           active: { type: "boolean", description: "Open the recording tab in the foreground (default: true)" },
           injectMonitor: { type: "boolean", description: "Inject event-driven DOM/storage monitor (default: true)" },
+          captureStorageValues: { type: "boolean", description: "Retain non-sensitive storage values (default false; keys only)" },
         },
         required: ["url"],
       },
@@ -1246,6 +1382,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
           maxInteractions: z.number().min(1).max(500).optional(),
           active: z.boolean().default(true),
           injectMonitor: z.boolean().default(true),
+          captureStorageValues: z.boolean().default(false),
         }).parse(args);
         const data = await robotTrainingStart(bridge, { ...parsed, runId: parsed.bundleID });
         return toolSuccess({ ...data, schemaVersion: "crawlio.recordingBundle.v1" });
@@ -1289,6 +1426,25 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
     },
     {
+      name: "recording_clear",
+      description: "Delete one stopped canonical recording's extension-retained record while preserving every materialized RecordingBundle file. Requires explicit confirmation; stop an active recording first.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bundleID: { type: "string", description: "Exact retained bundle id to delete" },
+          confirm: { type: "boolean", description: "Must be true to confirm permanent deletion of the extension-retained record" },
+        },
+        required: ["bundleID", "confirm"],
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const parsed = z.object({
+          bundleID: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.-]+$/),
+          confirm: z.literal(true),
+        }).parse(args);
+        return toolSuccess(await robotTrainingClear(bridge, { runId: parsed.bundleID, confirm: parsed.confirm }));
+      },
+    },
+    {
       name: "recording_artifacts",
       description: "List files in a canonical RecordingBundle directory without loading large bodies into the MCP response.",
       inputSchema: {
@@ -1306,7 +1462,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "recording_capture_bundle",
-      description: "One-shot canonical capture for automated flows: starts a bundle, optionally waits for network idle, then stops and writes RecordingBundle v1 artifacts. For human demos prefer recording_start then recording_stop.",
+      description: "One-shot background canonical capture for automated flows: opens an owned tab without taking focus, starts a bundle, optionally waits for network idle, then stops and writes RecordingBundle v1 artifacts. For human demos prefer recording_start then recording_stop.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1328,7 +1484,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
           timeout: z.number().int().min(1000).max(30000).default(15000),
           fetchBodies: z.boolean().default(true),
         }).parse(args);
-        const started = await robotTrainingStart(bridge, { url: parsed.url, runId: parsed.bundleID, outputDir: parsed.outputDir, active: true });
+        const started = await robotTrainingStart(bridge, { url: parsed.url, runId: parsed.bundleID, outputDir: parsed.outputDir, active: false });
         await bridge.send({ type: "wait_for_network_idle", idleTime: parsed.idleTime, timeout: parsed.timeout } as BridgeCommand, TOOL_TIMEOUTS.wait_for_network_idle).catch(() => null);
         const runId = String((started as { runId?: unknown }).runId ?? parsed.bundleID ?? "");
         const stopped = await robotTrainingStop(bridge, { runId, fetchBodies: parsed.fetchBodies });
@@ -1361,6 +1517,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           sendToCrawlio: { type: "boolean", description: "Also POST results to Crawlio ControlServer (default: true)" },
         },
       },
@@ -1387,7 +1544,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "detect_framework",
       description: "Detect the JavaScript framework used by the active tab (Next.js, Nuxt, React, Vue, Svelte, Angular, Gatsby, Remix, Astro, etc.)",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         const data = await bridge.send({ type: "detect_framework" }, TOOL_TIMEOUTS.detect_framework) as FrameworkDetection;
         return toolSuccess(data);
@@ -1396,7 +1553,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "start_network_capture",
       description: "Start capturing network requests on the active tab via Chrome DevTools Protocol. Call stop_network_capture to retrieve results.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         await bridge.send({ type: "start_network_capture" }, TOOL_TIMEOUTS.start_network_capture);
         return toolSuccess({ status: "Network capture started" });
@@ -1425,7 +1582,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "get_cookies",
       description: "Get cookies for the active tab's page via CDP Network.getCookies with document.cookie fallback. Returns domain-scoped cookies with sensitive values (session, csrf, auth, jwt) redacted.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         try {
           const data = await bridge.send({ type: "get_cookies" }, TOOL_TIMEOUTS.get_cookies) as { cookies: CookieEntry[]; fallbackUsed: boolean };
@@ -1443,6 +1600,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           domain: { type: "string", description: "Domain to filter cookies for (e.g. 'example.com'). Defaults to the active tab's base domain." },
           outputPath: { type: "string", description: "Override the output file path; must be inside your home directory. Defaults to ~/.crawlio/<domain>-session.json" },
         },
@@ -1495,6 +1653,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           maxDepth: { type: "number", description: "Maximum depth of DOM tree to capture (default: 10)" },
           summarize: { type: "boolean", description: "Return stats summary instead of raw tree (default: true)" },
         },
@@ -1514,12 +1673,30 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "take_screenshot",
-      description: "Take a screenshot of the active tab. Returns base64-encoded PNG.",
-      inputSchema: { type: "object", properties: {} },
-      handler: async () => {
-        const data = await bridge.send({ type: "take_screenshot" }, TOOL_TIMEOUTS.take_screenshot) as { data: string };
+      description: "Capture the viewport, full page, or one CSS-selected element. JPEG is the bounded default; request PNG when lossless output matters. If a PNG exceeds the response budget, capture falls back to JPEG and reports its actual MIME type.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tabId: TAB_ID_SCHEMA,
+          fullPage: { type: "boolean", description: "Capture the complete document instead of the viewport" },
+          selector: { type: "string", description: "Capture only this CSS-selected element" },
+          format: { type: "string", enum: ["png", "jpeg"], description: "Requested encoding (default: jpeg)" },
+          quality: { type: "number", description: "JPEG quality from 10 to 100 (default: 85)" },
+        },
+      },
+      handler: async (args) => {
+        const parsed = z.object({
+          fullPage: z.boolean().default(false),
+          selector: selectorSchema.optional(),
+          format: z.enum(["png", "jpeg"]).default("jpeg"),
+          quality: z.number().int().min(10).max(100).default(85),
+        }).parse(args);
+        const data = await bridge.send({ type: "take_screenshot", ...parsed }, TOOL_TIMEOUTS.take_screenshot) as {
+          data: string;
+          mimeType?: "image/png" | "image/jpeg";
+        };
         if (!data || typeof data.data !== "string") throw new Error("Bridge returned invalid take_screenshot response (missing data)");
-        return { content: [{ type: "image" as const, data: data.data, mimeType: "image/png" }], isError: false };
+        return { content: [{ type: "image" as const, data: data.data, mimeType: data.mimeType ?? "image/jpeg" }], isError: false };
       },
     },
     {
@@ -1545,10 +1722,16 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "get_crawl_status",
-      description: "Get the current Crawlio crawl status (progress, speed, state).",
-      inputSchema: { type: "object", properties: {} },
-      handler: async () => {
-        const status = await crawlio.getStatus();
+      description: "Get the current Crawlio crawl status — engine state, progress counters, sequence number.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          since: { type: "number", description: "Return only what changed after this sequence number (for polling)." },
+        },
+      },
+      handler: async (args) => {
+        const { since } = z.object({ since: z.number().optional() }).parse(args);
+        const status = await crawlio.getStatus(since);
         return toolSuccess(status);
       },
     },
@@ -1623,10 +1806,14 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
 
         const connStatus = await bridge.send({ type: "get_connection_status" }, 5000) as { connected?: boolean };
         if (!connStatus.connected) {
-          await bridge.send({ type: "connect_tab" } as BridgeCommand, 15000);
+          await bridge.send({
+            type: "connect_tab",
+            url: parsed.url,
+            background: true,
+          } as BridgeCommand, 15000);
+        } else {
+          await bridge.send({ type: "browser_navigate", url: parsed.url } as BridgeCommand, 45000);
         }
-
-        await bridge.send({ type: "browser_navigate", url: parsed.url } as BridgeCommand, 45000);
 
         if (parsed.waitMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, parsed.waitMs));
@@ -1636,13 +1823,12 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
 
         let enrichmentSent = false;
         try {
-          await crawlio.postEnrichment(capture.url || parsed.url, {
+          enrichmentSent = await crawlio.postEnrichment(capture.url || parsed.url, {
             framework: capture.framework,
             networkRequests: capture.networkRequests,
             consoleLogs: capture.consoleLogs,
             domSnapshotJSON: capture.domSnapshot ? JSON.stringify(capture.domSnapshot) : undefined,
           });
-          enrichmentSent = true;
         } catch (e) {
           console.error("[enrich_url] Failed to send enrichment to Crawlio:", e);
         }
@@ -1668,6 +1854,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           url: { type: "string", description: "URL to navigate to" },
         },
         required: ["url"],
@@ -1689,6 +1876,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ref: { type: "string", description: "Element ref from browser_snapshot (e.g., 'e3'). Preferred over selector." },
           selector: { type: "string", description: "CSS selector of element to click" },
           button: { type: "string", enum: ["left", "right", "middle"], description: "Mouse button (default: left)" },
@@ -1732,6 +1920,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ref: { type: "string", description: "Element ref from browser_snapshot (e.g., 'e3'). Preferred over selector." },
           selector: { type: "string", description: "CSS selector of element to type into" },
           text: { type: "string", description: "Text to type" },
@@ -1785,6 +1974,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           key: { type: "string", description: "Key name (e.g. Enter, Tab, Escape, ArrowDown, Backspace, Space, Home, End, F1-F12)" },
           modifiers: {
             type: "object",
@@ -1819,6 +2009,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ref: { type: "string", description: "Element ref from browser_snapshot (e.g., 'e3'). Preferred over selector." },
           selector: { type: "string", description: "CSS selector of element to hover over" },
           modifiers: {
@@ -1855,6 +2046,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ref: { type: "string", description: "Element ref from browser_snapshot (e.g., 'e3'). Preferred over selector." },
           selector: { type: "string", description: "CSS selector of the <select> element" },
           value: { type: "string", description: "Option value to select" },
@@ -1904,6 +2096,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           fields: {
             type: "array",
             items: {
@@ -1942,6 +2135,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           expression: { type: "string", description: `JavaScript expression to evaluate (max ${MAX_EVAL_EXPRESSION_LENGTH} chars)` },
         },
         required: ["expression"],
@@ -1965,6 +2159,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           interactive: { type: "boolean", description: "Interactive-only mode: show only buttons, links, inputs, etc. 60-80% token reduction." },
           compact: { type: "boolean", description: "Remove structural elements with no interactive descendants." },
           maxDepth: { type: "number", description: "Maximum tree depth (0 = root only, default: unlimited)." },
@@ -1996,6 +2191,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           baseline: { type: "string", description: "Previous snapshot text to diff against. If omitted, uses the last cached snapshot." },
           selector: { type: "string", description: "CSS selector to scope the current snapshot to a subtree." },
           compact: { type: "boolean", description: "Remove structural elements with no interactive descendants from current snapshot." },
@@ -2029,6 +2225,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector to wait for" },
           state: { type: "string", enum: ["attached", "visible", "hidden", "detached"], description: "Target state (default: visible)" },
           timeout: { type: "number", description: "Max wait time in ms (default: 30000, max: 60000)" },
@@ -2037,6 +2234,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
       handler: async (args) => {
         const schema = z.object({
+          tabId: z.number().int().positive().optional(),
           selector: selectorSchema,
           state: z.enum(["attached", "visible", "hidden", "detached"]).default("visible"),
           timeout: z.number().int().min(100).max(60000).default(30000),
@@ -2044,6 +2242,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         const parsed = schema.parse(args);
         const result = await bridge.send({
           type: "wait_for_selector",
+          ...(parsed.tabId !== undefined && { tabId: parsed.tabId }),
           selector: parsed.selector,
           state: parsed.state,
           timeout: parsed.timeout,
@@ -2058,6 +2257,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           action: { type: "string", enum: ["enable", "disable"], description: "Enable or disable interception (default: enable)" },
           patterns: {
             type: "array",
@@ -2111,7 +2311,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "get_frame_tree",
       description: "Get the frame hierarchy of the current page. Returns all frames (main + iframes) with their IDs, URLs, names, and parent relationships. Use frameId with switch_to_frame to execute JS in a specific frame.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         const data = await bridge.send({ type: "get_frame_tree" }, TOOL_TIMEOUTS.get_frame_tree);
         return toolSuccess(data);
@@ -2123,6 +2323,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           frameId: { type: "string", description: "Frame ID from get_frame_tree" },
         },
         required: ["frameId"],
@@ -2137,7 +2338,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "switch_to_main_frame",
       description: "Switch execution context back to the main (top-level) frame. Use after switch_to_frame to return to the main page context.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         const data = await bridge.send({ type: "switch_to_main_frame" }, TOOL_TIMEOUTS.switch_to_main_frame);
         return toolSuccess(data);
@@ -2212,6 +2413,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           name: { type: "string", description: "Cookie name" },
           value: { type: "string", description: "Cookie value" },
           domain: { type: "string", description: "Cookie domain (e.g., '.example.com')" },
@@ -2245,6 +2447,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           name: { type: "string", description: "Cookie name to delete" },
           domain: { type: "string", description: "Domain scope (optional)" },
           path: { type: "string", description: "Path scope (optional)" },
@@ -2268,6 +2471,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           type: { type: "string", enum: ["local", "session"], description: "Storage type (default: local)" },
           key: { type: "string", description: "Specific key to retrieve (optional — returns all if omitted)" },
         },
@@ -2297,6 +2501,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           type: { type: "string", enum: ["local", "session"], description: "Storage type (default: local)" },
           key: { type: "string", description: "Storage key" },
           value: { type: "string", description: "Storage value" },
@@ -2330,6 +2535,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           type: { type: "string", enum: ["local", "session"], description: "Storage type (default: local)" },
         },
       },
@@ -2366,6 +2572,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           accept: { type: "boolean", description: "true to accept/OK, false to dismiss/Cancel" },
           promptText: { type: "string", description: "Text to enter for prompt dialogs (ignored for alert/confirm)" },
         },
@@ -2391,6 +2598,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           url: { type: "string", description: "URL of the request to get the body for (matches against captured network requests)" },
           requestId: { type: "string", description: "Specific requestId if known (from network capture events)" },
         },
@@ -2416,6 +2624,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           url: { type: "string", description: "URL of the captured request to replay" },
           method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"], description: "Override HTTP method" },
           headers: { type: "object", description: "Override or add headers (merged with original captured headers)" },
@@ -2451,6 +2660,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           width: { type: "number", description: "Viewport width in pixels" },
           height: { type: "number", description: "Viewport height in pixels" },
           deviceScaleFactor: { type: "number", description: "Device scale factor / DPI (default: 1)" },
@@ -2482,6 +2692,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           userAgent: { type: "string", description: "Custom User-Agent string" },
         },
         required: ["userAgent"],
@@ -2504,6 +2715,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           device: { type: "string", description: "Device name (e.g., 'iPhone 14')" },
         },
         required: ["device"],
@@ -2527,6 +2739,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           landscape: { type: "boolean", description: "Paper orientation (default: false = portrait)" },
           scale: { type: "number", description: "Scale of the page rendering (default: 1, range: 0.1 to 2)" },
           paperWidth: { type: "number", description: "Paper width in inches (default: 8.5)" },
@@ -2570,6 +2783,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ref: { type: "string", description: "Element ref from browser_snapshot to scroll into view (e.g., 'e3'). Preferred over selector." },
           selector: { type: "string", description: "CSS selector to scroll into view first" },
           deltaX: { type: "number", description: "Horizontal scroll delta in pixels (default: 0)" },
@@ -2597,6 +2811,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ref: { type: "string", description: "Element ref from browser_snapshot (e.g., 'e3'). Preferred over selector." },
           selector: { type: "string", description: "CSS selector of the element to double-click" },
         },
@@ -2621,6 +2836,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           refFrom: { type: "string", description: "Element ref for drag start position (from browser_snapshot)." },
           refTo: { type: "string", description: "Element ref for drag end position (from browser_snapshot)." },
           from: { type: "string", description: "CSS selector of the drag source element" },
@@ -2655,6 +2871,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector for the <input type='file'> element" },
           files: {
             type: "array",
@@ -2685,6 +2902,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           depth: { type: "number", description: "Maximum tree depth to return (default: 10, max: 50)" },
           root: { type: "string", description: "CSS selector for subtree root (default: entire page)" },
         },
@@ -2709,6 +2927,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           latitude: { type: "number", description: "Latitude in degrees (-90 to 90)" },
           longitude: { type: "number", description: "Longitude in degrees (-180 to 180)" },
           accuracy: { type: "number", description: "Accuracy in meters (default: 1)" },
@@ -2737,7 +2956,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "get_performance_metrics",
       description: "Get performance metrics for the current page. Includes Chrome's built-in metrics (DOM nodes, JS heap, layout counts, script duration) and Web Vitals (LCP, CLS, FID). Useful for performance auditing and optimization.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         const data = await bridge.send({
           type: "get_performance_metrics",
@@ -2752,6 +2971,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           status: { type: "string", enum: ["connecting", "open", "closed", "error"], description: "Filter by connection status (optional)" },
         },
       },
@@ -2773,6 +2993,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           requestId: { type: "string", description: "WebSocket requestId (from get_websocket_connections). Omit for messages from all connections." },
           limit: { type: "number", description: "Maximum messages to return (default: 50, max: 500)" },
           direction: { type: "string", enum: ["sent", "received"], description: "Filter by direction (optional)" },
@@ -2820,6 +3041,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           preset: { type: "string", enum: ["offline", "slow-3g", "fast-3g", "4g", "wifi"], description: "Network preset name" },
           downloadKbps: { type: "number", description: "Download speed in Kbps (overrides preset)" },
           uploadKbps: { type: "number", description: "Upload speed in Kbps (overrides preset)" },
@@ -2848,6 +3070,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           disabled: { type: "boolean", description: "true to disable cache, false to re-enable" },
         },
         required: ["disabled"],
@@ -2868,6 +3091,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           headers: { type: "object", description: "Header name→value pairs (e.g., { 'Authorization': 'Bearer ...' })" },
         },
         required: ["headers"],
@@ -2887,7 +3111,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Get the current page's security state including TLS certificate details, protocol, cipher, and mixed content status.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async () => {
         const data = await bridge.send({
@@ -2903,6 +3127,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           ignore: { type: "boolean", description: "true to ignore cert errors, false to enforce" },
         },
         required: ["ignore"],
@@ -2922,7 +3147,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "list_service_workers",
       description: "List all service worker registrations for the current page. Shows scope URL, script URL, running status, and lifecycle state.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         const data = await bridge.send({
           type: "list_service_workers",
@@ -2937,6 +3162,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           registrationId: { type: "string", description: "Registration ID to stop (from list_service_workers). Omit to stop all." },
         },
       },
@@ -2959,6 +3185,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           enabled: { type: "boolean", description: "true to bypass service workers, false to restore normal behavior" },
         },
         required: ["enabled"],
@@ -2981,6 +3208,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of the element to replace" },
           html: { type: "string", description: "New outer HTML to set" },
           dangerous: { type: "boolean", description: "Set to true to allow HTML containing <script>, <iframe>, or event handlers" },
@@ -3008,6 +3236,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of the element" },
           name: { type: "string", description: "Attribute name" },
           value: { type: "string", description: "Attribute value" },
@@ -3035,6 +3264,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of the element" },
           name: { type: "string", description: "Attribute name to remove" },
         },
@@ -3059,6 +3289,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of the element to remove" },
         },
         required: ["selector"],
@@ -3082,7 +3313,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Start tracking CSS rule usage. Navigate pages and interact with elements, then call stop_css_coverage to get results showing which CSS rules were used.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async () => {
         const data = await bridge.send({ type: "start_css_coverage" }, TOOL_TIMEOUTS.start_css_coverage);
@@ -3094,7 +3325,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Stop CSS coverage tracking and return results. Each entry shows a CSS rule range, its stylesheet, and whether it was used.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async () => {
         const data = await bridge.send({ type: "stop_css_coverage" }, TOOL_TIMEOUTS.stop_css_coverage);
@@ -3110,6 +3341,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           detailed: { type: "boolean", description: "Enable block-level coverage (more granular but more data). Default: false" },
         },
       },
@@ -3123,7 +3355,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Stop JS coverage tracking and return results. Shows per-script coverage with function-level or block-level ranges and execution counts.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async () => {
         const data = await bridge.send({ type: "stop_js_coverage" }, TOOL_TIMEOUTS.stop_js_coverage);
@@ -3136,6 +3368,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of the element" },
           properties: { type: "array", items: { type: "string" }, description: "Filter to these property names (optional, returns all if omitted)" },
         },
@@ -3160,6 +3393,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selectors: {
             type: "array",
             items: { type: "string" },
@@ -3189,6 +3423,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of the element" },
           states: { type: "array", items: { type: "string", enum: ["active", "focus", "hover", "visited", "focus-within", "focus-visible"] }, description: "Pseudo-states to force" },
         },
@@ -3214,6 +3449,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           origin: { type: "string", description: "Security origin to query (defaults to current page origin)" },
         },
       },
@@ -3234,6 +3470,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           database: { type: "string", description: "Database name" },
           store: { type: "string", description: "Object store name" },
           limit: { type: "number", description: "Maximum entries to return (default: 25, max: 100)" },
@@ -3267,6 +3504,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           database: { type: "string", description: "Database name" },
           store: { type: "string", description: "Object store to clear (optional — omit to delete entire database)" },
         },
@@ -3294,6 +3532,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           type: { type: "string", enum: ["page", "service_worker", "background_page", "browser", "other"], description: "Filter by target type (optional)" },
         },
       },
@@ -3314,6 +3553,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           targetId: { type: "string", description: "Target ID from get_targets" },
         },
         required: ["targetId"],
@@ -3335,6 +3575,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           dispose: { type: "string", description: "Browser context ID to dispose (if disposing instead of creating)" },
         },
       },
@@ -3356,7 +3597,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Get DOM object counters: number of documents, DOM nodes, and JS event listeners. Useful for detecting memory leaks (growing counters over time).",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async (_args: Record<string, unknown>) => {
         const data = await bridge.send({
@@ -3370,7 +3611,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Force JavaScript garbage collection. Useful before taking memory measurements to get accurate baseline. Uses HeapProfiler.collectGarbage for V8-level GC. Returns post-GC DOM counters.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async (_args: Record<string, unknown>) => {
         const data = await bridge.send({
@@ -3384,7 +3625,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Take a V8 heap snapshot summary. Returns node/edge counts and snapshot size. NOTE: Full heap snapshots can be very large — this returns metadata summary only.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async (_args: Record<string, unknown>) => {
         const data = await bridge.send({
@@ -3400,6 +3641,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           selector: { type: "string", description: "CSS selector of element to highlight (omit to clear)" },
           color: { type: "string", description: "Hex color for highlight (default: #6FA8DC). Format: #RRGGBB or #RRGGBBAA" },
         },
@@ -3424,6 +3666,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           enabled: { type: "boolean", description: "true to show layout shift regions, false to hide" },
         },
         required: ["enabled"],
@@ -3444,6 +3687,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           enabled: { type: "boolean", description: "true to show paint rects, false to hide" },
         },
         required: ["enabled"],
@@ -3465,6 +3709,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           maxDurationSec: { type: "number", description: "Max recording duration in seconds (10-600, default: 600)" },
           maxInteractions: { type: "number", description: "Max interaction count before auto-stop (1-500, default: 500)" },
         },
@@ -3862,7 +4107,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Inspect tracker runtime state via CDP Runtime.evaluate. Probes Facebook fbq (loaded, version, pixelIds, queue), GA4 dataLayer (events, gtag/ga presence), GTM containers (GTM-/G- IDs), and TikTok ttq (loaded, queue). Returns DataLayerState with null for absent trackers. Requires debugger attached — no content script needed.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async () => {
         const data = await bridge.send({ type: "inspect_datalayer" }, TOOL_TIMEOUTS.inspect_datalayer) as DataLayerState;
@@ -3924,6 +4169,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: {
         type: "object",
         properties: {
+          tabId: TAB_ID_SCHEMA,
           widgets: {
             type: "array",
             items: { type: "string", enum: ["badge", "header", "sidebar"] },
@@ -3972,7 +4218,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     {
       name: "clear_serp_overlay",
       description: "Remove all Crawlio SERP overlay widgets (badges, header bar, sidebar) from the current page. Safe to call even if no overlay is present.",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { tabId: TAB_ID_SCHEMA } },
       handler: async () => {
         const result = await bridge.send({
           type: "clear_serp_overlay",
@@ -4428,7 +4674,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "Compare raw HTML (pre-JavaScript) vs rendered DOM (post-JavaScript) to detect JS-dependent SEO content. Identifies differences in title, meta description, headings, canonical, structured data, links, and content size. Returns a risk assessment for search engine visibility. Requires debugger attached and network capture active (best when page was loaded with capture running).",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: { tabId: TAB_ID_SCHEMA },
       },
       handler: async () => {
         const result = await bridge.send({
@@ -4687,13 +4933,21 @@ export function makePolicyEnforcingBridge(bridge: Pick<WebSocketBridge, "send">,
     // async-style: a denied command yields a REJECTED promise (the send() contract),
     // never a synchronous throw — callers always `await` it. Policy is read live so a
     // per-URL cached `smart` object always honors the current hot-reloaded policy.
-    send(command: Parameters<WebSocketBridge["send"]>[0], timeout?: number): Promise<unknown> {
+    send(
+      command: Parameters<WebSocketBridge["send"]>[0],
+      timeout?: number,
+      opts?: Parameters<WebSocketBridge["send"]>[2],
+    ): Promise<unknown> {
       const policy = getPolicy();
       const type = (command as { type?: unknown } | null | undefined)?.type;
       if (policy && typeof type === "string" && checkActionPolicy(type, policy) === "deny") {
         return Promise.reject(new Error(`Action policy denied browser operation in execute: ${type}`));
       }
-      return bridge.send(command, timeout);
+      // Forward `opts` only when the caller gave one. Passing it unconditionally appends an
+      // explicit `undefined` third argument to every send, which changes the call shape for
+      // every existing caller — arity is observable, and a test asserting the two-argument form
+      // caught exactly that.
+      return opts === undefined ? bridge.send(command, timeout) : bridge.send(command, timeout, opts);
     },
   };
   // The one and only place the brand is minted (the cast); see policy-sender.ts.
@@ -4732,12 +4986,18 @@ export async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Re
     click: async (selector: string, opts?: { settle?: number }) => {
       const ref = parseSnapshotRef(selector);
       if (ref) {
-        const result = await bridge.send({ type: "browser_click", ref, button: "left", modifiers: {} }, 10000);
+        const result = await bridge.send(
+          { type: "browser_click", ref, button: "left", modifiers: {} },
+          TOOL_TIMEOUTS.browser_click,
+        );
         await new Promise(r => setTimeout(r, opts?.settle ?? 500));
         return result;
       }
       await pollActionability(bridge, selector);
-      const result = await bridge.send({ type: "browser_click", selector, button: "left", modifiers: {} }, 10000);
+      const result = await bridge.send(
+        { type: "browser_click", selector, button: "left", modifiers: {} },
+        TOOL_TIMEOUTS.browser_click,
+      );
       await new Promise(r => setTimeout(r, opts?.settle ?? 500));
       return result;
     },
@@ -4755,7 +5015,10 @@ export async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Re
     },
     navigate: async (url: string, opts?: { settle?: number }) => {
       smartObjectCache = null;
-      const result = await bridge.send({ type: "browser_navigate", url }, 30000);
+      const result = await bridge.send(
+        { type: "browser_navigate", url },
+        TOOL_TIMEOUTS.browser_navigate,
+      );
       await new Promise(r => setTimeout(r, opts?.settle ?? 1000));
       return result;
     },
@@ -4791,7 +5054,9 @@ export async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Re
   // Detect frameworks once, build Set<string> for O(1) lookups
   let fw: { detections?: Array<{ name: string }> } | null;
   try {
-    fw = await bridge.send({ type: "detect_framework" }, 5000) as { detections?: Array<{ name: string }> };
+    // A probe, not work: with no browser attached the answer is "no frameworks", and queueing
+    // this made every execute wait out the 45s offline floor before saying so.
+    fw = await bridge.send({ type: "detect_framework" }, 5000, { queueWhenOffline: false }) as { detections?: Array<{ name: string }> };
   } catch { fw = null; }
 
   const detected = new Set<string>(
@@ -5243,8 +5508,17 @@ export async function buildSmartObject(bridge: PolicyEnforcedSender): Promise<Re
       if (!sessionGaps.some(g => g.dimension === gap.dimension)) sessionGaps.push(gap);
     }
 
+    const captureRecord = capture as Record<string, unknown>;
+    const normalizedCapture = ["networkRequests", "consoleLogs", "domSnapshot"]
+      .some(key => Object.prototype.hasOwnProperty.call(captureRecord, key))
+      ? shapeCapturePage(capture as PageCapture)
+      : capture;
     const evidence: PageEvidence & { gaps: CoverageGap[]; _trace?: MethodTrace } = {
-      capture: capture as PageEvidence["capture"],
+      // bridge.send receives the extension's raw PageCapture. Method Mode promises the same
+      // compact shape as the full capture_page tool, and its comparison builder reads
+      // capture.network/console/dom. Normalize here instead of making every skill understand two
+      // incompatible contracts. The fallback preserves test/custom bridges that already shape.
+      capture: normalizedCapture as PageEvidence["capture"],
       performance: perf as PageEvidence["performance"],
       security: security as PageEvidence["security"],
       fonts: fonts as PageEvidence["fonts"],
@@ -5323,9 +5597,6 @@ const CODE_MODE_HINTS: Record<string, string> = {
   seo_audit: "full-mode (--full) tool only — not reachable via bridge.send or smart.* in code mode",
   crux_metrics: "full-mode (--full) tool only — calls the Google CrUX API server-side",
   check_robots_txt: "full-mode (--full) tool only — not reachable via bridge.send in code mode",
-  robot_training_start: "full-mode (--full) tool only — server-composed, no bridge.send or smart.* path",
-  robot_training_status: "full-mode (--full) tool only — server-composed, no bridge.send or smart.* path",
-  robot_training_stop: "full-mode (--full) tool only — server-composed; pass the runId returned by robot_training_start",
   robot_training_artifacts: "full-mode (--full) tool only — server-composed; pass the outputDir returned by start/stop",
   // Storage tools: the schema's `type` param collides with the bridge envelope's own
   // `type` key, so in code mode the storage kind must be passed as `storageType`:
@@ -5337,7 +5608,6 @@ const CODE_MODE_HINTS: Record<string, string> = {
 /** Crawlio ControlServer HTTP endpoints — merged into code-mode search catalog.
  *  Mirrors the 33 entries from CrawlioMCP/Tools.swift toolCatalog. */
 const crawlioHTTPCatalog: CatalogEntry[] = [
-  { name: "get_crawl_status", description: "GET /status — engine state, progress counters, sequence number. Params: ?since=N (optional)", inputSchema: {} },
   { name: "get_crawl_logs", description: "GET /logs — recent log entries. Params: ?category=engine|download|parser|localizer|network|ui&level=debug|info|default|error|fault&limit=N", inputSchema: {} },
   { name: "get_errors", description: "GET /logs?level=error — error and fault-level log entries", inputSchema: {} },
   { name: "get_downloads", description: "GET /downloads — all download items with status, HTTP code, bytes, content type", inputSchema: {} },
@@ -5460,8 +5730,8 @@ function searchCatalog(
 }
 
 /**
- * Create code-mode tools: search, execute, connect_tab.
- * Replaces the full tool surface with three primary tools — the model writes JS against
+ * Create code-mode tools: search, execute, observe, connect_tab, plus async job controls.
+ * Replaces the full tool surface with four primary tools — the model writes JS against
  * `bridge` and `crawlio` instead of choosing among individual schemas. Counts live in
  * `surface.ts`; stating them here is how they went stale.
  */
@@ -5475,6 +5745,114 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
 
   // Find connect_tab from the full list — keep it as standalone
   const connectTab = allTools.find(t => t.name === "connect_tab")!;
+
+  // One compact control plane keeps the shipped training/recording/monitor skills executable in
+  // default code mode without flattening twelve lifecycle tools into tools/list. Collection still
+  // lives in the extension; this tool only starts, queries and materializes it.
+  const observeTool: Tool = {
+    name: "observe",
+    description: "Manage extension-resident observation. Actions: training_start, training_status, training_stop, training_clear, training_artifacts; recording_start, recording_status, recording_stop, recording_clear, recording_artifacts (RecordingBundle aliases); monitor_start, monitor_status, monitor_results, monitor_stop, monitor_clear. Training and monitors continue while MCP is disconnected; stop materializes canonical files and confirmed clear deletes only Chrome-retained records.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "training_start", "training_status", "training_stop", "training_clear", "training_artifacts",
+            "recording_start", "recording_status", "recording_stop", "recording_clear", "recording_artifacts",
+            "monitor_start", "monitor_status", "monitor_results", "monitor_stop", "monitor_clear",
+          ],
+        },
+        url: { type: "string" },
+        runId: { type: "string" },
+        bundleID: { type: "string" },
+        outputDir: { type: "string" },
+        monitorId: { type: "string" },
+        intervalMinutes: { type: "number" },
+        maxDurationSec: { type: "number" },
+        maxInteractions: { type: "number" },
+        active: { type: "boolean", description: "Open the training tab in the foreground (default true)" },
+        fetchBodies: { type: "boolean" },
+        confirm: { type: "boolean", description: "Must be true for training_clear/recording_clear" },
+        closeTab: { type: "boolean" },
+        captureStorageValues: { type: "boolean" },
+        limit: { type: "number" },
+        includeSnapshot: { type: "boolean" },
+        label: { type: "string" },
+      },
+      required: ["action"],
+    },
+    handler: async (args: Record<string, unknown>) => {
+      const base = z.object({ action: z.enum([
+        "training_start", "training_status", "training_stop", "training_clear", "training_artifacts",
+        "recording_start", "recording_status", "recording_stop", "recording_clear", "recording_artifacts",
+        "monitor_start", "monitor_status", "monitor_results", "monitor_stop", "monitor_clear",
+      ]) }).passthrough().parse(args);
+
+      if (base.action === "training_start" || base.action === "recording_start") {
+        const parsed = z.object({
+          url: urlSchema,
+          runId: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.-]+$/).optional(),
+          bundleID: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.-]+$/).optional(),
+          outputDir: z.string().min(1).max(2000).optional(),
+          maxDurationSec: z.number().min(10).max(600).optional(),
+          maxInteractions: z.number().min(1).max(500).optional(),
+          active: z.boolean().default(true),
+          captureStorageValues: z.boolean().default(false),
+        }).parse(base);
+        const data = await robotTrainingStart(bridge, {
+          ...parsed,
+          runId: parsed.runId ?? parsed.bundleID,
+          injectMonitor: true,
+        });
+        return toolSuccess(base.action === "recording_start"
+          ? { ...data, schemaVersion: "crawlio.recordingBundle.v1" }
+          : data);
+      }
+      if (base.action === "training_status" || base.action === "recording_status") {
+        const parsed = z.object({ runId: z.string().min(1).max(100).optional(), bundleID: z.string().min(1).max(100).optional() }).parse(base);
+        return toolSuccess(await robotTrainingStatus(bridge, parsed.runId ?? parsed.bundleID));
+      }
+      if (base.action === "training_stop" || base.action === "recording_stop") {
+        const parsed = z.object({
+          runId: z.string().min(1).max(100).optional(),
+          bundleID: z.string().min(1).max(100).optional(),
+          fetchBodies: z.boolean().default(true),
+          closeTab: z.boolean().default(false),
+        }).parse(base);
+        const runId = parsed.runId ?? parsed.bundleID;
+        if (!runId) throw new Error(`${base.action} requires runId${base.action === "recording_stop" ? " or bundleID" : ""}`);
+        return toolSuccess(await robotTrainingStop(bridge, { runId, fetchBodies: parsed.fetchBodies, closeTab: parsed.closeTab }));
+      }
+      if (base.action === "training_clear" || base.action === "recording_clear") {
+        const parsed = z.object({
+          runId: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.-]+$/).optional(),
+          bundleID: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_.-]+$/).optional(),
+          confirm: z.literal(true),
+        }).parse(base);
+        const runId = parsed.runId ?? parsed.bundleID;
+        if (!runId) throw new Error(`${base.action} requires runId${base.action === "recording_clear" ? " or bundleID" : ""}`);
+        return toolSuccess(await robotTrainingClear(bridge, { runId, confirm: parsed.confirm }));
+      }
+      if (base.action === "training_artifacts" || base.action === "recording_artifacts") {
+        const parsed = z.object({ outputDir: z.string().min(1).max(2000) }).parse(base);
+        return toolSuccess(await robotTrainingArtifacts(parsed));
+      }
+
+      const monitorAction = base.action.slice("monitor_".length);
+      const parsed = z.object({
+        monitorId: z.string().min(1).max(100).optional(),
+        url: urlSchema.optional(),
+        intervalMinutes: z.number().min(0.5).max(10_080).optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+        includeSnapshot: z.boolean().optional(),
+        closeTab: z.boolean().optional(),
+        label: z.string().max(120).optional(),
+      }).parse(base);
+      const data = await bridge.send({ type: "monitor_page", action: monitorAction, ...parsed } as BridgeCommand, TOOL_TIMEOUTS.monitor_page);
+      return toolSuccess(data);
+    },
+  };
 
   return [
     // --- search: discover available commands ---
@@ -5512,7 +5890,7 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "- For structured page evidence, prefer smart.extractPage() — runs 7 ops in parallel with typed gaps[].",
         "- capture_page returns a ~1KB shaped summary. For raw data, use stop_network_capture or get_console_logs.",
         "- Use smart.waitForIdle() instead of sleep(). Use smart.scrollCapture() instead of manual scroll loops.",
-        "- smart.snapshot() takes no options or { interactive: true } — there is no { compact: true } option.",
+        "- Scope large snapshots with smart.snapshot({ compact: true, maxDepth: 8, selector: '#main' }); use { interactive: true } for controls only.",
         "- For cross-page navigation, use smart.navigate(url) — never location.href = \"...\" (breaks CDP).",
         "",
         "Available in scope:",
@@ -5547,7 +5925,7 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "  smart.type(selector, text, opts?) — poll + type + 300ms settle",
         "  smart.navigate(url, opts?) — navigate + 1000ms settle",
         "  smart.waitFor(selector, timeout?) — poll until actionable",
-        "  smart.snapshot(opts?) — capture accessibility snapshot (opts: { interactive: true } for clickable elements only — NO compact option)",
+        "  smart.snapshot(opts?) — capture accessibility snapshot. opts: { interactive?: boolean, compact?: boolean, maxDepth?: number, selector?: string }.",
         "  smart.scrollCapture(opts?) — state-aware page scroll with screenshots, stops at page bottom",
         "  smart.waitForIdle(timeout?) — wait for DOM mutations to settle (500ms quiet window)",
         "  smart.extractPage(opts?) — capture_page + perf + security + fonts + meta + accessibility + mobileReadiness. Returns { capture, performance, security, fonts, meta, accessibility, mobileReadiness, gaps[] }. opts: { trace: true } adds _trace.",
@@ -5578,7 +5956,7 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "  smart.remix.{getContext,getRouteData}",
         "  smart.gatsby.{getData,getPageData}",
         "  smart.shopify.{getShop,getCart}",
-        "  smart.wordpress.{isWP,getRestUrl,getPlugins} | smart.woocommerce.{getParams,getCSRF}",
+        "  smart.wordpress.{isWP,getRestUrl,getPlugins} | smart.woocommerce.{getParams}",
         "  smart.laravel.{getCSRF} | smart.django.{getCSRF} | smart.drupal.{getSettings}",
         "  smart.jquery.{getVersion}",
         "",
@@ -5612,6 +5990,10 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         type: "object",
         properties: {
           code: { type: "string", description: "Async JavaScript function body. Has bridge, crawlio, sleep, TIMEOUTS, smart, compileRecording, ocrScreenshot, saveArtifact in scope. Must return a value (for bulk data, saveArtifact to disk and return { path, bytes })." },
+          tabId: {
+            type: "number",
+            description: "Target tab id from list_tabs. Every bridge.send in the script that does not name its own tabId runs against this tab (default: the connected tab).",
+          },
           background: { type: "boolean", description: "Run detached: returns { jobId } immediately and keeps executing server-side up to the sandbox cap (~120s). Poll get_job_result(jobId) for the result. Use for heavy/long runs (e.g. navigate + OCR) that would exceed a normal synchronous tool-call timeout." },
         },
         required: ["code"],
@@ -5633,9 +6015,13 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
           const screenshotParams: Record<string, unknown> = { type: "take_screenshot" };
           if (opts?.fullPage) screenshotParams.fullPage = true;
           if (opts?.selector) screenshotParams.selector = opts.selector;
-          const data = await policyBridge.send(screenshotParams as BridgeCommand, 30000) as { data: string };
+          const data = await policyBridge.send(screenshotParams as BridgeCommand, 30000) as {
+            data: string;
+            mimeType?: string;
+          };
           if (!data?.data) throw new Error("Screenshot capture failed — no image data returned");
-          const tmpPath = join(tmpdir(), `crawlio-ocr-${randomBytes(6).toString("hex")}.png`);
+          const extension = data.mimeType === "image/png" ? "png" : "jpg";
+          const tmpPath = join(tmpdir(), `crawlio-ocr-${randomBytes(6).toString("hex")}.${extension}`);
           try {
             await writeFile(tmpPath, Buffer.from(data.data, "base64"));
             const shimPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "ocr-shim.swift");
@@ -5651,20 +6037,35 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
           } finally { unlink(tmpPath).catch(() => {}); }
         };
 
-        // Build smart object with framework-aware helpers (cached per URL)
+        // Build smart object with framework-aware helpers (cached per tab + URL)
         let currentUrl = "";
+        let currentTabId: number | null = null;
         try {
-          const status = await policyBridge.send({ type: "get_connection_status" }, 3000) as { connectedTab?: { url?: string } };
+          const status = await policyBridge.send({ type: "get_connection_status" }, 3000, { queueWhenOffline: false }) as { connectedTab?: { url?: string; tabId?: number } };
           currentUrl = status?.connectedTab?.url || "";
+          currentTabId = typeof status?.connectedTab?.tabId === "number" ? status.connectedTab.tabId : null;
         } catch { /* rebuild on failure */ }
 
+        // A targeted execute builds `smart` against the tab it targets — detect_framework is
+        // tab-scoped, so it follows the ambient tab — while the connection status only ever
+        // describes the connected tab. Keying on the connected tab would file a React-specialized
+        // helper set built for tab 9 under tab 3 and hand it to the next untargeted script. The
+        // url is dropped with it, since it describes the connected tab too; an empty url fails the
+        // cache-write guard below, so a targeted run rebuilds rather than caching under a key it
+        // cannot describe.
+        const ambientTabId = currentTargetTab();
+        if (ambientTabId !== undefined) {
+          currentTabId = ambientTabId;
+          currentUrl = "";
+        }
+
         let smart: Record<string, unknown>;
-        if (smartObjectCache && smartObjectCache.url === currentUrl && currentUrl !== "") {
+        if (smartObjectCache && smartObjectCache.url === currentUrl && smartObjectCache.tabId === currentTabId && currentUrl !== "") {
           smart = smartObjectCache.smart;
         } else {
           smart = await buildSmartObject(policyBridge);
           // Only cache if framework detection succeeded (more than 7 core keys: evaluate, click, type, navigate, waitFor, snapshot, rebuild)
-          if (currentUrl && Object.keys(smart).length > 7) smartObjectCache = { url: currentUrl, smart };
+          if (currentUrl && Object.keys(smart).length > 7) smartObjectCache = { tabId: currentTabId, url: currentUrl, smart };
         }
 
         try {
@@ -5695,7 +6096,11 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
             const job: JobRecord = { status: "running", startedAt: Date.now(), controller };
             sweepJobs();
             jobRegistry.set(jobId, job);
-            void executeSandboxedCode(code, { ...sandboxGlobals, signal: controller.signal })
+            void executeSandboxedCode(code, {
+              ...sandboxGlobals,
+              signal: controller.signal,
+              onProgress: (report) => { job.progress = appendPhaseReport(job.progress, report); },
+            })
               .then(r => {
                 if (job.status === "cancelled") return; // cancel_job already settled it
                 job.status = "done"; job.value = r.value; job.console = r.console; job.finishedAt = Date.now();
@@ -5725,10 +6130,12 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
       },
     },
 
+    observeTool,
+
     // --- job control: async fire-and-poll for execute({ background: true }) ---
     {
       name: "get_job_result",
-      description: "Poll a background execute job by jobId (returned by execute({ background: true })). Returns { status: running|done|error|cancelled, value?, console?, error?, ageMs, runtimeMs? }, or { status: 'not_found' } if unknown/expired (finished jobs are kept ~10 min).",
+      description: "Poll a background execute job by jobId (returned by execute({ background: true })). Returns { status: running|done|error|cancelled, value?, console?, error?, ageMs, runtimeMs? }, or { status: 'not_found' } if unknown/expired (finished jobs are kept ~10 min). phase/percent come from reportPhase(name, percent) calls inside the job; phases is the recent timeline while it is still running.",
       inputSchema: {
         type: "object",
         properties: { jobId: { type: "string", description: "Job id from execute({ background: true })" } },
@@ -5744,6 +6151,13 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
           ...(job.status === "done" ? { value: job.value } : {}),
           ...(job.status === "error" ? { error: job.error } : {}),
           ...(job.console && job.console.length ? { console: job.console } : {}),
+          ...(job.progress ? {
+            phase: job.progress.current.phase,
+            ...(job.progress.current.percent !== undefined ? { percent: job.progress.current.percent } : {}),
+            // The timeline is what a poller uses to see shape. Once the job is done the value is
+            // the answer, so the history would be noise in the response the model actually reads.
+            ...(job.status === "running" ? { phases: job.progress.history } : {}),
+          } : {}),
           ageMs: Date.now() - job.startedAt,
           ...(job.finishedAt ? { runtimeMs: job.finishedAt - job.startedAt } : {}),
         });
@@ -5759,6 +6173,10 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         const jobs = [...jobRegistry.entries()].map(([jobId, job]) => ({
           jobId,
           status: job.status,
+          ...(job.progress ? {
+            phase: job.progress.current.phase,
+            ...(job.progress.current.percent !== undefined ? { percent: job.progress.current.percent } : {}),
+          } : {}),
           ageMs: now - job.startedAt,
           ...(job.finishedAt ? { runtimeMs: job.finishedAt - job.startedAt } : {}),
         }));

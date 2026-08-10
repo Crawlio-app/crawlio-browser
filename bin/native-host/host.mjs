@@ -14,7 +14,7 @@
 // {type:"pong"}; we answer that, then push the trusted token + port.
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { encodeNativeMessage, decodeNativeMessages, selectProvisionableBridge } from "./provision.mjs";
+import { encodeNativeMessage, decodeNativeMessages, isNativeHostLeaseExpired, selectProvisionableBridge } from "./provision.mjs";
 
 const BRIDGES_DIR = join(homedir(), ".crawlio", "bridges");
 const MAX_STDIN_BUF = 1 * 1024 * 1024; // a ping is tiny; cap the inbound buffer
@@ -56,12 +56,25 @@ async function provisionToken() {
 // Re-provision poll: started once after the first ping so the trusted token follows the
 // active session even while connectNative stays open. Cleared on stdin end/error.
 let reprovisionTimer = null;
+let leaseTimer = null;
+let lastPingAt = 0;
 function startReprovisionPoll() {
   if (reprovisionTimer) return;
   reprovisionTimer = setInterval(() => { void provisionToken(); }, 2500);
 }
+function startLeaseWatch() {
+  if (leaseTimer) return;
+  leaseTimer = setInterval(() => {
+    if (isNativeHostLeaseExpired(lastPingAt)) shutdown();
+  }, 5_000);
+}
 function stopReprovisionPoll() {
   if (reprovisionTimer) { clearInterval(reprovisionTimer); reprovisionTimer = null; }
+}
+function shutdown() {
+  stopReprovisionPoll();
+  if (leaseTimer) { clearInterval(leaseTimer); leaseTimer = null; }
+  process.exit(0);
 }
 
 let buf = Buffer.alloc(0);
@@ -75,11 +88,13 @@ process.stdin.on("data", (chunk) => {
   buf = rest;
   for (const msg of messages) {
     if (msg && msg.type === "ping") {
+      lastPingAt = Date.now();
       send({ type: "pong" }); // satisfy connectNative's liveness handshake
       void provisionToken(); // then deliver the trusted token over this authenticated channel
       startReprovisionPoll(); // and keep it pointed at the active session
+      startLeaseWatch(); // retire if the owning extension worker stops renewing the lease
     }
   }
 });
-process.stdin.on("end", () => { stopReprovisionPoll(); process.exit(0); });
-process.stdin.on("error", () => { stopReprovisionPoll(); process.exit(0); });
+process.stdin.on("end", shutdown);
+process.stdin.on("error", shutdown);

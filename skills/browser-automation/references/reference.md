@@ -7,18 +7,19 @@ inside `execute`. Both read the live builders, so neither can disagree with the 
 
 ## Browser Commands
 
-Commands sent via `bridge.send({ type: "<command>", ...params })`.
+Commands below are sent via `bridge.send({ type: "<command>", ...params })` except where a
+Code Mode helper is named explicitly.
 
 ### Connection & Tab Management
 
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
-| `connect_tab` | Connect to a browser tab (opens new if needed) | `url?`, `tabId?` |
+| `connect_tab` | Connect to a URL (owned tab without `tabs`) or adopt/discover a user tab (`tabs` required) | `url?`, `tabId?`, `background?` |
 | `disconnect_tab` | Disconnect from the current tab | — |
 | `list_tabs` | List all open browser tabs | — |
 | `get_connection_status` | Check current connection state | — |
 | `reconnect_tab` | Reconnect to the last connected tab | — |
-| `get_capabilities` | Get extension capabilities and version | — |
+| `get_capabilities` | Get permission-aware browser-bridge capabilities and version | — |
 | `create_tab` | Create a new browser tab | `url` |
 | `close_tab` | Close a specific tab | `tabId` |
 | `switch_tab` | Switch to a specific tab | `tabId` |
@@ -32,17 +33,17 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | `browser_type` | Type text into an element | `selector`, `text`, `slowly?`, `submit?` |
 | `browser_press_key` | Press a keyboard key | `key`, `modifiers?` |
 | `browser_hover` | Hover over an element | `selector` |
-| `browser_select_option` | Select dropdown option | `selector`, `value?`, `label?`, `index?` |
-| `browser_wait` | Wait for a specified duration | `ms` |
-| `browser_fill_form` | Fill multiple form fields at once | `selector`, `values` |
-| `browser_scroll` | Scroll the page or element | `x?`, `y?`, `selector?`, `direction?` |
+| `browser_select_option` | Select dropdown option | `ref?`, `selector?`, `value` |
+| `browser_wait` | Wait for a specified duration | `seconds` |
+| `browser_fill_form` | Fill multiple ref-addressed form fields at once | `fields` |
+| `browser_scroll` | Scroll the page or a ref/selector-addressed element | `ref?`, `selector?`, `deltaX?`, `deltaY?` |
 | `browser_double_click` | Double-click an element | `selector` |
-| `browser_drag` | Drag from one element to another | `sourceSelector`, `targetSelector` |
-| `browser_file_upload` | Upload a file to an input | `selector`, `filePath` |
-| `browser_evaluate` | Execute JavaScript in the page | `expression`, `returnByValue?` |
-| `browser_snapshot` | Capture accessibility tree snapshot | — |
+| `browser_drag` | Drag from one element to another | `refFrom?`, `refTo?`, `from?`, `to?`, `steps?` |
+| `browser_file_upload` | Upload files to an input | `selector`, `files` |
+| `browser_evaluate` | Execute JavaScript in the page | `expression` |
+| `browser_snapshot` | Capture accessibility tree snapshot | `interactive?`, `compact?`, `maxDepth?`, `selector?` |
 | `browser_wait_for` | Wait for element to appear | `selector`, `timeout?` |
-| `browser_intercept` | Intercept and modify network requests | `urlPattern`, `action`, `responseBody?`, `statusCode?` |
+| `browser_intercept` | Enable/disable interception with block/modify/mock rules | `action?`, `patterns?` |
 
 ### Data Capture
 
@@ -53,10 +54,10 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | `start_network_capture` | Start capturing network requests | — |
 | `stop_network_capture` | Stop and return captured network requests | — |
 | `get_console_logs` | Get console log entries | — |
-| `get_cookies` | Get all cookies for the current page | `url?` |
-| `get_dom_snapshot` | Get DOM snapshot | `depth?` |
+| `get_cookies` | Get all cookies for the current page | — |
+| `get_dom_snapshot` | Get DOM snapshot | `maxDepth?` |
 | `take_screenshot` | Take a screenshot | `fullPage?`, `selector?`, `format?`, `quality?` |
-| `ocr_screenshot` | Extract text from page via Vision.framework OCR (macOS) | `fullPage?`, `selector?` |
+| `ocrScreenshot()` | Code Mode helper for Vision.framework OCR (macOS) | `fullPage?`, `selector?` |
 | `get_response_body` | Get response body for a network request | `requestId` |
 | `get_websocket_connections` | List active WebSocket connections | — |
 | `get_websocket_messages` | Get messages for a WebSocket connection | `requestId`, `limit?` |
@@ -74,7 +75,7 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
 | `set_cookie` | Set a cookie | `name`, `value`, `domain?`, `path?`, `secure?`, `httpOnly?`, `sameSite?`, `expires?` |
-| `delete_cookies` | Delete cookies | `name?`, `domain?`, `url?` |
+| `delete_cookies` | Delete cookies | `name?`, `domain?`, `path?` |
 | `get_storage` | Get localStorage or sessionStorage | `storageType` |
 | `set_storage` | Set a storage item | `storageType`, `key`, `value` |
 | `clear_storage` | Clear storage | `storageType` |
@@ -98,7 +99,7 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
-| `set_viewport` | Set viewport dimensions | `width`, `height`, `deviceScaleFactor?`, `isMobile?` |
+| `set_viewport` | Set viewport dimensions | `width`, `height`, `deviceScaleFactor?`, `mobile?` |
 | `set_user_agent` | Override the user agent string | `userAgent` |
 | `emulate_device` | Emulate a device preset | `device` |
 | `set_geolocation` | Set geolocation coordinates | `latitude`, `longitude`, `accuracy?` |
@@ -107,8 +108,8 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
-| `emulate_network` | Emulate network conditions | `offline?`, `latency?`, `downloadThroughput?`, `uploadThroughput?` |
-| `set_cache_disabled` | Enable or disable cache | `cacheDisabled` |
+| `emulate_network` | Emulate network conditions | `preset?`, `downloadKbps?`, `uploadKbps?`, `latencyMs?` |
+| `set_cache_disabled` | Enable or disable cache | `disabled` |
 | `set_extra_headers` | Set extra HTTP headers | `headers` |
 | `set_stealth_mode` | Enable stealth mode to avoid detection | `enabled` |
 
@@ -124,8 +125,8 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
 | `list_service_workers` | List registered service workers | — |
-| `stop_service_worker` | Stop a service worker | `versionId` |
-| `bypass_service_worker` | Bypass service worker for network | `bypass` |
+| `stop_service_worker` | Stop a service worker | `registrationId` |
+| `bypass_service_worker` | Bypass service worker for network | `enabled` |
 
 ### DOM Manipulation
 
@@ -135,7 +136,7 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | `set_attribute` | Set an attribute on an element | `selector`, `name`, `value` |
 | `remove_attribute` | Remove an attribute from an element | `selector`, `name` |
 | `remove_node` | Remove an element from the DOM | `selector` |
-| `highlight_element` | Visually highlight an element | `selector`, `color?`, `duration?` |
+| `highlight_element` | Visually highlight an element | `selector`, `color?` |
 
 ### Performance & Coverage
 
@@ -147,8 +148,8 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | `start_js_coverage` | Start JS coverage collection | — |
 | `stop_js_coverage` | Stop and return JS coverage data | — |
 | `get_computed_style` | Get computed styles for an element | `selector`, `properties?` |
-| `detect_fonts` | Detect fonts used on the page | `selector?` |
-| `force_pseudo_state` | Force CSS pseudo state (hover, focus, etc.) | `selector`, `pseudoClasses` |
+| `detect_fonts` | Detect fonts used on the page | `selectors?` |
+| `force_pseudo_state` | Force CSS pseudo state (hover, focus, etc.) | `selector`, `states` |
 | `show_layout_shifts` | Visualize cumulative layout shifts | — |
 | `show_paint_rects` | Show paint rectangles | `enabled` |
 
@@ -167,16 +168,16 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
-| `get_databases` | List IndexedDB databases | `securityOrigin?` |
-| `query_object_store` | Query an IndexedDB object store | `databaseName`, `objectStoreName`, `securityOrigin?`, `limit?` |
-| `clear_database` | Clear an IndexedDB database | `databaseName`, `objectStoreName`, `securityOrigin?` |
+| `get_databases` | List IndexedDB databases | `origin?` |
+| `query_object_store` | Query an IndexedDB object store | `database`, `store`, `limit?`, `skip?`, `index?` |
+| `clear_database` | Clear a store or delete a database | `database`, `store?` |
 
 ### Export & PDF
 
 | Command | Description | Key Parameters |
 |---------|-------------|----------------|
 | `print_to_pdf` | Print page to PDF | `landscape?`, `displayHeaderFooter?`, `scale?`, `paperWidth?`, `paperHeight?` |
-| `extract_site` | Full site extraction via Crawlio | `url`, `format?` |
+| `extract_site` | Start a Crawlio crawl (active URL by default) | `url?` |
 
 ### Crawlio Desktop Bridge
 
@@ -185,11 +186,13 @@ Commands sent via `bridge.send({ type: "<command>", ...params })`.
 | `get_crawl_status` | Get Crawlio crawl status | — |
 | `get_enrichment` | Get enrichment data for a URL | `url?` |
 | `get_crawled_urls` | Get list of crawled URLs | `status?`, `type?`, `limit?`, `offset?` |
-| `enrich_url` | Submit enrichment data to Crawlio | `url`, `framework?`, `networkRequests?`, `consoleLogs?`, `domSnapshotJSON?` |
+| `enrich_url` | Navigate, capture, and submit enrichment to Crawlio | `url`, `waitMs?` |
 
 ## Desktop Commands
 
-Commands sent via `crawlio.api(method, path, body?)`. Requires Crawlio desktop app running.
+Commands sent via `crawlio.api(method, path, body?)`. Requires Crawlio desktop app running. The
+runtime authenticates automatically from `CRAWLIO_MCP_TOKEN` or Crawlio.app's mode-0600 local
+`mcp.token`; skills never read, print, or pass the credential themselves.
 
 | Command | HTTP | Description |
 |---------|------|-------------|
@@ -240,7 +243,7 @@ The `smart` object provides auto-waiting wrappers and framework-specific data:
 | `smart.type(selector, text, opts?)` | Poll + type + 300ms settle. Accepts CSS selectors or snapshot refs. |
 | `smart.navigate(url, opts?)` | Navigate + 1000ms settle |
 | `smart.waitFor(selector, timeout?)` | Poll until element is actionable |
-| `smart.snapshot()` | Capture accessibility snapshot |
+| `smart.snapshot(opts?)` | Capture accessibility snapshot; supports `interactive`, `compact`, `maxDepth`, `selector` |
 | `smart.rebuild()` | Refresh framework detection cache (forces re-probe on next call) |
 
 > **Note:** There is no `smart.screenshot()` method. For screenshots, use `bridge.send({ type: 'take_screenshot' })` or `smart.scrollCapture()` for multi-section visual evidence.
@@ -261,6 +264,7 @@ The `smart` object provides auto-waiting wrappers and framework-specific data:
 | `smart.alpine` | `getVersion`, `getStoreKeys`, `getComponentCount` |
 | `smart.shopify` | `getShop`, `getCart` |
 | `smart.wordpress` | `isWP`, `getRestUrl`, `getPlugins` |
+| `smart.woocommerce` | `getParams` |
 | `smart.laravel` | `getCSRF` |
 | `smart.django` | `getCSRF` |
 | `smart.drupal` | `getSettings` |

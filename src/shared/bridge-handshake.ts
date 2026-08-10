@@ -26,8 +26,13 @@
 
 const CHALLENGE_TYPE = "__crawlio_challenge__";
 const HANDSHAKE_TYPE = "__crawlio_handshake__";
+const HANDSHAKE_ACCEPTED_TYPE = "__crawlio_handshake_accepted__";
 
-export const HANDSHAKE_MESSAGE_TYPES = { challenge: CHALLENGE_TYPE, handshake: HANDSHAKE_TYPE } as const;
+export const HANDSHAKE_MESSAGE_TYPES = {
+  challenge: CHALLENGE_TYPE,
+  handshake: HANDSHAKE_TYPE,
+  accepted: HANDSHAKE_ACCEPTED_TYPE,
+} as const;
 
 function bytesToBase64(bytes: Uint8Array): string {
   let bin = "";
@@ -83,4 +88,32 @@ export function evaluateServerTrust(hasTrustedToken: boolean, handshakeVerified:
   if (handshakeVerified) return "trusted";
   if (hasTrustedToken) return "refuse";
   return "tofu-allow";
+}
+
+export interface BridgeResponseRerouteState {
+  /** Token that authenticated the socket when the command was accepted. */
+  commandToken: string | null;
+  /** Token currently provisioned through the authenticated native channel. */
+  currentToken: string | null;
+  /** The replacement is the extension's elected command route for the same port. */
+  sameActivePort: boolean;
+  /** The replacement socket is open and has proved the current token. */
+  replacementOpen: boolean;
+  replacementVerified: boolean;
+}
+
+/**
+ * A long-running command can outlive its WebSocket while the same MCP server reconnects.
+ * Its response may move to the replacement socket only when both connections are bound to
+ * the exact same native-provisioned token and the replacement is the verified active route.
+ * TOFU connections deliberately cannot reroute: without a token there is no stable identity
+ * with which to distinguish a reconnect from a different listener reusing the port.
+ */
+export function canRerouteBridgeResponse(state: BridgeResponseRerouteState): boolean {
+  return state.commandToken !== null
+    && state.currentToken !== null
+    && timingSafeStringEqual(state.commandToken, state.currentToken)
+    && state.sameActivePort
+    && state.replacementOpen
+    && state.replacementVerified;
 }

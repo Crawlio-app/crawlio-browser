@@ -186,3 +186,20 @@ describe("PAGE_SOURCED_TOOLS", () => {
     expect(PAGE_SOURCED_TOOLS.has("compile_recording")).toBe(false);
   });
 });
+
+describe("background jobs cross the same boundary as foreground ones", () => {
+  it("wraps the output of the job-polling tools", () => {
+    // `execute({background:true})` returns only a jobId, so the page text a script produces
+    // reaches the model through get_job_result instead. While these were excluded, the identical
+    // script was marked untrusted run in the foreground and trusted run in the background — and
+    // reportPhase() labels gave sandbox code a second way to put page text in front of the model
+    // with no marker on it.
+    expect(PAGE_SOURCED_TOOLS.has("execute")).toBe(true);
+    expect(PAGE_SOURCED_TOOLS.has("get_job_result")).toBe(true);
+    expect(PAGE_SOURCED_TOOLS.has("list_jobs")).toBe(true);
+  });
+
+  it("leaves cancel_job alone, which only acknowledges", () => {
+    expect(PAGE_SOURCED_TOOLS.has("cancel_job")).toBe(false);
+  });
+});

@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { describe, it, expect, vi } from "vitest";
-import { createTools, TOOL_TIMEOUTS } from "@/mcp-server/tools";
+import { createCodeModeTools, createTools, TOOL_TIMEOUTS } from "@/mcp-server/tools";
 
 function createMockBridge(responses: unknown[] = []) {
   const queue = [...responses];
@@ -22,13 +22,16 @@ describe("robot training MCP tools", () => {
     "robot_training_start",
     "robot_training_status",
     "robot_training_stop",
+    "robot_training_clear",
     "robot_training_artifacts",
     "recording_start",
     "recording_status",
     "recording_stop",
+    "recording_clear",
     "recording_artifacts",
     "recording_capture_bundle",
     "recording_validate_bundle",
+    "monitor_page",
   ];
 
   it("registers the robot training tool surface", () => {
@@ -43,12 +46,16 @@ describe("robot training MCP tools", () => {
   it("starts a fresh monitored recording run and writes a manifest", async () => {
     const outputDir = await mkdtemp(join(tmpdir(), "robot-training-start-"));
     try {
-      const bridge = createMockBridge([
-        { tabId: 101, url: "https://example.com", title: "Example", connected: true },
-        "started",
-        { sessionId: "rec_1" },
-        { result: { ok: true, monitor: "robot-training", entries: 1 }, type: "object" },
-      ]);
+      const bridge = createMockBridge([{
+        runId: "rt_test",
+        targetUrl: "https://example.com",
+        outputDir,
+        tabId: 101,
+        recordingId: "rec_1",
+        startedAt: "2026-05-19T00:00:00Z",
+        status: "recording",
+        monitor: { installed: true, survivesNavigation: true },
+      }]);
       const tool = createTools(bridge as any, createMockCrawlio()).find(t => t.name === "robot_training_start")!;
 
       const result = await tool.handler({
@@ -62,18 +69,19 @@ describe("robot training MCP tools", () => {
       expect(result.isError).toBe(false);
       expect(payload.runId).toBe("rt_test");
       expect(payload.tabId).toBe(101);
-      expect(bridge.send).toHaveBeenNthCalledWith(1, {
-        type: "create_tab",
+      const types = bridge.send.mock.calls.map((c: unknown[]) => (c[0] as { type: string }).type);
+      expect(types).toEqual(["robot_training_start"]);
+      expect(bridge.send).toHaveBeenCalledWith({
+        type: "robot_training_start",
         url: "https://example.com",
-        active: true,
-        connect: true,
-      }, TOOL_TIMEOUTS.robot_training_start);
-      expect(bridge.send).toHaveBeenNthCalledWith(2, { type: "start_network_capture" }, 5000);
-      expect(bridge.send).toHaveBeenNthCalledWith(3, {
-        type: "start_recording",
+        runId: "rt_test",
+        outputDir,
         maxDurationSec: undefined,
         maxInteractions: undefined,
-      }, 10000);
+        active: true,
+        injectMonitor: true,
+        captureStorageValues: false,
+      }, 30_000);
 
       const manifest = JSON.parse(await readFile(join(outputDir, "manifest.json"), "utf-8"));
       expect(manifest.id).toBe("rt_test");
@@ -85,7 +93,73 @@ describe("robot training MCP tools", () => {
     }
   });
 
-  it("stops a run and writes split artifacts plus mentu-interceptor flows", async () => {
+  it("keeps the automated one-shot bundle capture in an owned background tab", async () => {
+    const outputDir = await mkdtemp(join(tmpdir(), "recording-capture-background-"));
+    const startedAt = "2026-05-19T00:00:00Z";
+    try {
+      const bridge = createMockBridge([
+        {
+          runId: "bundle_bg",
+          targetUrl: "https://example.com",
+          outputDir,
+          tabId: 202,
+          recordingId: "rec_bg",
+          startedAt,
+          status: "recording",
+        },
+        { status: "idle" },
+        {
+          run: {
+            runId: "bundle_bg",
+            targetUrl: "https://example.com",
+            outputDir,
+            tabId: 202,
+            recordingId: "rec_bg",
+            startedAt,
+            status: "stopped",
+          },
+          recording: {
+            id: "rec_bg",
+            startedAt,
+            duration: 1,
+            pages: [],
+            metadata: { tabId: 202, initialUrl: "https://example.com", stopReason: "manual" },
+          },
+          network: [],
+          bodies: {},
+          state: {},
+          stateLog: [],
+        },
+      ]);
+      const capture = createTools(bridge as any, createMockCrawlio())
+        .find((tool) => tool.name === "recording_capture_bundle")!;
+
+      const result = await capture.handler({
+        url: "https://example.com",
+        bundleID: "bundle_bg",
+        outputDir,
+        idleTime: 100,
+        timeout: 1_000,
+      }) as any;
+
+      expect(result.isError).toBe(false);
+      expect(bridge.send).toHaveBeenNthCalledWith(1, {
+        type: "robot_training_start",
+        url: "https://example.com",
+        runId: "bundle_bg",
+        outputDir,
+        maxDurationSec: undefined,
+        maxInteractions: undefined,
+        active: false,
+        injectMonitor: true,
+        captureStorageValues: false,
+      }, 30_000);
+    } finally {
+      await rm(outputDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stops a run and writes the canonical artifacts plus a captured-endpoint OpenAPI draft", async () => {
     const outputDir = await mkdtemp(join(tmpdir(), "robot-training-stop-"));
     try {
       const recording = {
@@ -114,17 +188,22 @@ describe("robot training MCP tools", () => {
         metadata: { tabId: 101, initialUrl: "https://example.com", stopReason: "manual" },
       };
       const bridge = createMockBridge([
-        { tabId: 101, url: "https://example.com", title: "Example", connected: true },
-        "started",
-        { sessionId: "rec_1" },
-        { result: { ok: true, monitor: "robot-training", entries: 1 }, type: "object" },
-        { result: [{ id: 1, reason: "init" }], type: "object" },
-        recording,
-        { body: "{\"done\":true}", base64Encoded: false, truncated: false, mimeType: "application/json" },
-        recording.pages[0].network,
-        [],
-        { cookies: [] },
-        { result: { url: "https://example.com", title: "Example" }, type: "object" },
+        {
+          runId: "rt_stop", targetUrl: "https://example.com", outputDir, tabId: 101,
+          recordingId: "rec_1", startedAt: "2026-05-19T00:00:00Z", status: "recording",
+        },
+        {
+          run: {
+            runId: "rt_stop", targetUrl: "https://example.com", outputDir, tabId: 101,
+            recordingId: "rec_1", startedAt: "2026-05-19T00:00:00Z",
+            stoppedAt: "2026-05-19T00:00:01Z", status: "stopped",
+          },
+          recording,
+          network: recording.pages[0].network,
+          bodies: { "1": { body: "{\"done\":true}", base64Encoded: false } },
+          state: { cookies: [] },
+          stateLog: [{ id: 1, reason: "init" }],
+        },
       ]);
       const tools = createTools(bridge as any, createMockCrawlio());
       const start = tools.find(t => t.name === "robot_training_start")!;
@@ -146,14 +225,69 @@ describe("robot training MCP tools", () => {
       expect(flows).toContain("https://example.com/api/do");
       expect(JSON.parse(await readFile(join(outputDir, "state-log.json"), "utf-8"))).toHaveLength(1);
       expect(JSON.parse(await readFile(join(outputDir, "recording.json"), "utf-8")).pages[0].interactions[0].source).toBe("user");
+      const openapi = JSON.parse(await readFile(join(outputDir, "api.openapi.yaml"), "utf-8"));
+      expect(openapi.openapi).toBe("3.1.0");
+      expect(openapi.paths["/api/do"].post.responses["200"]).toBeDefined();
+      expect(openapi.paths["/api/do"].post.requestBody.content["application/json"]).toBeDefined();
 
       const sentTypes = bridge.send.mock.calls.map(([command]) => (command as { type?: string }).type);
-      expect(sentTypes.indexOf("browser_evaluate")).toBeLessThan(sentTypes.indexOf("stop_recording"));
-      expect(sentTypes.indexOf("stop_recording")).toBeLessThan(sentTypes.indexOf("get_response_body"));
-      expect(sentTypes.indexOf("get_response_body")).toBeLessThan(sentTypes.indexOf("stop_network_capture"));
+      expect(sentTypes).toEqual(["robot_training_start", "robot_training_stop"]);
+      expect(bridge.send).toHaveBeenLastCalledWith({
+        type: "robot_training_stop",
+        runId: "rt_stop",
+        fetchBodies: true,
+        closeTab: false,
+      }, 90_000);
     } finally {
       await rm(outputDir, { recursive: true, force: true });
     }
+  });
+
+  it("exposes one default-mode observe control plane for resident lifecycles", async () => {
+    const bridge = createMockBridge([{ resident: true, runs: [] }]);
+    const tools = createCodeModeTools(bridge as any, createMockCrawlio());
+    const observe = tools.find((tool) => tool.name === "observe");
+    expect(observe).toBeDefined();
+    expect(tools.map((tool) => tool.name)).toContain("observe");
+    expect(observe!.inputSchema.properties).toHaveProperty("active");
+
+    const result = await observe!.handler({ action: "training_status", runId: "rt_status" }) as any;
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ resident: true, runs: [] });
+    expect(bridge.send).toHaveBeenCalledWith({ type: "robot_training_status", runId: "rt_status" }, 10_000);
+  });
+
+  it("clears one stopped retained run only after explicit confirmation", async () => {
+    const bridge = createMockBridge([{ cleared: "rt_clear", artifactsPreserved: true }]);
+    const tools = createTools(bridge as any, createMockCrawlio());
+    const clear = tools.find((tool) => tool.name === "robot_training_clear")!;
+
+    await expect(clear.handler({ runId: "../../escape", confirm: true })).rejects.toThrow();
+    await expect(clear.handler({ runId: "rt_clear", confirm: false })).rejects.toThrow();
+
+    const result = await clear.handler({ runId: "rt_clear", confirm: true }) as any;
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ cleared: "rt_clear", artifactsPreserved: true });
+    expect(bridge.send).toHaveBeenCalledTimes(1);
+    expect(bridge.send).toHaveBeenCalledWith({
+      type: "robot_training_clear",
+      runId: "rt_clear",
+      confirm: true,
+    }, 10_000);
+  });
+
+  it("routes recording_clear through the default observe alias", async () => {
+    const bridge = createMockBridge([{ cleared: "rec_clear", artifactsPreserved: true }]);
+    const observe = createCodeModeTools(bridge as any, createMockCrawlio())
+      .find((tool) => tool.name === "observe")!;
+
+    const result = await observe.handler({ action: "recording_clear", bundleID: "rec_clear", confirm: true }) as any;
+    expect(result.isError).toBe(false);
+    expect(bridge.send).toHaveBeenCalledWith({
+      type: "robot_training_clear",
+      runId: "rec_clear",
+      confirm: true,
+    }, 10_000);
   });
 
   it("validates a canonical bundle directory without reading body payloads into the response", async () => {

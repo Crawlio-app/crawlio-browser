@@ -33,6 +33,21 @@ describe("Phase 2 perception tools", () => {
     expect(result.isError).toBe(false);
     expect(bridge.send).toHaveBeenCalledWith({ type: "get_user_tabs" }, TOOL_TIMEOUTS.get_user_tabs);
   });
+
+  it("browser_wait_for advertises and forwards an explicit target tab", async () => {
+    const bridge = createMockBridge({ found: true });
+    const tool = createTools(bridge as any, createMockCrawlio()).find(x => x.name === "browser_wait_for")!;
+    const properties = tool.inputSchema.properties as Record<string, unknown>;
+
+    expect(properties.tabId).toBeDefined();
+    const result = await tool.handler({ tabId: 42, selector: "#ready", state: "visible", timeout: 5000 }) as any;
+
+    expect(result.isError).toBe(false);
+    expect(bridge.send).toHaveBeenCalledWith(
+      { type: "wait_for_selector", tabId: 42, selector: "#ready", state: "visible", timeout: 5000 },
+      TOOL_TIMEOUTS.browser_wait_for,
+    );
+  });
 });
 
 describe("Phase 4 turn_id correlation", () => {

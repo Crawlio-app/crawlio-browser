@@ -10,12 +10,13 @@ import { ZodError } from "zod";
 import rateLimit from "express-rate-limit";
 import { PKG_VERSION } from "../shared/constants.js";
 import { WebSocketBridge } from "./websocket-bridge.js";
-import { CrawlioClient } from "./crawlio-client.js";
+import { CrawlioClient, isCrawlioUnavailableError } from "./crawlio-client.js";
 import { createTools, createCodeModeTools, TOOL_TIMEOUTS, toolError, problemOf, ensurePermission, PERMISSION_EXEMPT_TOOLS } from "./tools.js";
 import { loadActionPolicy, checkActionPolicy, initPolicyReloader, reloadPolicyIfChanged, type ActionPolicy } from "./action-policy.js";
 import { applyToolResponseSafety, type ToolResponseEnvelope } from "./tool-response-safety.js";
 import { resolveStdioLifecycleConfig, decideStdioIdleExit } from "./lifecycle.js";
 import { startSessionTelemetry, recordToolCall } from "./telemetry.js";
+import { withTargetTab } from "./target-tab.js";
 import { appendFileSync, mkdirSync, existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join, dirname } from "path";
@@ -165,19 +166,46 @@ function noteInboundRequest(): number {
 // sub-3s timeout to a 45s floor when the bridge is offline (the queue lane in send()), so race
 // the status probe against a 3s fallback — origin resolution must never block a tool response
 // past its own 3s budget. Falls back to "unknown" when the probe is slow, offline, or fails.
-async function resolveConnectedOrigin(): Promise<string> {
+async function resolveConnectedOrigin(targetTabId?: number): Promise<string> {
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-  const probe = (bridge.send({ type: "get_connection_status" }, 3000) as Promise<{ connectedTab?: { url?: string } }>)
-    .catch(() => ({} as { connectedTab?: { url?: string } }));
-  const fallback = new Promise<{ connectedTab?: { url?: string } }>((resolve) => {
-    fallbackTimer = setTimeout(() => resolve({}), 3000);
-  });
+  type Probe = { connectedTab?: { url?: string }; tabs?: Array<{ id?: number; tabId?: number; url?: string }> };
+  // A command that named a tab produced content from THAT tab, so the label has to describe it.
+  // get_connection_status only ever describes the connected tab — labelling tab 9's page with the
+  // connected tab's origin would tell the agent that attacker-controlled text came from the page
+  // it trusts, which is the one decision this label exists to inform.
+  const command = targetTabId === undefined
+    ? { type: "get_connection_status" as const }
+    : { type: "list_tabs" as const };
+  const probe = (bridge.send(command, 3000, { queueWhenOffline: false }) as Promise<Probe>).catch(() => ({} as Probe));
+  const fallback = new Promise<Probe>((resolve) => { fallbackTimer = setTimeout(() => resolve({}), 3000); });
   try {
     const status = await Promise.race([probe, fallback]);
-    return status?.connectedTab?.url || "unknown";
+    if (targetTabId === undefined) return status?.connectedTab?.url || "unknown";
+    const tab = (status?.tabs ?? []).find((t) => (t.id ?? t.tabId) === targetTabId);
+    return tab?.url || "unknown";
   } finally {
     if (fallbackTimer) clearTimeout(fallbackTimer);
   }
+}
+
+/**
+ * Tools a caller polls in a loop, where probing the browser per call is the wrong trade.
+ *
+ * The content boundary exists to MARK page-sourced text so the model can tell it from
+ * instructions; the origin label on the wrapper is informational. Resolving it costs a
+ * `get_connection_status` round trip that, with the browser detached, takes the offline queue lane
+ * and waits out a 3s fallback — measured at 3001ms and 3002ms on a job poll, during which the job
+ * advanced seven phases unobserved. Worse, each probe enqueues a command into a bounded queue, so
+ * a client polling every 200ms evicts real work with its own telemetry.
+ *
+ * A background job may also have visited several pages, so there is no single honest origin to
+ * report. These get the wrapper — the security property — with a static label.
+ */
+const POLLED_TOOLS = new Set(["get_job_result", "list_jobs"]);
+
+function resolveOriginFor(toolName: string, targetTabId?: number): Promise<string> {
+  if (POLLED_TOOLS.has(toolName)) return Promise.resolve("background-job");
+  return resolveConnectedOrigin(targetTabId);
 }
 
 const tools = codeMode
@@ -188,7 +216,7 @@ if (!codeMode) {
   // Counted, not quoted. This line said 114 for as long as the surface had been 145.
   console.error(`[MCP] Full mode — exposing all ${tools.length} tools`);
 } else {
-  console.error(`[MCP] Code mode (default) — ${tools.length} tools (search, execute, connect_tab + async jobs: get_job_result, list_jobs, cancel_job)`);
+  console.error(`[MCP] Code mode (default) — ${tools.length} tools (search, execute, observe, connect_tab + async jobs: get_job_result, list_jobs, cancel_job)`);
 }
 
 // --- Action policy ---
@@ -228,6 +256,19 @@ function createMcpServer(): Server {
     // Track in-flight tool requests so the stdio idle watcher never exits mid-call,
     // and stamp lastToolActivity on every exit path (success, error, or early return).
     activeRequests++;
+
+    // Publish the activity signal NOW, on receipt, not only when the call finishes.
+    //
+    // The extension attaches to exactly one server and elects the one with the freshest
+    // lastActivityAt. Stamping only in the `finally` meant a server that did not hold the browser
+    // could not say it wanted it until its first call had already failed — and a browser call
+    // with no extension takes the offline queue lane, so "already failed" means 45 seconds later.
+    // With a portal running alongside an editor's own stdio server, the one the user is actually
+    // typing into loses the election, every browser tool reports "extension not connected", and
+    // the MCP connection looks broken when it is fine. Stamping on receipt lets the server the
+    // user is using win within a discovery pass.
+    bridge.noteActivity(noteInboundRequest());
+
     try {
       const tool = tools.find((t) => t.name === toolName);
       if (!tool) {
@@ -255,8 +296,15 @@ function createMcpServer(): Server {
       const timer = setTimeout(() => controller.abort(), timeout);
 
       try {
+        const args = request.params.arguments ?? {};
+        const rawTabId = (args as Record<string, unknown>).tabId;
+        const targetTabId = typeof rawTabId === "number" && Number.isInteger(rawTabId) && rawTabId >= 0
+          ? rawTabId
+          : undefined;
         const result = await Promise.race([
-          tool.handler(request.params.arguments ?? {}),
+          // The handler's Zod schema will strip `tabId`, so carry it alongside the call and let
+          // bridge.send() stamp it onto tab-scoped commands. See ./target-tab.ts.
+          withTargetTab(rawTabId, () => tool.handler(args)),
           new Promise<never>((_, reject) => {
             controller.signal.addEventListener("abort", () =>
               reject(new Error(`Tool '${toolName}' timed out after ${timeout}ms`))
@@ -266,7 +314,7 @@ function createMcpServer(): Server {
         await applyToolResponseSafety({
           toolName,
           response: result as ToolResponseEnvelope,
-          resolveOrigin: resolveConnectedOrigin,
+          resolveOrigin: () => resolveOriginFor(toolName, targetTabId),
         });
         return result as Record<string, unknown>;
       } catch (error) {
@@ -313,7 +361,11 @@ async function main() {
       bridge.push({ type: "set_crawlio_port", port });
       console.error(`[MCP] Pushed Crawlio port ${port} to extension`);
     } catch (e) {
-      console.error("[MCP] Could not push Crawlio port:", e);
+      // The desktop app is an optional enrichment sidecar. Its normal absence must not make a
+      // healthy browser bridge look like an MCP failure; unexpected failures remain visible.
+      if (!isCrawlioUnavailableError(e)) {
+        console.error("[MCP] Could not push Crawlio port:", e instanceof Error ? e.message : e);
+      }
     }
   };
 
@@ -322,7 +374,11 @@ async function main() {
       const port = await crawlio.getPort();
       bridge.push({ type: "set_crawlio_port", port });
       console.error(`[MCP] Port refresh: pushed Crawlio port ${port}`);
-    } catch (e) { console.error("[MCP] Port refresh failed:", e); }
+    } catch (e) {
+      if (!isCrawlioUnavailableError(e)) {
+        console.error("[MCP] Port refresh failed:", e instanceof Error ? e.message : e);
+      }
+    }
   };
 
   if (portalMode) {
@@ -469,7 +525,7 @@ async function startPortalServer(port: number): Promise<void> {
       version: PKG_VERSION,
       mode: codeMode ? "code" : "full",
       transport: "portal",
-      bridgeConnected: bridge.isConnected,
+      bridgeConnected: bridge.isReady,
       toolCount: tools.length,
       uptime: process.uptime(),
     });
@@ -502,14 +558,6 @@ process.on("uncaughtException", (err) => {
   const code = (err as NodeJS.ErrnoException).code;
   // EPIPE on stdout/stderr is normal during MCP disconnect — don't crash
   if (code === "EPIPE") return;
-  // A WS-bridge port collision must NOT take down the stdio server — that was the disconnect
-  // bug (EADDRINUSE from listen() → here → exit). The bridge now walks the port range itself
-  // (websocket-bridge.ts); this is defense-in-depth for any bind error that still escapes:
-  // log and keep serving. Browser tools degrade cleanly via the bridge's isConnected guard.
-  if (code === "EADDRINUSE" || code === "EACCES" || code === "EADDRNOTAVAIL") {
-    console.error(`[MCP] non-fatal listen error (${code}) — bridge port issue, MCP stays up:`, err.message);
-    return;
-  }
   lastFatalReason = `uncaughtException: ${err.message}`;
   console.error("[MCP] CRASH — uncaughtException:", err.stack ?? err.message);
   process.exit(1);

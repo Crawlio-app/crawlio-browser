@@ -1,15 +1,11 @@
-// Session tab-group manager — maps an agent browser session to a Chrome tab group so each
-// session owns a *visible fleet* of tabs. Each tracked tab carries an origin so we know which tabs the
+// Logical session-tab registry. Each tracked tab carries an origin so we know which tabs the
 // agent created (and may close) vs. ones it adopted from the user (which it must not close).
-//
-// Requires the optional `tabGroups` permission. When the permission is absent, grouping
-// degrades gracefully: the registry still tracks membership but no Chrome group is created
-// (groupId = NO_GROUP), so single-tab sessions keep working unchanged.
+// Crawlio intentionally does not declare `tabGroups`: visible Chrome grouping would add another
+// optional permission and store-review explanation without improving browser control.
 
 const SESSION_GROUPS_KEY = "crawlio:sessionGroups";
 export const SESSION_GROUP_DEFAULT_TITLE = "Crawlio";
-export const SESSION_GROUP_DELIVERABLE_TITLE = "✅ Crawlio";
-/** Sentinel groupId used when the tabGroups permission is not granted. */
+/** Back-compat sentinel for persisted records created before visible grouping was removed. */
 export const NO_GROUP = -1;
 
 export type TabOrigin = "agent" | "user";
@@ -130,41 +126,10 @@ async function saveSessionGroups(store: SessionGroupStore): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Chrome tab-group operations
+// Logical membership operations
 // ---------------------------------------------------------------------------
 
-export function hasTabGroupsPermission(): Promise<boolean> {
-  return new Promise((resolve) => {
-    try {
-      chrome.permissions.contains({ permissions: ["tabGroups"] }, (granted) => resolve(granted === true));
-    } catch {
-      resolve(false);
-    }
-  });
-}
-
-// Group a tab into the session's Chrome group, creating the group on first use. Best-effort:
-// if tabGroups isn't permitted the membership is still tracked but no visual group is made.
-async function groupTabInChrome(group: SessionGroup, tabId: number): Promise<number> {
-  if (!(await hasTabGroupsPermission())) return NO_GROUP;
-  try {
-    const opts: chrome.tabs.GroupOptions =
-      group.groupId !== NO_GROUP ? { groupId: group.groupId, tabIds: tabId } : { tabIds: tabId };
-    const groupId = await chrome.tabs.group(opts);
-    if (group.groupId === NO_GROUP || group.groupId !== groupId) {
-      try {
-        await chrome.tabGroups.update(groupId, { title: group.title });
-      } catch {
-        // Title is cosmetic.
-      }
-    }
-    return groupId;
-  } catch {
-    return group.groupId;
-  }
-}
-
-/** Add (or re-add) a tab to a session's group, creating the registry entry + Chrome group lazily. */
+/** Add (or re-add) a tab to a session's logical group. */
 export async function addTabToSessionGroup(
   sessionId: string,
   tabId: number,
@@ -173,8 +138,7 @@ export async function addTabToSessionGroup(
 ): Promise<SessionGroup> {
   const store = await loadSessionGroups();
   let group = store[sessionId] ?? { sessionId, groupId: NO_GROUP, title, tabs: [] };
-  const groupId = await groupTabInChrome(group, tabId);
-  group = upsertTabRecord({ ...group, groupId }, tabId, origin);
+  group = upsertTabRecord({ ...group, groupId: NO_GROUP }, tabId, origin);
   store[sessionId] = group;
   await saveSessionGroups(store);
   return group;
@@ -190,19 +154,13 @@ export async function claimTabIntoSession(sessionId: string, tabId: number): Pro
   return addTabToSessionGroup(sessionId, tabId, "user");
 }
 
-/** Rename a session's Chrome group (and the stored title). */
+/** Rename a logical session group. */
 export async function renameSessionGroup(sessionId: string, title: string): Promise<SessionGroup | null> {
   const store = await loadSessionGroups();
   const group = store[sessionId];
   if (!group) return null;
   group.title = title;
-  if (group.groupId !== NO_GROUP && (await hasTabGroupsPermission())) {
-    try {
-      await chrome.tabGroups.update(group.groupId, { title });
-    } catch {
-      // Group may have been dissolved by the user.
-    }
-  }
+  group.groupId = NO_GROUP;
   store[sessionId] = group;
   await saveSessionGroups(store);
   return group;
@@ -218,7 +176,6 @@ export async function finalizeSession(
   if (!group) return { handoff: [], deliverable: [], released: [], closed: [] };
 
   const plan = planFinalize(group, keep);
-  const permitted = await hasTabGroupsPermission();
 
   // Close throwaway agent tabs.
   if (plan.closed.length) {
@@ -226,30 +183,6 @@ export async function finalizeSession(
       await chrome.tabs.remove(plan.closed);
     } catch {
       // Tabs may already be gone.
-    }
-  }
-
-  // Ungroup handed-off + released tabs so they return to the user's normal strip.
-  const ungroup = [...plan.handoff, ...plan.released];
-  if (ungroup.length && permitted) {
-    try {
-      await chrome.tabs.ungroup(ungroup);
-    } catch {
-      // Best effort.
-    }
-  }
-
-  // Move deliverables into a dedicated "✅ Crawlio" group.
-  if (plan.deliverable.length && permitted) {
-    try {
-      const deliverableGroupId = await chrome.tabs.group({ tabIds: plan.deliverable });
-      try {
-        await chrome.tabGroups.update(deliverableGroupId, { title: SESSION_GROUP_DELIVERABLE_TITLE });
-      } catch {
-        // Title is cosmetic.
-      }
-    } catch {
-      // Best effort.
     }
   }
 

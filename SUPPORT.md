@@ -22,7 +22,7 @@ Common causes, in rough order of frequency:
 | Symptom | Likely cause |
 |---|---|
 | Tools time out or say "not connected" | The Chrome extension is not installed, or its bridge is not connected. Check the extension's popup for a connected status. |
-| "permission_denied" in a tool result | An optional permission has not been granted. Open the extension popup and approve the pending request. |
+| "permission_denied" in a tool result | An optional permission has not been granted. Open the extension popup, choose **Complete onboarding**, and authorize the outstanding grants there. |
 | Nothing captured on a `chrome://` or `about:` page | Browser-internal pages are not scriptable via CDP by design. |
 | A page reports being opted out | The site sets `<meta name="crawlio-agent" content="disable">` and the extension respects it. |
 

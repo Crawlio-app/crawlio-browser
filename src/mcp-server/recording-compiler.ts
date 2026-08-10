@@ -42,7 +42,7 @@ export function compileRecording(session: RecordingSession, options: CompileOpti
   lines.push("Connect to a browser tab before running:");
   lines.push("");
   lines.push("```");
-  lines.push(`connect_tab({ url: ${JSON.stringify(session.metadata.initialUrl)} })`);
+  lines.push(`connect_tab({ url: ${JSON.stringify(session.metadata.initialUrl)}, background: true })`);
   lines.push("```");
   lines.push("");
 
@@ -396,4 +396,3 @@ export async function forgeRecordingClaim(
   }
   return claim;
 }
-

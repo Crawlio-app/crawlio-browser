@@ -6,7 +6,11 @@ import {
   createTools,
 } from "@/mcp-server/tools";
 import { MessageQueue } from "@/mcp-server/websocket-bridge";
-import { CrawlioClient } from "@/mcp-server/crawlio-client";
+import {
+  CrawlioClient,
+  CrawlioUnavailableError,
+  isCrawlioUnavailableError,
+} from "@/mcp-server/crawlio-client";
 
 // --- Mock bridge factory ---
 
@@ -51,7 +55,6 @@ describe("Permission Broker — Wire Protocol", () => {
     // granted: false with missing
     const bridge2 = createMockBridge([
       { data: { granted: false, missing: { permissions: ["tabs"] } } },
-      { data: {} }, // request_permissions response (best-effort)
     ]);
     const r2 = await ensurePermission(bridge2 as never, "list_tabs");
     expect(r2.allowed).toBe(false);
@@ -71,36 +74,34 @@ describe("Permission Broker — Wire Protocol", () => {
 });
 
 // ============================================================
-// Group 2: Permission Broker — Phase 2 Fallback (A8/A9 fix)
+// Group 2: Permission Broker — onboarding-only acquisition
 // ============================================================
 
-describe("Permission Broker — Phase 2 Fallback", () => {
-  it("T4: request_permissions called after check_permissions denial", async () => {
+describe("Permission Broker — onboarding-only acquisition", () => {
+  it("T4: a denial never triggers a request_permissions command or extension UI", async () => {
     const bridge = createMockBridge([
       { data: { granted: false, missing: { permissions: ["tabs"] } } },
-      { data: { ok: true } }, // request_permissions
-    ]);
-    await ensurePermission(bridge as never, "list_tabs");
-    expect(bridge.send).toHaveBeenCalledTimes(2);
-    expect(bridge.send.mock.calls[0][0]).toEqual(
-      expect.objectContaining({ type: "check_permissions" })
-    );
-    expect(bridge.send.mock.calls[1][0]).toEqual(
-      expect.objectContaining({ type: "request_permissions" })
-    );
-  });
-
-  it("T5: request_permissions failure doesn't crash — denial still returned", async () => {
-    const bridge = createMockBridge([
-      { data: { granted: false, missing: { permissions: ["tabs"] } } },
-      { error: "Extension disconnected" }, // request_permissions fails
     ]);
     const result = await ensurePermission(bridge as never, "list_tabs");
     expect(result.allowed).toBe(false);
-    expect(result.error).toMatch(/Permission required/);
+    expect(bridge.send).toHaveBeenCalledTimes(1);
+    expect(bridge.send.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ type: "check_permissions" })
+    );
   });
 
-  it("T4b: request_permissions NOT called when check_permissions grants", async () => {
+  it("T5: denial is actionable without staging a badge or widget prompt", async () => {
+    const bridge = createMockBridge([
+      { data: { granted: false, missing: { permissions: ["tabs"] } } },
+    ]);
+    const result = await ensurePermission(bridge as never, "list_tabs");
+    expect(result.allowed).toBe(false);
+    expect(result.error).toContain("list_tabs");
+    expect(result.error).toMatch(/dedicated onboarding page/i);
+    expect(result.error).not.toMatch(/badge|popup|widget/i);
+  });
+
+  it("T4b: a grant requires only the permission check", async () => {
     const bridge = createMockBridge([
       { data: { granted: true } },
     ]);
@@ -108,11 +109,15 @@ describe("Permission Broker — Phase 2 Fallback", () => {
     expect(bridge.send).toHaveBeenCalledTimes(1);
   });
 
-  it("T6: denial message contains 'Click the Crawlio extension icon'", () => {
+  it("T6: denial message guides the user to onboarding, in human language", () => {
     const msg = formatPermissionDenial({ permissions: ["tabs"] }, "list_tabs");
-    expect(msg).toContain("Click the Crawlio extension icon");
     expect(msg).toContain("list_tabs");
-    expect(msg).toContain("tabs");
+    expect(msg).toMatch(/dedicated onboarding page/i);
+    expect(msg).not.toMatch(/badge|Enable Crawlio|popup|widget/i);
+    // Human language, not the raw Chrome permission id.
+    expect(msg).toContain("See your open tabs");
+    // And it must still forbid working around the block.
+    expect(msg).toMatch(/do not attempt workarounds/i);
   });
 });
 
@@ -199,8 +204,14 @@ describe("MessageQueue", () => {
     await queue.drain(sendFn);
 
     expect(sendFn).toHaveBeenCalledTimes(2);
-    // 3rd item remains in queue
-    expect(queue.depth).toBe(1);
+    // Items 2 and 3 both remain. Item 2 never made it onto the wire, so its caller is still
+    // waiting for an answer — failing it here would discard exactly the work the queue exists to
+    // protect. It goes back to the head, still counting against its original deadline, and the
+    // next drain carries it.
+    expect(queue.depth).toBe(2);
+    const order: string[] = [];
+    await queue.drain(async (msg, resolve) => { order.push(JSON.parse(msg).id); resolve({ ok: true }); });
+    expect(order).toEqual(["2", "3"]);
   });
 
   it("queue overflow evicts oldest item", async () => {
@@ -228,6 +239,12 @@ describe("MessageQueue", () => {
 // ============================================================
 
 describe("CrawlioClient — Enrichment Fault Isolation", () => {
+  it("classifies optional desktop-app absence without treating arbitrary failures as expected", () => {
+    expect(isCrawlioUnavailableError(new CrawlioUnavailableError("not running"))).toBe(true);
+    expect(isCrawlioUnavailableError({ code: "CRAWLIO_UNAVAILABLE" })).toBe(true);
+    expect(isCrawlioUnavailableError(new Error("permission denied"))).toBe(false);
+  });
+
   it("T10: Promise.allSettled — one failure doesn't kill others", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const client = new CrawlioClient();
@@ -257,13 +274,10 @@ describe("CrawlioClient — Enrichment Fault Isolation", () => {
         consoleLogs: [{ level: "error", text: "test" }],
         domSnapshotJSON: '{"tag":"html"}',
       })
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true);
 
-    // console.error called for the failed framework POST
-    expect(consoleError).toHaveBeenCalledWith(
-      "[CrawlioClient] Enrichment POST failed:",
-      expect.anything()
-    );
+    // Optional fallback failures are represented by the return value, not alarming stack traces.
+    expect(consoleError).not.toHaveBeenCalled();
 
     // All 4 individual fallback POSTs were attempted (framework, network, console, dom)
     const fallbackPaths = calledPaths.filter(p => p !== "/enrichment/bundle");
@@ -272,7 +286,7 @@ describe("CrawlioClient — Enrichment Fault Isolation", () => {
     consoleError.mockRestore();
   });
 
-  it("T11: fallback triggers on any non-ok response (not just 404)", async () => {
+  it("T11: fallback can recover from a bundle-route server error", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const client = new CrawlioClient();
     vi.spyOn(client, "getPort").mockResolvedValue(9999);
@@ -293,6 +307,48 @@ describe("CrawlioClient — Enrichment Fault Isolation", () => {
 
     // Fallback individual POST must have been called
     expect(calledPaths).toContain("/enrichment/framework");
+    consoleError.mockRestore();
+  });
+
+  it("does not fan out or log when the optional app rejects enrichment authorization", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = new CrawlioClient();
+    const calledPaths: string[] = [];
+    vi.spyOn(client as any, "fetch").mockImplementation(async (path: string) => {
+      calledPaths.push(path);
+      throw Object.assign(new Error("HTTP 401: Unauthorized"), {
+        httpError: "client_error",
+        status: 401,
+      });
+    });
+
+    await expect(client.postEnrichment("https://example.com", {
+      framework: { name: "React" },
+      networkRequests: [{ url: "https://example.com/api" }],
+    })).resolves.toBe(false);
+
+    expect(calledPaths).toEqual(["/enrichment/bundle"]);
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("does not fan out or log when the optional Crawlio app is unavailable", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = new CrawlioClient();
+    const calledPaths: string[] = [];
+    vi.spyOn(client as any, "fetch").mockImplementation(async (path: string) => {
+      calledPaths.push(path);
+      throw new TypeError("connect ECONNREFUSED 127.0.0.1:8787");
+    });
+
+    await expect(client.postEnrichment("https://example.com", {
+      framework: { name: "React" },
+      networkRequests: [{ url: "https://example.com/api" }],
+      consoleLogs: [{ level: "info", text: "ready" }],
+    })).resolves.toBe(false);
+
+    expect(calledPaths).toEqual(["/enrichment/bundle"]);
+    expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   encodeNativeMessage,
   decodeNativeMessages,
+  isNativeHostLeaseExpired,
   listLiveBridges,
   selectProvisionableBridge,
 } from "../../bin/native-host/provision.mjs";
@@ -28,6 +29,14 @@ describe("native-host framing", () => {
     const { messages, rest } = decodeNativeMessages(Buffer.concat([a, b, partial]));
     expect(messages).toEqual([{ type: "ping" }, { type: "set_crawlio_token", token: "t" }]);
     expect(rest.length).toBe(3); // the partial frame is held back
+  });
+});
+
+describe("native-host liveness lease", () => {
+  it("keeps a host with a recent Chrome ping and expires an orphan", () => {
+    expect(isNativeHostLeaseExpired(10_000, 20_000, 15_000)).toBe(false);
+    expect(isNativeHostLeaseExpired(10_000, 25_001, 15_000)).toBe(true);
+    expect(isNativeHostLeaseExpired(0, 20_000, 15_000)).toBe(true);
   });
 });
 

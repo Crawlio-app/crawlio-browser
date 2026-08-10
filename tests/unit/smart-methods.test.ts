@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCodeModeTools, createTools } from "@/mcp-server/tools";
+import { buildSmartObject, createCodeModeTools, createTools, TOOL_TIMEOUTS } from "@/mcp-server/tools";
 import { CrawlioClient } from "@/mcp-server/crawlio-client";
 import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, TableCandidate, TableExtraction, NetworkIdleResult, DataExtraction, PageSections } from "@/shared/evidence-types";
 // --- Extraction program helpers ---
@@ -197,6 +197,42 @@ function parseResult(result: { isError?: boolean; content: Array<{ text: string 
   return JSON.parse(result.content[0].text);
 }
 
+describe("smart interaction command budgets", () => {
+  it("covers the complete stop-old-capture and start-new-capture connection lifecycle", () => {
+    expect(TOOL_TIMEOUTS.connect_tab).toBe(60000);
+    expect(TOOL_TIMEOUTS.agent_session_create).toBe(60000);
+    expect(TOOL_TIMEOUTS.agent_session_create_tab).toBe(60000);
+  });
+
+  it("uses full lifecycle timeouts for clicks and navigation", async () => {
+    const bridge = createSmartBridge();
+    bridge.send.mockImplementation(async (message: Record<string, unknown>) => {
+      if (message.type === "browser_evaluate") {
+        return { result: { actionable: true }, type: "object" };
+      }
+      return { ok: true };
+    });
+    const smart = await buildSmartObject(bridge as never) as {
+      click: (selector: string, opts?: { settle?: number }) => Promise<unknown>;
+      navigate: (url: string, opts?: { settle?: number }) => Promise<unknown>;
+    };
+
+    await smart.click("#submit", { settle: 0 });
+    await smart.click("[ref=e3]", { settle: 0 });
+    await smart.navigate("https://example.test", { settle: 0 });
+
+    const clickCalls = bridge.send.mock.calls.filter(
+      (call: [Record<string, unknown>, number?]) => call[0].type === "browser_click",
+    );
+    expect(clickCalls).toHaveLength(2);
+    expect(clickCalls.map((call: [Record<string, unknown>, number?]) => call[1])).toEqual([15000, 15000]);
+    const navigateCall = bridge.send.mock.calls.find(
+      (call: [Record<string, unknown>, number?]) => call[0].type === "browser_navigate",
+    );
+    expect(navigateCall?.[1]).toBe(40000);
+  });
+});
+
 // ============================================================
 // scrollCapture
 // ============================================================
@@ -338,6 +374,34 @@ describe("smart.extractPage", () => {
     expect(data.capture).toHaveProperty("network");
     expect(data.capture).toHaveProperty("console");
     expect(data.capture).toHaveProperty("dom");
+  });
+
+  it("normalizes the extension's raw PageCapture before Method Mode consumes it", async () => {
+    const fallback = bridge.send.getMockImplementation();
+    bridge.send.mockImplementation(async (msg: Record<string, unknown>) => {
+      if (msg.type !== "capture_page") return fallback?.(msg);
+      return {
+        url: "https://test.com/raw",
+        title: "Raw capture",
+        capturedAt: "2026-08-07T00:00:00.000Z",
+        networkRequests: [
+          { requestId: "1", url: "https://test.com/api", method: "GET", status: 200, resourceType: "XHR", durationMs: 10 },
+        ],
+        consoleLogs: [{ level: "warning", text: "warning", timestamp: "2026-08-07T00:00:00.000Z" }],
+        cookies: [{ name: "sid", value: "redacted", domain: "test.com", path: "/", secure: true, httpOnly: true }],
+        domSnapshot: { tag: "html", attrs: {}, children: [{ tag: "body", attrs: {}, children: [] }] },
+      };
+    });
+
+    const result = await execute.handler({ code: "return await smart.extractPage()" });
+    const data = parseResult(result);
+    expect(data.capture.network).toMatchObject({ total: 1, failed: 0 });
+    expect(data.capture.console).toMatchObject({ total: 1, warnings: 1 });
+    expect(data.capture.cookies).toEqual({ total: 1, names: ["sid"] });
+    expect(data.capture.dom.nodeCount).toBe(2);
+    expect(data.capture.networkRequests).toBeUndefined();
+    expect(data.capture.consoleLogs).toBeUndefined();
+    expect(data.capture.domSnapshot).toBeUndefined();
   });
 
   it("calls capture_page, get_performance_metrics, get_security_state, detect_fonts, get_accessibility_tree in parallel", async () => {

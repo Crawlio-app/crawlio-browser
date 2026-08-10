@@ -109,6 +109,13 @@ describe("compileRecording frontmatter", () => {
     const result = compileRecording(createTestSession(), { name: "My Cool Skill" });
     expect(result.skillMarkdown).toContain("name: my-cool-skill");
   });
+
+  it("replays into an owned background tab without taking keyboard focus", () => {
+    const result = compileRecording(createTestSession(), { name: "Background Replay" });
+    expect(result.skillMarkdown).toContain(
+      'connect_tab({ url: "https://example.com", background: true })',
+    );
+  });
 });
 
 // ============================================================

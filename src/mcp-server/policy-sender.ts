@@ -16,7 +16,11 @@ declare const POLICY_ENFORCED: unique symbol;
  */
 export interface PolicyEnforcedSender {
   readonly [POLICY_ENFORCED]: true;
-  send(command: Parameters<WebSocketBridge["send"]>[0], timeout?: number): Promise<unknown>;
+  send(
+    command: Parameters<WebSocketBridge["send"]>[0],
+    timeout?: number,
+    opts?: Parameters<WebSocketBridge["send"]>[2],
+  ): Promise<unknown>;
 }
 
 // Structural guard (the whole point of the brand): a raw WebSocketBridge must NOT be

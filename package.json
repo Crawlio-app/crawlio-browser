@@ -1,14 +1,18 @@
 {
   "name": "crawlio-browser",
-  "version": "1.9.5",
+  "version": "1.11.0",
   "mcpName": "app.crawlio/crawlio-browser",
-  "description": "MCP server with 145 CDP-backed tools for browser automation — screenshots, DOM, network capture, framework detection, cookies, storage, session recording, structured data extraction, tracking analysis, SEO auditing, technographic fingerprinting, performance metrics via Chrome",
+  "description": "MCP server with 150 browser tools for live Chrome automation \u2014 screenshots, DOM, network capture, framework detection, storage, resident recording and monitoring, structured extraction, tracking, SEO, technographics, and performance",
   "type": "module",
   "main": "dist/mcp-server/index.js",
   "bin": {
     "crawlio-browser": "bin/crawlio-browser.js"
   },
   "files": [
+    "NOTICE",
+    "README.md",
+    "TELEMETRY.md",
+    "THIRD_PARTY_NOTICES.md",
     "bin/crawlio-browser.js",
     "bin/native-host/README.md",
     "bin/native-host/ext-key.json",
@@ -17,18 +21,16 @@
     "bin/native-host/install.mjs",
     "bin/native-host/provision.mjs",
     "dist/mcp-server/",
+    "mcp.json",
+    "packages/selectors/LICENSE",
+    "packages/selectors/dist/",
+    "packages/selectors/package.json",
     "packages/semantic-grounding/contract/",
     "packages/semantic-grounding/dist/",
     "packages/semantic-grounding/package.json",
-    "packages/selectors/dist/",
-    "packages/selectors/package.json",
-    "packages/selectors/LICENSE",
-    "skills/",
+    "plugin.json",
     "server.json",
-    "TELEMETRY.md",
-    "README.md",
-    "NOTICE",
-    "THIRD_PARTY_NOTICES.md"
+    "skills/"
   ],
   "scripts": {
     "build": "npm run build:selectors && npm run build:semantic-grounding && npm run build:server && npm run build:extension",
@@ -40,9 +42,16 @@
     "oss:export": "node scripts/export-oss.mjs",
     "oss:check": "node scripts/check-oss-clean.mjs",
     "prepublishOnly": "npm run check:versions && npm run typecheck && npm run test && npm run build:selectors && npm run build:semantic-grounding && npm run build:server && npm run check:surface",
-    "build:extension": "rm -rf dist/extension && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension --define.__DEV__=false --define.__BUILD_ID__=\\\"$(date -u +%Y%m%dT%H%M%SZ)\\\" --minify && cd dist/extension && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.prod.json dist/extension/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon16.png src/extension/icon32.png src/extension/icon48.png src/extension/icon128.png dist/extension/",
+    "build:extension": "CRAWLIO_EXTENSION_BUILD_ID=$(node scripts/extension-build-id.mjs) && test -n \"$CRAWLIO_EXTENSION_BUILD_ID\" && rm -rf dist/extension && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension --define.__DEV__=false --define.__BUILD_ID__=\\\"$CRAWLIO_EXTENSION_BUILD_ID\\\" --minify && cd dist/extension && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.prod.json dist/extension/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon16.png src/extension/icon32.png src/extension/icon48.png src/extension/icon128.png dist/extension/",
     "build:dev": "rm -rf dist/extension-dev && tsup src/extension/background.ts src/extension/popup.ts src/extension/welcome.ts --format iife --outDir dist/extension-dev --define.__DEV__=true --define.__BUILD_ID__=\\\"$(date -u +%Y%m%dT%H%M%SZ)\\\" && cd dist/extension-dev && mv background.global.js background.js && mv popup.global.js popup.js && mv welcome.global.js welcome.js && cd ../.. && cp src/extension/manifest.dev.json dist/extension-dev/manifest.json && cp src/extension/popup.html src/extension/popup.css src/extension/welcome.html src/extension/welcome.css src/extension/icon*.png dist/extension-dev/",
     "test": "vitest run",
+    "test:e2e:mcp": "npm run test:e2e:mcp:stress && npm run test:e2e:mcp:sessions && npm run test:e2e:mcp:method && npm run test:e2e:mcp:recording",
+    "test:e2e:mcp:stress": "node tests/e2e-stress.mjs --takeover",
+    "test:e2e:mcp:sessions": "node tests/e2e-sessions.mjs --takeover",
+    "test:e2e:mcp:method": "node tests/e2e-method-mode.mjs",
+    "test:e2e:mcp:recording": "node tests/e2e-recording.mjs",
+    "test:e2e:resident": "node tests/e2e-resident-observation.mjs",
+    "test:e2e:resident:manual": "CRAWLIO_E2E_MANUAL_BRIDGE_CONTROL=1 node tests/e2e-resident-observation.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.extension.json",
@@ -70,7 +79,7 @@
   "homepage": "https://www.crawlio.app/browser-agent",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Crawlio-app/crawlio-browser"
+    "url": "git+https://github.com/Crawlio-app/crawlio-browser.git"
   },
   "bugs": {
     "url": "https://github.com/Crawlio-app/crawlio-browser/issues"
@@ -101,5 +110,8 @@
     "typescript": "^5.6.2",
     "typescript-eslint": "^8.66.0",
     "vitest": "^4.0.18"
+  },
+  "overrides": {
+    "esbuild": "^0.28.2"
   }
 }

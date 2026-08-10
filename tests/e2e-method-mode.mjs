@@ -23,6 +23,7 @@ let step = 0;
 let passed = 0;
 let failed = 0;
 let bridgePort = null;
+let ownedTabId = null;
 
 // --- Helpers ---
 
@@ -54,7 +55,11 @@ async function callTool(name, args = {}) {
     const errText = result.content?.map(c => c.text).join("\n") || "Unknown error";
     throw new Error(errText);
   }
-  const text = result.content?.find(c => c.type === "text")?.text;
+  const text = (result.content?.find(c => c.type === "text")?.text ?? "")
+    // Page-derived execute results are wrapped in nonce-bound provenance markers. Strip both
+    // markers before JSON parsing or every successful object becomes an opaque `_raw` string.
+    .replace(/---\s*(?:END_)?CRAWLIO_PAGE_CONTENT[\s\S]*?---/g, "")
+    .trim();
   if (!text) return {};
   try { return JSON.parse(text); } catch { return { _raw: text }; }
 }
@@ -62,6 +67,17 @@ async function callTool(name, args = {}) {
 /** Call the execute tool with code that runs in the smart.* sandbox */
 async function execute(code) {
   return callTool("execute", { code });
+}
+
+async function cleanupOwnedTab() {
+  if (!ownedTabId || !client) return;
+  const tabId = ownedTabId;
+  ownedTabId = null;
+  // Code mode does not expose close_tab as a top-level MCP tool. Use the execute bridge so the
+  // harness cleans up the exact background tab it owns instead of swallowing an unknown-tool error.
+  try {
+    await execute(`return await bridge.send({ type: "close_tab", tabId: ${JSON.stringify(tabId)} }, 5000);`);
+  } catch { /* best effort */ }
 }
 
 /** Wait for the MCP server's bridge to have an extension connection */
@@ -75,13 +91,16 @@ async function waitForBridge() {
         if (res.ok) {
           const health = await res.json();
           // Match by PID — the transport spawns a child process
-          if (health.connected && health.pid === transport.serverProcess?.pid) {
+          if (health.connected && health.pid === transport.pid) {
             bridgePort = port;
             return true;
           }
         }
       } catch { /* port not listening */ }
     }
+    // Publishing activity is how a fresh server wins the extension's non-destructive bridge
+    // election from an always-on incumbent. The incumbent stays alive and is re-elected later.
+    await client.callTool({ name: "get_capabilities", arguments: {} }).catch(() => {});
     log("  ", `Waiting for extension to connect to bridge... (${Math.round((Date.now() - start) / 1000)}s)`);
     await new Promise(r => setTimeout(r, BRIDGE_POLL_MS));
   }
@@ -117,11 +136,13 @@ async function main() {
 
   // --- Test Steps ---
 
-  // Step 1: connect_tab to example.com
-  await runStep("connect_tab to example.com", async () => {
-    const result = await callTool("connect_tab", { url: "https://example.com" });
+  // Step 1: connect_tab to an agent-owned background page. Input helpers use CDP focus emulation
+  // for this connection and must not take keyboard focus from the user's active Chrome tab.
+  await runStep("connect_tab to example.com in the background", async () => {
+    const result = await callTool("connect_tab", { url: "https://example.com", background: true });
     log("  ", `result: ${JSON.stringify(result).slice(0, 200)}`);
     assert(result.tabId || result.connected, "tab connected");
+    ownedTabId = result.tabId ?? null;
   });
 
   // Step 2: waitForIdle via execute sandbox
@@ -280,7 +301,8 @@ async function main() {
     assert(data?.siteA_url || data?.siteA_hasCapture !== undefined, "has siteA data");
     assert(data?.siteB_url || data?.siteB_hasCapture !== undefined, "has siteB data");
     assert(data?.hasScaffold === true, "has scaffold");
-    assert(data?.dimensionCount === 10, `scaffold has 10 dimensions (got ${data?.dimensionCount})`);
+    assert(data?.dimensionCount === 11, `scaffold has 11 dimensions (got ${data?.dimensionCount})`);
+    assert(data?.dimensionNames?.includes("content-delivery"), "scaffold includes content-delivery");
     assert(data?.sharedFieldCount > 0, `sharedFields > 0 (got ${data?.sharedFieldCount})`);
     assert(data?.siteA_hasGaps === true, "siteA has gaps array");
     assert(data?.siteB_hasGaps === true, "siteB has gaps array");
@@ -457,12 +479,14 @@ async function main() {
   console.log("\n=== Results ===");
   console.log(`  Total: ${step}  Passed: \x1b[32m${passed}\x1b[0m  Failed: \x1b[31m${failed}\x1b[0m`);
 
+  await cleanupOwnedTab();
   await client.close();
   process.exit(failed > 0 ? 1 : 0);
 }
 
 main().catch(async (e) => {
   console.error(`\x1b[31mFATAL: ${e.message}\x1b[0m`);
+  await cleanupOwnedTab();
   try { await client?.close(); } catch { /* already exiting on a fatal error */ }
   process.exit(1);
 });

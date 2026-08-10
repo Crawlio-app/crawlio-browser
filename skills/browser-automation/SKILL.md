@@ -1,7 +1,7 @@
 ---
 name: browser-automation
-description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates Crawlio Browser's 145 browser tools via the search + execute + connect_tab interface.
-allowed-tools: mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab
+description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates Crawlio Browser's 150 browser tools via the search + execute + connect_tab interface.
+allowed-tools: mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab, mcp__crawlio-browser__observe
 ---
 
 # Browser Automation with Crawlio Browser
@@ -17,8 +17,8 @@ Use this skill when the user wants to:
 - Read cookies, localStorage, sessionStorage, or IndexedDB
 - Capture performance metrics, security state, or service workers
 - Record browser sessions to capture interactions, navigation, network, and console as structured data
-- Capture canonical RecordingBundle v1 training artifacts with `recording_start` / `recording_stop`
-- Train replayable robots from human-guided demonstrations with `robot_training_*`
+- Capture canonical RecordingBundle v1 training artifacts with `observe({ action: "recording_start" | "recording_stop" })`
+- Train replayable robots from human-guided demonstrations with the extension-resident `observe` lifecycle
 - Automate multi-step browser workflows
 
 ## Connection (Always First)
@@ -26,12 +26,13 @@ Use this skill when the user wants to:
 Before any browser operation, connect to a tab:
 
 ```
-connect_tab({ url: "https://example.com" })
+connect_tab({ url: "https://example.com", background: true })
 ```
 
-- Opens a new tab if no matching tab is found
+- Opens or reuses an owned background tab without moving the user's foreground or keyboard focus
 - Attaches CDP debugger automatically
-- Omit `url` to connect to the currently active tab
+- Omit `background: true` only when the user explicitly asks to see the automation in front
+- Omit `url` only when the user explicitly asks to adopt the currently active tab
 
 Check connection status anytime:
 ```js
@@ -47,6 +48,7 @@ return await bridge.send({ type: "get_connection_status" })
 5. **`smart.evaluate` returns `{ result, type }`** — NOT the raw value. Access `.result` to get the value. Never `JSON.parse()` the return directly.
 6. **Keep scripts fast** — each `execute` call should complete in <15s. Split loops over many elements into separate `execute` calls. Never loop 5+ `smart.click` calls in one script.
 7. **Canonical recording order matters** — start network before recording, dump state before stop, fetch bodies before `stop_network_capture`, and keep the monitor event-driven.
+8. **Autonomous work stays in the background** — URL connections must pass `background: true`; foreground adoption is only for an explicit human-visible/manual flow.
 
 ## Evidence Protocol
 
@@ -67,7 +69,7 @@ Retrieve all findings with `smart.findings()`. Reset with `smart.clearFindings()
 3. **No manual scroll+screenshot loops** — use `smart.scrollCapture({ maxSections: 10 })`. It handles bottom detection, stuck scroll, and scroll reset.
 4. **No raw `capture_page` + `detect_framework` combo** — `smart.extractPage()` does both plus 5 more operations in one call with graceful failure.
 5. **`capture_page` returns ~1KB shaped summary** — counts and top errors, not raw arrays. For raw network data use `stop_network_capture`. For raw console logs use `get_console_logs`.
-6. **No `smart.snapshot({ compact: true })`** — the `compact` option does not exist. Use `smart.snapshot()` with no options, or `{ interactive: true }` for clickable elements only.
+6. **Snapshot options are supported** — use `smart.snapshot({ interactive: true, compact: true, maxDepth: 8, selector: "#main" })` to reduce or scope output. Re-snapshot after navigation because refs become stale.
 7. **No `location.href = "..."` for navigation** — use `smart.navigate(url)`. Direct location assignment breaks CDP debugger attachment.
 
 ## Core Patterns via `execute`
@@ -91,12 +93,14 @@ return await smart.navigate("https://example.com")
 return await bridge.send({ type: 'take_screenshot' })
 ```
 
-Returns `{ screenshot: string }` (base64 PNG). For full-page: `bridge.send({ type: 'take_screenshot', fullPage: true })`.
+Returns `{ data, mimeType, format }` with base64 image bytes. JPEG is the bounded default; request
+lossless output with `{ format: "png" }`. For a full page use `{ fullPage: true }`; for one element
+use `{ selector: "#target" }`. An oversized PNG may fall back to JPEG, so trust `mimeType`.
 
 ### OCR Text Extraction (macOS only)
 
-```
-ocr_screenshot({ fullPage: true })
+```js
+return await ocrScreenshot({ fullPage: true })
 ```
 
 Takes a CDP screenshot, runs it through macOS Vision.framework (`VNRecognizeTextRequest`), and returns recognized text with confidence scores and bounding regions. Works on canvas elements, images rendered as pixels, anti-scraping sites, and any visual content invisible to DOM extraction.
@@ -209,7 +213,7 @@ const config = await smart.vue?.getConfig()
 const state = await smart.redux?.getStoreState()
 ```
 
-Available framework namespaces: `react`, `vue`, `angular`, `svelte`, `nextjs`, `nuxt`, `remix`, `gatsby`, `shopify`, `wordpress`, `laravel`, `django`, `drupal`, `alpine`, `redux`, `jquery`.
+Available framework namespaces: `react`, `vue`, `angular`, `svelte`, `nextjs`, `nuxt`, `remix`, `gatsby`, `shopify`, `wordpress`, `woocommerce`, `laravel`, `django`, `drupal`, `alpine`, `redux`, `jquery`.
 
 ### Cookies
 
@@ -268,7 +272,7 @@ To drill down, call individual tools: `get_console_logs`, `get_dom_snapshot`, `g
 
 Record a full browser session — every interaction, navigation, network request, and console log — as structured JSON.
 
-For full robot-training captures that also persist monitor snapshots, response bodies, and `flows.jsonl`, use the **robot-training** skill and the `robot_training_start/status/stop/artifacts` MCP tools.
+For full resident captures that retain monitor snapshots, response bodies, and `flows.jsonl`, use the **robot-training** skill and the default-mode `observe` tool. Collection continues if MCP disconnects; `training_stop` materializes files after reconnection.
 
 ### Start Recording
 
@@ -296,7 +300,7 @@ stop_recording({})
 
 Returns the full session:
 - `pages[]` — one per URL visited, each with `interactions[]`, `console[]`, `network[]`
-- `metadata` — tabId, initialUrl, stopReason (`manual` | `max_duration` | `max_interactions` | `tab_closed` | `disconnect`)
+- `metadata` — tabId, initialUrl, stopReason (`manual` | `max_duration` | `max_interactions` | `tab_closed` | `tab_disconnected`)
 - `duration` — total seconds
 
 ### Workflow via Execute
@@ -335,7 +339,7 @@ When you don't know the exact command, search first:
 search({ query: "cookies" })
 ```
 
-This returns matching command names, descriptions, and parameter schemas from the full catalog of 178 commands (145 browser + 33 desktop).
+This returns matching command names, descriptions, and parameter schemas from the full catalog of 182 commands (150 browser + 32 Crawlio HTTP).
 
 ## Desktop Integration (Crawlio App)
 
@@ -385,21 +389,22 @@ const tabs = result.tabs;           // array of tab objects
 const connected = result.connectedTabId;
 
 // connect_tab → { action, tabId, url, title, windowId, capturing, domainState }
-const tab = await bridge.send({ type: 'connect_tab', tabId: 123 });
+const tab = await bridge.send({ type: 'connect_tab', tabId: 123, background: true });
 
-// capture_page → { url, title, framework, network, console, cookies, dom, capturedAt }
+// Raw bridge capture_page → { url, title, framework, networkRequests, consoleLogs,
+//                              domSnapshot, cookies, capturedAt }
+// Prefer smart.extractPage() when you need the compact network/console/dom summaries.
 const page = await bridge.send({ type: 'capture_page' });
 
-// take_screenshot → { screenshot: string }  (base64 PNG)
+// take_screenshot → { data: string, mimeType: string, format: 'png'|'jpeg' }
 const ss = await bridge.send({ type: 'take_screenshot' });
 
 // get_cookies → { cookies: Cookie[] }
 const result = await bridge.send({ type: 'get_cookies' });
 const cookies = result.cookies;
 
-// get_console_logs → { logs: LogEntry[] }
-const result = await bridge.send({ type: 'get_console_logs' });
-const logs = result.logs;
+// get_console_logs → LogEntry[]
+const logs = await bridge.send({ type: 'get_console_logs' });
 
 // close_tab → requires tabId!
 await bridge.send({ type: 'close_tab', tabId: 123 });  // REQUIRED
@@ -411,8 +416,7 @@ await bridge.send({ type: 'close_tab', tabId: 123 });  // REQUIRED
 ```js
 await bridge.send({ type: 'start_network_capture' });
 // ... interactions ...
-const result = await bridge.send({ type: 'stop_network_capture' });
-const entries = result.entries;  // array of network entries
+const entries = await bridge.send({ type: 'stop_network_capture' });
 // WRONG: bridge.send({ type: 'get_network_entries' })  — does NOT exist
 ```
 
@@ -425,7 +429,7 @@ const entries = result.entries;  // array of network entries
 | "Extension disconnected" | Check that the Chrome extension is installed and the popup shows "Connected" |
 | "timed out after 30000ms" | Script too slow — reduce interactions per call, use evaluate instead of click loops |
 | "[object Object]" not valid JSON | You called `JSON.parse` on a `{result, type}` object — use `.result` first |
-| "Permission required" | Click the Crawlio extension icon and grant permissions |
+| "Permission required" | Open Crawlio's dedicated onboarding page, grant the requested browser access there, then retry |
 
 ## Script Performance Rules
 
@@ -477,9 +481,9 @@ const title = (await smart.evaluate("document.title")).result
 return { title, url: (await smart.evaluate("location.href")).result }
 ```
 
-## Higher-Order Methods (17)
+## Higher-Order Methods (18)
 
-These methods compose existing bridge commands into common workflows. The `smart` object exposes 7 core methods + 17 higher-order methods + up to 17 framework namespaces.
+These methods compose existing bridge commands into common workflows. The `smart` object exposes 7 core methods + 18 higher-order methods + up to 17 framework namespaces.
 
 ### Evidence Extraction
 
@@ -531,7 +535,7 @@ const tables = await smart.detectTables()
 const data = await smart.extractTable("table.pricing")
 
 // Wait for network to become idle (no pending requests)
-const idle = await smart.waitForNetworkIdle(5000)
+const idle = await smart.waitForNetworkIdle({ timeout: 5000, idleTime: 500 })
 
 // Compound extraction — detect tables + extract + network idle
 const extracted = await smart.extractData()
@@ -560,4 +564,4 @@ For multi-page research protocols (competitive analysis, site audits), see the *
 
 ## Reference
 
-See [reference.md](./reference.md) for a curated reference with parameters. For the complete, current surface run `crawlio-browser tools --full`, or `search` it from inside `execute` — both read the live builders, so neither can go stale.
+See [references/reference.md](./references/reference.md) for a curated reference with parameters. For the complete, current surface run `crawlio-browser tools --full`, or `search` it from inside `execute` — both read the live builders, so neither can go stale.

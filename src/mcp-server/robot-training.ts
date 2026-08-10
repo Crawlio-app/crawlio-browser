@@ -4,12 +4,19 @@ import { basename, join, resolve } from "path";
 import type { SelectorRecord } from "@crawlio/selectors";
 import type { WebSocketBridge } from "./websocket-bridge.js";
 import type { NetworkEntry, RecordingBundleManifest, RecordingSession } from "../shared/types.js";
-import { getForgePreludeJs, type ForgedSelectorBundle } from "./selector-kernel.js";
+import type { ForgedSelectorBundle } from "./selector-kernel.js";
+import { buildResidentTrainingMonitorScript } from "../extension/injected/resident-training-monitor.js";
 
 type BridgeCommand = Parameters<WebSocketBridge["send"]>[0];
 
-const STATIC_RESOURCE_TYPES = new Set(["Stylesheet", "Image", "Font", "Media", "Script"]);
-const TELEMETRY_URL = /cdn-cgi\/rum|cloudflareinsights|google-analytics|googletagmanager|doubleclick|facebook\.com\/tr/i;
+/**
+ * Compatibility export for callers that inspect the page-program expression budget. Installation
+ * now happens inside the extension so collection survives an MCP restart; the returned program is
+ * the same resident monitor that the extension injects, with storage values disabled by default.
+ */
+export function buildRobotTrainingMonitorJs(): string {
+  return buildResidentTrainingMonitorScript(false);
+}
 
 export interface RobotTrainingRun {
   runId: string;
@@ -18,161 +25,8 @@ export interface RobotTrainingRun {
   tabId: number;
   recordingId?: string;
   startedAt: string;
-  status: "recording" | "stopped" | "error";
+  status: "recording" | "stopped" | "interrupted" | "error";
   lastError?: string;
-}
-
-const activeRobotTrainingRuns = new Map<string, RobotTrainingRun>();
-
-export const ROBOT_TRAINING_MONITOR_JS = String.raw`
-(() => {
-  if (window.__sub_state_uninstall) {
-    try { window.__sub_state_uninstall(); } catch (_) {}
-  }
-
-  window.__sub_state_log = window.__sub_state_log || [];
-  window.__sub_state_id = 0;
-
-  const cssPath = (el) => {
-    // Prefer the verified @crawlio/selectors kernel selector (computeXPath +
-    // resolvesExactlyTo, injected as window.__crawlioForge); the heuristic chain
-    // below is only a fallback when the kernel is unavailable on this page.
-    try {
-      if (el && el.nodeType === 1 && window.__crawlioForge) {
-        const b = window.__crawlioForge.bundle(el);
-        if (b && b.selector && b.selector.value) return b.selector.value;
-      }
-    } catch (_) {}
-    if (!el || !el.tagName) return null;
-    if (el.id) return "#" + CSS.escape(el.id);
-    const parts = [];
-    let cur = el;
-    while (cur && cur.nodeType === 1 && parts.length < 5) {
-      let part = cur.tagName.toLowerCase();
-      if (cur.classList && cur.classList.length) {
-        part += "." + Array.from(cur.classList).slice(0, 2).map(c => CSS.escape(c)).join(".");
-      }
-      const parent = cur.parentElement;
-      if (parent) {
-        const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
-        if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(cur) + 1) + ")";
-      }
-      parts.unshift(part);
-      cur = parent;
-    }
-    return parts.join(" > ");
-  };
-
-  const fields = () => {
-    const out = {};
-    for (const el of document.querySelectorAll("input, textarea, select")) {
-      const key = el.id || el.name || cssPath(el);
-      if (!key) continue;
-      out[key] = {
-        value: "value" in el ? el.value : "",
-        type: el.type || el.tagName.toLowerCase(),
-        checked: "checked" in el ? !!el.checked : undefined,
-      };
-    }
-    return out;
-  };
-
-  const visibleButtons = () => Array.from(document.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']"))
-    .filter(el => {
-      const r = el.getBoundingClientRect();
-      const style = getComputedStyle(el);
-      return r.width > 0 && r.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-    })
-    .slice(0, 80)
-    .map(el => ({
-      selector: cssPath(el),
-      tag: el.tagName,
-      text: (el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "").trim().slice(0, 120),
-      href: el.href || undefined,
-    }));
-
-  const storageObject = (storage) => {
-    const out = {};
-    try {
-      for (const k of Object.keys(storage)) out[k] = storage.getItem(k);
-    } catch (_) {}
-    return out;
-  };
-
-  const snap = (reason, extra) => {
-    const entry = {
-      id: ++window.__sub_state_id,
-      ts: Date.now(),
-      reason,
-      url: location.href,
-      title: document.title,
-      ss: storageObject(sessionStorage),
-      ls: storageObject(localStorage),
-      fields: fields(),
-      visibleButtons: visibleButtons(),
-      focusedSelector: cssPath(document.activeElement),
-      scroll: { x: scrollX, y: scrollY },
-      extra: extra || null,
-    };
-    window.__sub_state_log.push(entry);
-    return entry;
-  };
-
-  const targetInfo = (target) => {
-    const info = {
-      selector: cssPath(target),
-      tag: target?.tagName,
-      text: (target?.innerText || target?.textContent || target?.value || target?.getAttribute?.("aria-label") || "").trim().slice(0, 160),
-      bundle: null,
-    };
-    // Forge the verified 5-rail SelectorBundle for the interacted element so the
-    // recorded step carries it (xpath/attribute/classChain/textContent/rolePlusText).
-    try { if (target && target.nodeType === 1 && window.__crawlioForge) info.bundle = window.__crawlioForge.bundle(target); } catch (_) {}
-    return info;
-  };
-
-  const onClick = (event) => {
-    const info = targetInfo(event.target);
-    snap("before-click", info);
-    setTimeout(() => snap("after-click", info), 200);
-  };
-  const onChange = (event) => {
-    const info = targetInfo(event.target);
-    if ("value" in event.target) info.value = event.target.value;
-    snap("input-change", info);
-  };
-  const onSubmit = (event) => {
-    snap("before-submit", targetInfo(event.target));
-    setTimeout(() => snap("after-submit", targetInfo(event.target)), 300);
-  };
-  const onPageShow = () => snap("pageshow", null);
-  const onPopState = () => snap("popstate", null);
-
-  document.addEventListener("click", onClick, true);
-  document.addEventListener("change", onChange, true);
-  document.addEventListener("submit", onSubmit, true);
-  window.addEventListener("pageshow", onPageShow);
-  window.addEventListener("popstate", onPopState);
-  snap("init", null);
-
-  window.__sub_state_uninstall = () => {
-    document.removeEventListener("click", onClick, true);
-    document.removeEventListener("change", onChange, true);
-    document.removeEventListener("submit", onSubmit, true);
-    window.removeEventListener("pageshow", onPageShow);
-    window.removeEventListener("popstate", onPopState);
-  };
-
-  return { ok: true, monitor: "robot-training", entries: window.__sub_state_log.length };
-})()
-`;
-
-/** The page program injected to drive a robot-training capture: the verified
- *  selector forge prelude (the @crawlio/selectors kernel + the 5-rail bundler)
- *  followed by the monitor, so the monitor's cssPath/targetInfo resolve through
- *  window.__crawlioForge (computeXPath, verified by resolvesExactlyTo). */
-export function buildRobotTrainingMonitorJs(): string {
-  return `${getForgePreludeJs()}\n${ROBOT_TRAINING_MONITOR_JS}`;
 }
 
 function slugify(input: string): string {
@@ -252,14 +106,6 @@ function buildFlowsJsonl(network: NetworkEntry[], bodies: Record<string, unknown
       });
     });
   return lines.length ? `${lines.join("\n")}\n` : "";
-}
-
-function networkEntriesFromRecording(session: RecordingSession): NetworkEntry[] {
-  const entries: NetworkEntry[] = [];
-  for (const page of session.pages ?? []) {
-    for (const entry of page.network ?? []) entries.push(entry);
-  }
-  return entries;
 }
 
 function interactionCount(session: RecordingSession): number {
@@ -436,11 +282,86 @@ function buildRegistryMarkdown(run: RobotTrainingRun, recording: RecordingSessio
   return lines.join("\n");
 }
 
-function shouldFetchBody(entry: NetworkEntry): boolean {
-  if (!entry.requestId) return false;
-  if (STATIC_RESOURCE_TYPES.has(entry.resourceType)) return false;
-  if (TELEMETRY_URL.test(entry.url)) return false;
-  return true;
+const OPENAPI_METHODS = new Set(["get", "put", "post", "delete", "options", "head", "patch", "trace"]);
+
+/**
+ * Build a conservative OpenAPI draft from captured same-origin HTTP exchanges.
+ *
+ * JSON is valid YAML 1.2, so serializing this object into `api.openapi.yaml` avoids a YAML
+ * dependency while keeping the artifact directly consumable. Values and body examples are
+ * intentionally omitted: the extension has already redacted capture data, and a contract draft
+ * needs shapes/endpoints rather than another copy of potentially sensitive payloads.
+ */
+function buildOpenApiDraft(run: RobotTrainingRun, network: NetworkEntry[]): Record<string, unknown> {
+  const target = new URL(run.targetUrl);
+  const paths: Record<string, Record<string, unknown>> = {};
+
+  for (const entry of network) {
+    let url: URL;
+    try { url = new URL(entry.url); } catch { continue; }
+    const method = entry.method.toLowerCase();
+    if (url.origin !== target.origin || !OPENAPI_METHODS.has(method) || entry.status <= 0) continue;
+
+    const path = url.pathname || "/";
+    const pathItem = paths[path] ?? (paths[path] = {});
+    let operation = pathItem[method] as Record<string, unknown> | undefined;
+    if (!operation) {
+      const queryNames = [...new Set([...url.searchParams.keys()])];
+      const operationIdSuffix = path
+        .replace(/[^a-zA-Z0-9]+(.)/g, (_whole, next: string) => next.toUpperCase())
+        .replace(/[^a-zA-Z0-9]/g, "") || "root";
+      operation = {
+        operationId: `${method}${operationIdSuffix[0].toUpperCase()}${operationIdSuffix.slice(1)}`,
+        summary: `Captured ${entry.method.toUpperCase()} ${path}`,
+        ...(queryNames.length ? {
+          parameters: queryNames.map((name) => ({
+            name,
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+          })),
+        } : {}),
+        responses: {},
+      };
+      pathItem[method] = operation;
+    }
+
+    const responses = operation.responses as Record<string, unknown>;
+    const status = String(Math.round(entry.status));
+    const responseMime = entry.mimeType || "application/octet-stream";
+    responses[status] = {
+      description: `Captured HTTP ${status}`,
+      content: {
+        [responseMime]: {
+          schema: { type: /json/i.test(responseMime) ? "object" : "string" },
+        },
+      },
+    };
+
+    if (entry.requestBody && !["get", "head"].includes(method) && !operation.requestBody) {
+      const firstBodyCharacter = entry.requestBody.trimStart()[0];
+      const requestMime = Object.entries(entry.requestHeaders ?? {})
+        .find(([key]) => key.toLowerCase() === "content-type")?.[1]
+        ?? (["{", "["].includes(firstBodyCharacter) ? "application/json" : "application/octet-stream");
+      operation.requestBody = {
+        required: true,
+        content: {
+          [requestMime]: {
+            schema: { type: /json/i.test(requestMime) ? "object" : "string" },
+          },
+        },
+      };
+    }
+  }
+
+  return {
+    openapi: "3.1.0",
+    info: { title: `Crawlio Recording ${run.runId}`, version: "1.0.0" },
+    servers: [{ url: target.origin }],
+    paths,
+    "x-crawlio-draft": true,
+    "x-crawlio-source-bundle": run.runId,
+  };
 }
 
 export async function robotTrainingStart(
@@ -453,57 +374,54 @@ export async function robotTrainingStart(
     maxInteractions?: number;
     active?: boolean;
     injectMonitor?: boolean;
+    captureStorageValues?: boolean;
   },
 ): Promise<Record<string, unknown>> {
   const runId = options.runId || newRunId();
   const outputDir = resolve(options.outputDir || defaultOutputDir(options.url, runId));
   await mkdir(outputDir, { recursive: true });
 
-  const tab = await bridge.send({
-    type: "create_tab",
+  const resident = await bridge.send({
+    type: "robot_training_start",
     url: options.url,
-    active: options.active !== false,
-    connect: true,
-  } as BridgeCommand, 20_000) as { tabId?: number; url?: string; title?: string };
-  if (typeof tab.tabId !== "number") throw new Error("create_tab did not return a tabId");
-
-  await bridge.send({ type: "start_network_capture" } as BridgeCommand, 5_000);
-  const recording = await bridge.send({
-    type: "start_recording",
+    runId,
+    outputDir,
     maxDurationSec: options.maxDurationSec,
     maxInteractions: options.maxInteractions,
-  } as BridgeCommand, 10_000) as { sessionId?: string };
-
-  let monitor: unknown = null;
-  if (options.injectMonitor !== false) {
-    monitor = await bridge.send({
-      type: "browser_evaluate",
-      expression: buildRobotTrainingMonitorJs(),
-    } as BridgeCommand, 10_000);
-  }
+    active: options.active !== false,
+    injectMonitor: options.injectMonitor !== false,
+    captureStorageValues: options.captureStorageValues === true,
+  } as BridgeCommand, 30_000) as {
+    tabId?: number;
+    recordingId?: string;
+    startedAt?: string;
+    status?: RobotTrainingRun["status"];
+    monitor?: unknown;
+    [key: string]: unknown;
+  };
+  if (typeof resident.tabId !== "number") throw new Error("resident robot training did not return a tabId");
 
   const run: RobotTrainingRun = {
     runId,
-    targetUrl: options.url,
+    targetUrl: typeof resident.targetUrl === "string" ? resident.targetUrl : options.url,
     outputDir,
-    tabId: tab.tabId,
-    recordingId: recording.sessionId,
-    startedAt: new Date().toISOString(),
-    status: "recording",
+    tabId: resident.tabId,
+    recordingId: resident.recordingId,
+    startedAt: resident.startedAt ?? new Date().toISOString(),
+    status: resident.status ?? "recording",
   };
-  activeRobotTrainingRuns.set(runId, run);
 
   await writeJson(join(outputDir, "manifest.json"), {
     ...buildManifest(run),
-    tab,
-    monitor,
+    resident: true,
+    bridgeRequiredForCollection: false,
+    monitor: resident.monitor ?? null,
     status: run.status,
   });
 
   return {
+    ...resident,
     ...run,
-    tab,
-    monitor,
     artifacts: {
       manifest: join(outputDir, "manifest.json"),
     },
@@ -514,13 +432,22 @@ export async function robotTrainingStatus(
   bridge: WebSocketBridge,
   runId?: string,
 ): Promise<Record<string, unknown>> {
-  const recording = await bridge.send({ type: "get_recording_status" } as BridgeCommand, 5_000).catch((err) => ({
-    error: err instanceof Error ? err.message : String(err),
-  }));
-  const runs = runId
-    ? Array.from(activeRobotTrainingRuns.values()).filter(run => run.runId === runId)
-    : Array.from(activeRobotTrainingRuns.values());
-  return { runs, recording };
+  return bridge.send(
+    { type: "robot_training_status", ...(runId ? { runId } : {}) } as BridgeCommand,
+    10_000,
+  ) as Promise<Record<string, unknown>>;
+}
+
+/** Delete one stopped resident record in Chrome. Canonical bundle files are deliberately preserved. */
+export async function robotTrainingClear(
+  bridge: WebSocketBridge,
+  options: { runId: string; confirm: true },
+): Promise<Record<string, unknown>> {
+  return bridge.send({
+    type: "robot_training_clear",
+    runId: options.runId,
+    confirm: options.confirm,
+  } as BridgeCommand, 10_000) as Promise<Record<string, unknown>>;
 }
 
 export async function robotTrainingStop(
@@ -531,66 +458,58 @@ export async function robotTrainingStop(
     closeTab?: boolean;
   },
 ): Promise<Record<string, unknown>> {
-  const run = activeRobotTrainingRuns.get(options.runId);
-  if (!run) throw new Error(`robot training run '${options.runId}' not found`);
+  const exported = await bridge.send({
+    type: "robot_training_stop",
+    runId: options.runId,
+    fetchBodies: options.fetchBodies !== false,
+    closeTab: options.closeTab === true,
+  } as BridgeCommand, 90_000) as {
+    run?: {
+      runId?: string;
+      targetUrl?: string;
+      outputDir?: string;
+      tabId?: number;
+      recordingId?: string;
+      startedAt?: string;
+      stoppedAt?: string;
+      status?: RobotTrainingRun["status"];
+      lastError?: string;
+    };
+    recording?: RecordingSession;
+    network?: NetworkEntry[];
+    bodies?: Record<string, unknown>;
+    state?: Record<string, unknown>;
+    stateLog?: unknown[];
+  };
+  const view = exported.run;
+  if (!view || typeof view.tabId !== "number" || !view.startedAt || !exported.recording) {
+    throw new Error(`resident robot training run '${options.runId}' returned an incomplete export`);
+  }
+  const targetUrl = view.targetUrl ?? exported.recording.metadata.initialUrl;
+  const run: RobotTrainingRun = {
+    runId: view.runId ?? options.runId,
+    targetUrl,
+    outputDir: resolve(view.outputDir ?? defaultOutputDir(targetUrl, options.runId)),
+    tabId: view.tabId,
+    recordingId: view.recordingId,
+    startedAt: view.startedAt,
+    status: view.status ?? "stopped",
+    lastError: view.lastError,
+  };
+  await mkdir(run.outputDir, { recursive: true });
 
   try {
-    const stateEval = await bridge.send({
-      type: "browser_evaluate",
-      expression: "window.__sub_state_log || []",
-    } as BridgeCommand, 10_000) as { result?: unknown };
-    const stateLog = Array.isArray(stateEval.result) ? stateEval.result : [];
-
-    const recording = await bridge.send({ type: "stop_recording" } as BridgeCommand, 10_000) as RecordingSession;
-    const recordingNetwork = networkEntriesFromRecording(recording);
-    const bodies: Record<string, unknown> = {};
-    if (options.fetchBodies !== false) {
-      for (const entry of recordingNetwork) {
-        if (!shouldFetchBody(entry)) continue;
-        try {
-          bodies[entry.requestId as string] = await bridge.send({
-            type: "get_response_body",
-            requestId: entry.requestId,
-          } as BridgeCommand, 10_000);
-        } catch (err) {
-          bodies[entry.requestId as string] = {
-            url: entry.url,
-            method: entry.method,
-            status: entry.status,
-            error: err instanceof Error ? err.message : String(err),
-          };
-        }
-      }
-    }
-
-    const network = await bridge.send({ type: "stop_network_capture" } as BridgeCommand, 60_000) as NetworkEntry[];
-    const consoleLogs = await bridge.send({ type: "get_console_logs" } as BridgeCommand, 5_000).catch(() => []);
-    const cookies = await bridge.send({ type: "get_cookies" } as BridgeCommand, 5_000).catch(() => ({ cookies: [] }));
-    const finalMetaEval = await bridge.send({
-      type: "browser_evaluate",
-      expression: `(() => ({
-        url: location.href,
-        title: document.title,
-        ts: new Date().toISOString(),
-        cookies: document.cookie,
-        localStorage: Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)])),
-        sessionStorage: Object.fromEntries(Object.keys(sessionStorage).map(k => [k, sessionStorage.getItem(k)]))
-      }))()`,
-    } as BridgeCommand, 10_000).catch(() => ({ result: null })) as { result?: unknown };
-
-    const state = { consoleLogs, cookies, finalMeta: finalMetaEval.result ?? null };
+    const recording = exported.recording;
+    const network = Array.isArray(exported.network) ? exported.network : [];
+    const bodies = exported.bodies ?? {};
+    const stateLog = Array.isArray(exported.stateLog) ? exported.stateLog : [];
+    const state = exported.state ?? {};
     const rawDump = { recording, network, bodies, stateLog, ...state };
     const flowsJsonl = buildFlowsJsonl(network, bodies);
     const flowCount = flowsJsonl.trim() ? flowsJsonl.trim().split(/\n+/).length : 0;
     const causalGraph = buildCausalGraph(run, recording, network, stateLog);
     const recipe = buildRecipe(run, recording, bundlesFromStateLog(stateLog));
-    const openapi = [
-      "openapi: 3.1.0",
-      "info:",
-      `  title: Crawlio Recording ${run.runId}`,
-      "  version: 1.0.0",
-      "paths: {}",
-    ].join("\n");
+    const openapi = buildOpenApiDraft(run, network);
 
     await writeJson(join(run.outputDir, "raw-dump.json"), rawDump);
     await writeJson(join(run.outputDir, "recording.json"), recording);
@@ -603,31 +522,22 @@ export async function robotTrainingStop(
     await writeText(join(run.outputDir, "CAUSAL.md"), buildCausalMarkdown(run, recording, network, stateLog));
     await writeJson(join(run.outputDir, "recipe.json"), recipe);
     await writeText(join(run.outputDir, "REGISTRY.md"), buildRegistryMarkdown(run, recording));
-    await writeText(join(run.outputDir, "api.openapi.yaml"), openapi);
+    // JSON is valid YAML 1.2 and preserves exact escaping for captured paths/header media types.
+    await writeText(join(run.outputDir, "api.openapi.yaml"), JSON.stringify(openapi, null, 2));
 
-    run.status = "stopped";
-    activeRobotTrainingRuns.delete(run.runId);
-    const stoppedAt = new Date().toISOString();
+    const stoppedAt = view.stoppedAt ?? recording.stoppedAt ?? new Date().toISOString();
     await writeJson(join(run.outputDir, "manifest.json"), {
-      ...buildManifest(run, {
-        stoppedAt,
-        recording,
-        network,
-        bodies,
-        stateLog,
-        flows: flowCount,
-      }),
+      ...buildManifest(run, { stoppedAt, recording, network, bodies, stateLog, flows: flowCount }),
       status: run.status,
+      resident: true,
+      bridgeRequiredForCollection: false,
     });
-
-    if (options.closeTab === true) {
-      await bridge.send({ type: "close_tab", tabId: run.tabId } as BridgeCommand, 5_000).catch(() => null);
-    }
 
     return {
       runId: run.runId,
       outputDir: run.outputDir,
       status: run.status,
+      resident: true,
       recording: {
         id: recording.id,
         pages: recording.pages?.length ?? 0,
@@ -648,6 +558,7 @@ export async function robotTrainingStop(
       ...buildManifest(run, { warnings: [run.lastError] }),
       status: run.status,
       lastError: run.lastError,
+      resident: true,
     }).catch(() => undefined);
     throw err;
   }

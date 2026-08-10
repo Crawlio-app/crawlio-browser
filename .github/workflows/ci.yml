@@ -12,7 +12,12 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # Never cancel a run on main; a superseded PR run is not worth the minutes.
+  # Never cancel a RUNNING job on main; a superseded PR run is not worth the minutes.
+  #
+  # This does not mean nothing on main is ever abandoned. GitHub keeps at most one PENDING run
+  # per group, so when runs arrive faster than they finish, the queued one is dropped even with
+  # cancel-in-progress false. Those abandoned runs are why the `ci` aggregator below must not
+  # treat "did not finish" as "failed".
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -121,10 +126,16 @@ jobs:
 
   # Single stable check name for branch protection. Requiring this instead of the individual
   # jobs means the matrix can grow or shrink without touching repository settings.
+  #
+  # `!cancelled()` rather than `always()`: when a run is superseded, its jobs are abandoned, and
+  # under always() this aggregator still ran, compared "abandoned" against "success" and reported
+  # a red build for a run that was never allowed to finish. A superseded run has no verdict to
+  # give, so it must give none. A genuine job failure does not cancel the run, so that path still
+  # reaches this check and still fails it.
   ci:
     runs-on: ubuntu-latest
     needs: [build, lint, versions]
-    if: always()
+    if: ${{ !cancelled() }}
     steps:
       - name: Verify required jobs succeeded
         run: |

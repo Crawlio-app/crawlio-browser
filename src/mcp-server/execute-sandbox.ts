@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads";
 import type { WebSocketBridge } from "./websocket-bridge.js";
 import type { PolicyEnforcedSender } from "./policy-sender.js";
+import { normalizePhaseReport, type PhaseReport } from "../shared/job-progress.js";
 import type { CrawlioClient } from "./crawlio-client.js";
 import { checkActionPolicy, type ActionPolicy } from "./action-policy.js";
 
@@ -230,6 +231,11 @@ export interface ExecuteSandboxGlobals {
    * The host implementation confines the path and caps the size. Returns { path, bytes }.
    */
   saveArtifact?: (name: string, contents: string, opts?: { append?: boolean }) => Promise<{ path: string; bytes: number }>;
+  /**
+   * Called when sandboxed code reports a phase. Absent for foreground runs, where the caller is
+   * already blocked on the result and has nothing to poll.
+   */
+  onProgress?: (report: PhaseReport) => void;
   allowedBridgeTypes: Set<string>;
   actionPolicy?: ActionPolicy | null;
   /** Optional cancellation for background jobs — aborting terminates the worker + rejects the run. */
@@ -306,6 +312,11 @@ function buildBootstrap(): string {
         postEnrichment: async (...args) => callHost("crawlio", ["postEnrichment"], args),
       });
       globalThis.sleep = async (ms) => callHost("sleep", [], [ms]);
+      // Report which phase a long job is in. Fire-and-forget from the caller's point of view:
+      // a progress line that fails to land must never take the run down with it.
+      globalThis.reportPhase = async (phase, percent) => {
+        try { await callHost("progress", [], [phase, percent]); } catch { /* progress is advisory */ }
+      };
       // SECURITY: rebuild TIMEOUTS as a CONTEXT-realm, null-prototype
       // object. The incoming timeouts is a WORKER-realm object; exposing it let
       // sandbox code reach TIMEOUTS.constructor.constructor = the worker realm's
@@ -374,6 +385,13 @@ async function runHostCall(
       case "sleep": {
         const ms = typeof args[0] === "number" ? args[0] : 0;
         await globals.sleep(Math.min(Math.max(0, ms), MAX_SLEEP_MS));
+        return serializeEnvelope(undefined);
+      }
+      case "progress": {
+        // Advisory only — normalize, hand to the host, and never fail the call. A job whose
+        // progress reporting throws would be a job killed by its own telemetry.
+        const report = normalizePhaseReport(args[0], args[1], Date.now());
+        if (report) globals.onProgress?.(report);
         return serializeEnvelope(undefined);
       }
       case "smart": {
